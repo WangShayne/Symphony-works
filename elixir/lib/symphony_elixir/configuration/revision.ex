@@ -57,6 +57,13 @@ defmodule SymphonyElixir.Configuration.Revision do
     |> validate_required([:validated_by, :validation_evidence, :validated_at])
   end
 
+  @spec update_draft_changeset(t(), map()) :: Ecto.Changeset.t()
+  def update_draft_changeset(revision, attrs) do
+    revision
+    |> cast(attrs, [:document, :schema_version, :content_hash])
+    |> validate_required([:document, :schema_version, :content_hash, :created_by])
+  end
+
   @spec activation_changeset(t(), map()) :: Ecto.Changeset.t()
   def activation_changeset(revision, attrs) do
     revision

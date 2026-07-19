@@ -50,10 +50,34 @@ defmodule SymphonyElixir.Configuration.DocumentTest do
 
     assert %{path: ["model_references"], message: "is required"} in missing_errors
 
-    assert {:error, populated_errors} =
-             Document.validate(Map.put(document, "model_references", [%{"id" => "future"}]))
+    assert {:error, typed_errors} = Document.validate(Map.put(document, "providers", %{}))
+    assert %{path: ["providers"], message: "must be a list"} in typed_errors
 
-    assert %{path: ["model_references"], message: "must be empty during bootstrap"} in populated_errors
+    assert {:error, populated_errors} =
+             Document.validate(Map.put(document, "model_references", ["future"]))
+
+    assert %{path: ["model_references", "0"], message: "must be an object"} in populated_errors
+
+    assert {:error, routing_errors} = Document.validate(Map.put(document, "routing", %{"kind" => "x"}))
+    assert %{path: ["routing"], message: "must be empty during bootstrap"} in routing_errors
+
+    assert {:error, task_type_errors} = Document.validate(Map.put(document, "task_types", ["bad"]))
+    assert %{path: ["task_types", "0"], message: "must be an object"} in task_type_errors
+
+    assert {:error, profile_errors} =
+             Document.validate(Map.put(document, "execution_profiles", ["bad"]))
+
+    assert %{path: ["execution_profiles", "0"], message: "must be an object"} in profile_errors
+
+    assert {:error, task_type_field_errors} =
+             Document.validate(Map.put(document, "task_types", [%{}]))
+
+    assert %{path: ["task_types", "0", "id"], message: "is required"} in task_type_field_errors
+
+    assert {:error, profile_field_errors} =
+             Document.validate(Map.put(document, "execution_profiles", [%{}]))
+
+    assert %{path: ["execution_profiles", "0", "id"], message: "is required"} in profile_field_errors
 
     assert {:error, unsupported_errors} =
              document

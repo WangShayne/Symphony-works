@@ -47,9 +47,16 @@ defmodule SymphonyElixirWeb.Router do
     pipe_through(:configuration_api)
 
     post("/automation-projects", AutomationProjectController, :create)
+    get("/configuration/templates", AutomationProjectController, :templates)
+    post("/configuration-revisions/import-workflow", AutomationProjectController, :import_workflow)
+    patch("/configuration-revisions/:id", AutomationProjectController, :update)
     post("/configuration-revisions/:id/validate", AutomationProjectController, :validate)
     post("/configuration-revisions/:id/activate", AutomationProjectController, :activate)
+    post("/configuration-revisions/:id/rollback", AutomationProjectController, :rollback)
+    get("/configuration-revisions/:id/export", AutomationProjectController, :export)
     get("/configuration-revisions/active", AutomationProjectController, :active)
+    post("/configuration-task-pins", AutomationProjectController, :pin_task)
+    get("/configuration-task-pins/:task_id", AutomationProjectController, :pinned_task)
   end
 
   scope "/", SymphonyElixirWeb do

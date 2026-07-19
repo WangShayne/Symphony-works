@@ -1,10 +1,15 @@
 defmodule SymphonyElixirWeb.Api.V1.AutomationProjectControllerTest do
   use SymphonyElixirWeb.ConnCase, async: false
 
-  alias SymphonyElixirWeb.Api.V1.AutomationProjectController
-
   @bootstrap_token "test-bootstrap-token-with-32-bytes"
   @same_length_invalid_token String.duplicate("x", byte_size(@bootstrap_token))
+
+  defmodule FailingProbe do
+    @behaviour SymphonyElixir.Configuration.Probe
+
+    @impl true
+    def validate(_document), do: {:error, {:model, %{"message" => "offline", "api_key" => "secret"}}}
+  end
 
   test "configuration writes reject an unauthenticated request", %{conn: conn} do
     conn = post(conn, "/api/v1/automation-projects", %{"project" => valid_project()})
@@ -62,6 +67,26 @@ defmodule SymphonyElixirWeb.Api.V1.AutomationProjectControllerTest do
                |> json_response(404)
     end
 
+    assert %{"error" => %{"code" => "not_found"}} =
+             build_conn()
+             |> authenticated()
+             |> post("/api/v1/configuration-revisions/#{missing_id}/rollback")
+             |> json_response(404)
+
+    assert %{"error" => %{"code" => "not_found"}} =
+             build_conn()
+             |> authenticated()
+             |> get("/api/v1/configuration-revisions/#{missing_id}/export")
+             |> json_response(404)
+
+    assert %{"error" => %{"code" => "not_found"}} =
+             build_conn()
+             |> authenticated()
+             |> patch("/api/v1/configuration-revisions/#{missing_id}", %{
+               "document" => %{"schema_version" => 1, "automation_projects" => []}
+             })
+             |> json_response(404)
+
     create_conn =
       build_conn()
       |> authenticated()
@@ -72,12 +97,43 @@ defmodule SymphonyElixirWeb.Api.V1.AutomationProjectControllerTest do
     revision_id = json_response(create_conn, 201)["data"]["id"]
 
     for action <- ["validate", "activate"] do
-      assert %{"error" => %{"code" => "invalid_configuration"}} =
+      assert %{"error" => %{"code" => "invalid_configuration", "details" => details}} =
                build_conn()
                |> authenticated()
                |> post("/api/v1/configuration-revisions/#{revision_id}/#{action}")
                |> json_response(422)
+
+      assert Enum.any?(
+               details,
+               &(&1["path"] == ["automation_projects", "0", "repository", "url"])
+             )
     end
+
+    assert %{"error" => %{"code" => "invalid_configuration"}} =
+             build_conn()
+             |> authenticated()
+             |> post("/api/v1/configuration-revisions/#{revision_id}/rollback")
+             |> json_response(422)
+
+    valid_create =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/automation-projects", %{"project" => valid_project()})
+      |> json_response(201)
+
+    active_id = valid_create["data"]["id"]
+    active_document = valid_create["data"]["document"]
+
+    build_conn()
+    |> authenticated()
+    |> post("/api/v1/configuration-revisions/#{active_id}/activate")
+    |> json_response(200)
+
+    assert %{"error" => %{"code" => "invalid_configuration"}} =
+             build_conn()
+             |> authenticated()
+             |> patch("/api/v1/configuration-revisions/#{active_id}", %{"document" => active_document})
+             |> json_response(422)
   end
 
   test "missing project input and an invalid actor return validation errors", %{conn: conn} do
@@ -98,18 +154,117 @@ defmodule SymphonyElixirWeb.Api.V1.AutomationProjectControllerTest do
 
     private_value = "must-not-leak"
 
-    invalid_actor_conn =
+    private_revision =
       build_conn()
-      |> assign(:current_principal, %{id: nil})
-      |> AutomationProjectController.create(%{
-        "project" => Map.put(valid_project(), "private_note", private_value)
+      |> authenticated()
+      |> post("/api/v1/automation-projects", %{
+        "project" =>
+          valid_project()
+          |> Map.put("private_note", private_value)
+          |> put_in(["repository", "url"], "")
       })
+      |> json_response(201)
 
-    invalid_actor = json_response(invalid_actor_conn, 422)
+    invalid_configuration =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/configuration-revisions/#{private_revision["data"]["id"]}/validate")
+      |> json_response(422)
 
-    assert invalid_actor["error"]["code"] == "invalid_configuration"
-    refute Map.has_key?(invalid_actor["error"], "details")
-    refute Jason.encode!(invalid_actor) =~ private_value
+    assert invalid_configuration["error"]["code"] == "invalid_configuration"
+    refute Jason.encode!(invalid_configuration) =~ private_value
+  end
+
+  test "configuration lifecycle resources normalize invalid import and pin errors" do
+    assert %{"error" => %{"code" => "invalid_configuration"}} =
+             build_conn()
+             |> authenticated()
+             |> post("/api/v1/configuration-revisions/import-workflow", %{})
+             |> json_response(422)
+
+    assert %{"error" => %{"code" => "invalid_configuration"}} =
+             build_conn()
+             |> authenticated()
+             |> post("/api/v1/configuration-revisions/import-workflow", %{
+               "workflow" => %{"content" => "---\n["}
+             })
+             |> json_response(422)
+
+    path_import =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/configuration-revisions/import-workflow", %{
+        "workflow" => %{"path" => "/etc/passwd"}
+      })
+      |> json_response(422)
+
+    assert path_import["error"]["code"] == "invalid_configuration"
+    refute Jason.encode!(path_import) =~ "root:"
+
+    assert %{"error" => %{"code" => "invalid_configuration"}} =
+             build_conn()
+             |> authenticated()
+             |> post("/api/v1/configuration-task-pins", %{})
+             |> json_response(422)
+
+    assert %{"error" => %{"code" => "invalid_configuration"}} =
+             build_conn()
+             |> authenticated()
+             |> patch("/api/v1/configuration-revisions/#{Ecto.UUID.generate()}", %{})
+             |> json_response(422)
+
+    assert %{"error" => %{"code" => "not_found"}} =
+             build_conn()
+             |> authenticated()
+             |> post("/api/v1/configuration-task-pins", %{"task_id" => "task-1"})
+             |> json_response(404)
+
+    assert %{"error" => %{"code" => "not_found"}} =
+             build_conn()
+             |> authenticated()
+             |> get("/api/v1/configuration-task-pins/missing")
+             |> json_response(404)
+  end
+
+  test "REST activation invokes configured probes without exposing probe details" do
+    previous = Application.get_env(:symphony_elixir, :configuration_probes)
+    Application.put_env(:symphony_elixir, :configuration_probes, [FailingProbe])
+
+    on_exit(fn ->
+      Application.put_env(:symphony_elixir, :configuration_probes, previous)
+    end)
+
+    create_conn =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/automation-projects", %{"project" => valid_project()})
+
+    revision_id = json_response(create_conn, 201)["data"]["id"]
+
+    response =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/configuration-revisions/#{revision_id}/activate")
+      |> json_response(422)
+
+    assert response["error"]["code"] == "invalid_configuration"
+    refute Jason.encode!(response) =~ "secret"
+    refute Jason.encode!(response) =~ "offline"
+
+    Application.put_env(:symphony_elixir, :configuration_probes, :invalid)
+
+    create_conn =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/automation-projects", %{"project" => put_in(valid_project(), ["name"], "No probes")})
+
+    revision_id = json_response(create_conn, 201)["data"]["id"]
+
+    assert %{"data" => %{"id" => ^revision_id, "status" => "active"}} =
+             build_conn()
+             |> authenticated()
+             |> post("/api/v1/configuration-revisions/#{revision_id}/activate")
+             |> json_response(200)
   end
 
   test "bootstrap Administrator creates, validates, activates, and reads an Automation Project",
@@ -153,6 +308,93 @@ defmodule SymphonyElixirWeb.Api.V1.AutomationProjectControllerTest do
     assert project["repository"]["target_branch"] == "main"
   end
 
+  test "REST configuration lifecycle imports, pins, rolls back, and exports redacted data" do
+    assert %{"data" => %{"task_types" => [_ | _], "execution_profiles" => [_ | _]}} =
+             build_conn()
+             |> authenticated()
+             |> get("/api/v1/configuration/templates")
+             |> json_response(200)
+
+    import_conn =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/configuration-revisions/import-workflow", %{
+        "workflow" => %{"content" => workflow_content()}
+      })
+
+    assert %{"data" => %{"id" => imported_id, "status" => "draft", "document" => imported_document}} =
+             json_response(import_conn, 201)
+
+    updated_document =
+      put_in(imported_document, ["automation_projects", Access.at(0), "name"], "Edited draft")
+
+    assert %{"data" => %{"id" => ^imported_id, "document" => %{"automation_projects" => [updated]}}} =
+             build_conn()
+             |> authenticated()
+             |> patch("/api/v1/configuration-revisions/#{imported_id}", %{
+               "document" => updated_document
+             })
+             |> json_response(200)
+
+    assert updated["name"] == "Edited draft"
+
+    assert %{"data" => %{"id" => ^imported_id, "status" => "active"}} =
+             build_conn()
+             |> authenticated()
+             |> post("/api/v1/configuration-revisions/#{imported_id}/activate")
+             |> json_response(200)
+
+    assert %{"error" => %{"code" => "invalid_configuration"}} =
+             build_conn()
+             |> authenticated()
+             |> post("/api/v1/configuration-task-pins", %{"task_id" => ""})
+             |> json_response(422)
+
+    assert %{"data" => %{"revision_id" => ^imported_id, "task_id" => "task-1"}} =
+             build_conn()
+             |> authenticated()
+             |> post("/api/v1/configuration-task-pins", %{"task_id" => "task-1"})
+             |> json_response(201)
+
+    replacement =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/automation-projects", %{
+        "project" => put_in(valid_project(), ["name"], "Replacement")
+      })
+      |> json_response(201)
+
+    replacement_id = replacement["data"]["id"]
+
+    assert %{"data" => %{"id" => ^replacement_id, "status" => "active"}} =
+             build_conn()
+             |> authenticated()
+             |> post("/api/v1/configuration-revisions/#{replacement_id}/activate")
+             |> json_response(200)
+
+    assert %{"data" => %{"revision_id" => ^imported_id}} =
+             build_conn()
+             |> authenticated()
+             |> get("/api/v1/configuration-task-pins/task-1")
+             |> json_response(200)
+
+    assert %{"data" => %{"id" => ^imported_id, "status" => "active"}} =
+             build_conn()
+             |> authenticated()
+             |> post("/api/v1/configuration-revisions/#{imported_id}/rollback")
+             |> json_response(200)
+
+    exported =
+      build_conn()
+      |> authenticated()
+      |> get("/api/v1/configuration-revisions/#{imported_id}/export")
+      |> json_response(200)
+
+    encoded = Jason.encode!(exported)
+    refute encoded =~ "ghp_api_key"
+    assert encoded =~ "[REDACTED]"
+  end
+
   defp authenticated(conn) do
     conn
     |> put_req_header("accept", "application/json")
@@ -169,5 +411,19 @@ defmodule SymphonyElixirWeb.Api.V1.AutomationProjectControllerTest do
         "target_branch" => "main"
       }
     }
+  end
+
+  defp workflow_content do
+    """
+    ---
+    tracker:
+      kind: github
+      project_slug: WangShayne/Symphony-works
+      api_key: ghp_api_key
+    codex:
+      command: codex app-server
+    ---
+    Imported prompt.
+    """
   end
 end

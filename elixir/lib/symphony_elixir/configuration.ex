@@ -9,7 +9,8 @@ defmodule SymphonyElixir.Configuration do
   import Ecto.Query
 
   alias Ecto.Multi
-  alias SymphonyElixir.Configuration.{Document, Revision, Validator}
+  alias SymphonyElixir.Configuration.{Document, Exporter, Revision, TaskPin, Templates, Validator}
+  alias SymphonyElixir.Configuration.WorkflowImporter
   alias SymphonyElixir.Repo
 
   @spec create_draft(map(), keyword()) :: {:ok, Revision.t()} | {:error, Ecto.Changeset.t()}
@@ -26,6 +27,26 @@ defmodule SymphonyElixir.Configuration do
     |> Repo.insert()
   end
 
+  @spec update_draft(Ecto.UUID.t(), map(), keyword()) ::
+          {:ok, Revision.t()} | {:error, :not_found | tuple() | Ecto.Changeset.t()}
+  def update_draft(id, document, opts) when is_map(document) do
+    _actor = Keyword.fetch!(opts, :actor)
+
+    with %Revision{} = revision <- Repo.get(Revision, id),
+         :ok <- validate_transition(revision.status, :draft_update) do
+      revision
+      |> Revision.update_draft_changeset(%{
+        document: document,
+        schema_version: Map.get(document, "schema_version"),
+        content_hash: Document.content_hash(document)
+      })
+      |> Repo.update()
+    else
+      nil -> {:error, :not_found}
+      {:error, _reason} = error -> error
+    end
+  end
+
   @spec validate(Ecto.UUID.t(), keyword()) ::
           {:ok, Revision.t()} | {:error, :not_found | tuple() | Ecto.Changeset.t()}
   def validate(id, opts) do
@@ -33,7 +54,7 @@ defmodule SymphonyElixir.Configuration do
 
     with %Revision{} = revision <- Repo.get(Revision, id),
          :ok <- validate_transition(revision.status, :validated),
-         {:ok, evidence} <- Validator.validate(revision.document) do
+         {:ok, evidence} <- Validator.validate(revision.document, opts) do
       revision
       |> Revision.validation_changeset(%{
         validated_by: actor,
@@ -55,7 +76,46 @@ defmodule SymphonyElixir.Configuration do
     new_multi()
     |> Multi.run(:revision, fn repo, _changes -> fetch_revision(repo, id) end)
     |> Multi.run(:validation, fn _repo, %{revision: revision} ->
-      Validator.validate(revision.document)
+      Validator.validate(revision.document, opts)
+    end)
+    |> Multi.update_all(
+      :supersede_previous,
+      from(revision in Revision, where: revision.status == :active and revision.id != ^id),
+      set: [status: :superseded, updated_at: timestamp]
+    )
+    |> Multi.run(:activate, fn repo, %{revision: revision, validation: evidence} ->
+      revision
+      |> Revision.activation_changeset(%{
+        validated_by: actor,
+        validation_evidence: evidence,
+        validated_at: timestamp,
+        activated_by: actor,
+        activated_at: timestamp
+      })
+      |> repo.update()
+    end)
+    |> Repo.transaction()
+    |> case do
+      {:ok, %{activate: revision}} -> {:ok, revision}
+      {:error, _step, reason, _changes} -> {:error, reason}
+    end
+  end
+
+  @spec rollback(Ecto.UUID.t(), keyword()) :: {:ok, Revision.t()} | {:error, term()}
+  def rollback(id, opts) do
+    actor = Keyword.fetch!(opts, :actor)
+    timestamp = now()
+
+    new_multi()
+    |> Multi.run(:revision, fn repo, _changes -> fetch_revision(repo, id) end)
+    |> Multi.run(:transition, fn _repo, %{revision: revision} ->
+      case validate_transition(revision.status, :rollback) do
+        :ok -> {:ok, :ok}
+        {:error, _reason} = error -> error
+      end
+    end)
+    |> Multi.run(:validation, fn _repo, %{revision: revision} ->
+      Validator.validate(revision.document, opts)
     end)
     |> Multi.update_all(
       :supersede_previous,
@@ -93,6 +153,44 @@ defmodule SymphonyElixir.Configuration do
     Repo.one!(from(revision in Revision, where: revision.status == :active))
   end
 
+  @spec pin_for_task(String.t(), keyword()) :: {:ok, TaskPin.t()} | {:error, term()}
+  def pin_for_task(task_id, opts) when is_binary(task_id) do
+    actor = Keyword.get(opts, :actor, "system")
+
+    case Repo.get_by(TaskPin, task_id: task_id) do
+      %TaskPin{} = pin ->
+        {:ok, pin}
+
+      nil ->
+        insert_task_pin(task_id, actor)
+    end
+  end
+
+  @spec pinned_for_task!(String.t()) :: TaskPin.t()
+  def pinned_for_task!(task_id) when is_binary(task_id) do
+    Repo.get_by!(TaskPin, task_id: task_id)
+  end
+
+  @spec export(Ecto.UUID.t(), keyword()) :: {:ok, map()} | {:error, :not_found}
+  def export(id, opts) do
+    case Repo.get(Revision, id) do
+      nil -> {:error, :not_found}
+      %Revision{} = revision -> {:ok, Exporter.export(revision, opts)}
+    end
+  end
+
+  @spec import(map(), keyword()) :: {:ok, Revision.t()} | {:error, term()}
+  def import(input, opts) do
+    actor = Keyword.fetch!(opts, :actor)
+
+    with {:ok, document} <- WorkflowImporter.import(input) do
+      create_draft(document, actor: actor)
+    end
+  end
+
+  @spec templates() :: map()
+  def templates, do: Templates.all()
+
   defp fetch_revision(repo, id) do
     case repo.get(Revision, id) do
       nil -> {:error, :not_found}
@@ -100,7 +198,23 @@ defmodule SymphonyElixir.Configuration do
     end
   end
 
+  defp insert_task_pin(task_id, actor) do
+    with {:ok, revision} <- active() do
+      %TaskPin{}
+      |> TaskPin.changeset(%{
+        task_id: task_id,
+        revision_id: revision.id,
+        content_hash: revision.content_hash,
+        document: revision.document,
+        pinned_by: actor
+      })
+      |> Repo.insert()
+    end
+  end
+
   defp validate_transition(:draft, :validated), do: :ok
+  defp validate_transition(:draft, :draft_update), do: :ok
+  defp validate_transition(:superseded, :rollback), do: :ok
 
   defp validate_transition(current, requested) do
     {:error, {:invalid_transition, current, requested}}

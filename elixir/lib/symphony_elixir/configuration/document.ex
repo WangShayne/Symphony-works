@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Configuration.Document do
   Later configuration slices extend the same document instead of creating parallel stores.
   """
 
-  @empty_list_sections [
+  @list_sections [
     "providers",
     "model_references",
     "task_types",
@@ -16,7 +16,7 @@ defmodule SymphonyElixir.Configuration.Document do
   ]
   @empty_map_sections ["routing", "budgets", "acceptance", "network", "retention"]
   @top_level_fields ["schema_version", "automation_projects"] ++
-                      @empty_list_sections ++ @empty_map_sections
+                      @list_sections ++ @empty_map_sections
   @project_fields ["id", "name", "tracker", "repository"]
   @tracker_fields ["kind", "scope"]
   @repository_fields ["url", "target_branch"]
@@ -63,8 +63,10 @@ defmodule SymphonyElixir.Configuration.Document do
       []
       |> require_schema_version(document)
       |> require_automation_projects(document)
-      |> require_empty_sections(document, @empty_list_sections, [])
+      |> require_list_sections(document, @list_sections)
       |> require_empty_sections(document, @empty_map_sections, %{})
+      |> validate_task_types(document)
+      |> validate_execution_profiles(document)
       |> reject_unknown_fields(document, @top_level_fields, [])
 
     case errors do
@@ -120,12 +122,78 @@ defmodule SymphonyElixir.Configuration.Document do
 
   defp require_project_paths(errors, project, prefix) do
     Enum.reduce(@required_project_paths, errors, fn path, acc ->
-      case fetch_path(project, path) do
-        value when is_binary(value) and value != "" -> acc
-        _ -> [%{path: prefix ++ path, message: "is required"} | acc]
+      require_path(acc, project, prefix, path)
+    end)
+  end
+
+  defp require_paths(errors, value, prefix, paths) do
+    Enum.reduce(paths, errors, fn path, acc ->
+      require_path(acc, value, prefix, path)
+    end)
+  end
+
+  defp require_path(errors, value, prefix, path) do
+    case fetch_path(value, path) do
+      string when is_binary(string) and string != "" -> errors
+      _other -> [%{path: prefix ++ path, message: "is required"} | errors]
+    end
+  end
+
+  defp require_list_sections(errors, document, sections) do
+    Enum.reduce(sections, errors, fn section, acc ->
+      case Map.fetch(document, section) do
+        {:ok, values} when is_list(values) -> require_object_list(acc, section, values)
+        {:ok, _value} -> [%{path: [section], message: "must be a list"} | acc]
+        :error -> [%{path: [section], message: "is required"} | acc]
       end
     end)
   end
+
+  defp require_object_list(errors, section, values) do
+    values
+    |> Enum.with_index()
+    |> Enum.reduce(errors, fn
+      {value, _index}, acc when is_map(value) ->
+        acc
+
+      {_value, index}, acc ->
+        [%{path: [section, Integer.to_string(index)], message: "must be an object"} | acc]
+    end)
+  end
+
+  defp validate_task_types(errors, %{"task_types" => task_types}) when is_list(task_types) do
+    Enum.reduce(Enum.with_index(task_types), errors, fn
+      {task_type, index}, acc when is_map(task_type) ->
+        require_paths(acc, task_type, ["task_types", Integer.to_string(index)], [
+          ["id"],
+          ["name"],
+          ["profile_id"]
+        ])
+
+      {_task_type, _index}, acc ->
+        acc
+    end)
+  end
+
+  defp validate_task_types(errors, _document), do: errors
+
+  defp validate_execution_profiles(errors, %{"execution_profiles" => profiles})
+       when is_list(profiles) do
+    Enum.reduce(Enum.with_index(profiles), errors, fn
+      {profile, index}, acc when is_map(profile) ->
+        require_paths(acc, profile, ["execution_profiles", Integer.to_string(index)], [
+          ["id"],
+          ["name"],
+          ["runtime"],
+          ["instructions"]
+        ])
+
+      {_profile, _index}, acc ->
+        acc
+    end)
+  end
+
+  defp validate_execution_profiles(errors, _document), do: errors
 
   defp require_empty_sections(errors, document, sections, empty_value) do
     Enum.reduce(sections, errors, fn section, acc ->

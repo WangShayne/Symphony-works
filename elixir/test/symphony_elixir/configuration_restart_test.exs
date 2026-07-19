@@ -4,7 +4,7 @@ defmodule SymphonyElixir.ConfigurationRestartTest do
   alias Ecto.Adapters.SQL.Sandbox
   alias SymphonyElixir.Configuration
   alias SymphonyElixir.Configuration.Document
-  alias SymphonyElixir.Configuration.Revision
+  alias SymphonyElixir.Configuration.{Revision, TaskPin}
   alias SymphonyElixir.Repo
 
   setup do
@@ -18,6 +18,7 @@ defmodule SymphonyElixir.ConfigurationRestartTest do
 
       if Process.whereis(Repo) do
         Sandbox.mode(Repo, :auto)
+        Repo.delete_all(TaskPin)
         Repo.delete_all(Revision)
         Sandbox.mode(Repo, :manual)
       end
@@ -38,6 +39,19 @@ defmodule SymphonyElixir.ConfigurationRestartTest do
 
     assert Configuration.active!().document["automation_projects"] |> hd() |> Map.fetch!("name") ==
              "Symphony"
+  end
+
+  test "task configuration pin survives a supervised Repo restart" do
+    {:ok, draft} = Configuration.create_draft(valid_document(), actor: "bootstrap-admin")
+    {:ok, active} = Configuration.activate(draft.id, actor: "bootstrap-admin")
+    {:ok, pin} = Configuration.pin_for_task("task-1", actor: "scheduler")
+
+    assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, Repo)
+    assert {:ok, _repo} = Supervisor.restart_child(SymphonyElixir.Supervisor, Repo)
+    Sandbox.mode(Repo, :auto)
+
+    assert Configuration.pinned_for_task!("task-1").id == pin.id
+    assert Configuration.pinned_for_task!("task-1").revision_id == active.id
   end
 
   defp valid_document do

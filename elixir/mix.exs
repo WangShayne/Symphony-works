@@ -6,6 +6,7 @@ defmodule SymphonyElixir.MixProject do
       app: :symphony_elixir,
       version: "0.0.1",
       elixir: "~> 1.19",
+      elixirc_paths: elixirc_paths(Mix.env()),
       compilers: [:phoenix_live_view] ++ Mix.compilers(),
       start_permanent: Mix.env() == :prod,
       test_coverage: [
@@ -75,7 +76,8 @@ defmodule SymphonyElixir.MixProject do
       {:jason, "~> 1.4"},
       {:yaml_elixir, "~> 2.12"},
       {:solid, "~> 1.2"},
-      {:ecto, "~> 3.13"},
+      {:ecto_sql, "~> 3.13"},
+      {:ecto_sqlite3, "~> 0.22"},
       {:burrito, "~> 1.5", only: :prod, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false}
@@ -85,10 +87,15 @@ defmodule SymphonyElixir.MixProject do
   defp aliases do
     [
       setup: ["deps.get"],
+      "ecto.setup": ["ecto.create", "ecto.migrate"],
+      "ecto.reset": ["ecto.drop", "ecto.setup"],
       build: ["escript.build"],
       lint: ["specs.check", "credo --strict"]
     ]
   end
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_env), do: ["lib"]
 
   defp escript do
     [

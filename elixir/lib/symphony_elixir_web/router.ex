@@ -14,6 +14,15 @@ defmodule SymphonyElixirWeb.Router do
     plug(:put_secure_browser_headers)
   end
 
+  pipeline :configuration_api do
+    plug(:accepts, ["json"])
+    plug(SymphonyElixirWeb.Auth.BootstrapPlug)
+  end
+
+  pipeline :bootstrap_admin do
+    plug(SymphonyElixirWeb.Auth.BootstrapPlug)
+  end
+
   scope "/", SymphonyElixirWeb do
     get("/dashboard.css", StaticAssetController, :dashboard_css)
     get("/favicon.png", StaticAssetController, :favicon)
@@ -26,6 +35,21 @@ defmodule SymphonyElixirWeb.Router do
     pipe_through(:browser)
 
     live("/", DashboardLive, :index)
+  end
+
+  scope "/", SymphonyElixirWeb do
+    pipe_through([:browser, :bootstrap_admin])
+
+    live("/configuration", ConfigurationLive, :index)
+  end
+
+  scope "/api/v1", SymphonyElixirWeb.Api.V1 do
+    pipe_through(:configuration_api)
+
+    post("/automation-projects", AutomationProjectController, :create)
+    post("/configuration-revisions/:id/validate", AutomationProjectController, :validate)
+    post("/configuration-revisions/:id/activate", AutomationProjectController, :activate)
+    get("/configuration-revisions/active", AutomationProjectController, :active)
   end
 
   scope "/", SymphonyElixirWeb do

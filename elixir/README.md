@@ -72,6 +72,22 @@ mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
 ```
 
+### Persistent configuration bootstrap
+
+The configuration control plane requires an external bootstrap Administrator token with at least
+32 bytes. Generate the token outside SQLite, export it only to the service process, and run the
+database migrations before opening the Dashboard or REST API.
+
+```bash
+export SYMPHONY_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)"
+mise exec -- mix ecto.setup
+```
+
+SQLite defaults to `~/.local/share/symphony/symphony.db`. Set `SYMPHONY_DATA_ROOT` to move the
+managed data directory, or set `SYMPHONY_DATABASE_PATH` to choose the complete database path. The
+repository creates parent directories, enables WAL and foreign-key enforcement, and keeps the
+bootstrap token in process configuration rather than the database.
+
 ## Burrito releases
 
 Symphony ships self-contained executables built with
@@ -247,6 +263,10 @@ The observability UI now runs on a minimal Phoenix stack:
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
 - Tracker issue identifiers link to the tracker-provided URL when it uses `http` or `https`
+
+The bootstrap configuration Dashboard is available at `/configuration`. Its versioned REST
+resource is under `/api/v1/automation-projects`; both surfaces require the configured bootstrap
+token until the OIDC/RBAC configuration replaces this one-time identity.
 
 ## Project Layout
 

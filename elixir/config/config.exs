@@ -2,6 +2,15 @@ import Config
 
 config :phoenix, :json_library, Jason
 
+config :symphony_elixir,
+  ecto_repos: [SymphonyElixir.Repo]
+
+config :symphony_elixir, SymphonyElixir.Repo,
+  journal_mode: :wal,
+  busy_timeout: 5_000,
+  foreign_keys: :on,
+  pool_size: 5
+
 config :symphony_elixir, SymphonyElixirWeb.Endpoint,
   adapter: Bandit.PhoenixAdapter,
   url: [host: "localhost"],
@@ -15,7 +24,4 @@ config :symphony_elixir, SymphonyElixirWeb.Endpoint,
   check_origin: false,
   server: false
 
-if config_env() == :test do
-  config :symphony_elixir,
-    workflow_file_path: Path.expand("../test/fixtures/startup_workflow.md", __DIR__)
-end
+import_config "#{config_env()}.exs"

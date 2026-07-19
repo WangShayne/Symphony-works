@@ -1,0 +1,30 @@
+# Local research and agent indexes
+.research/
+.worktrees/
+.codegraph/
+.cursor/
+.DS_Store
+
+# Elixir build artifacts
+_build/
+deps/
+cover/
+doc/
+*.beam
+*.ez
+*.plt
+*.plt.hash
+
+# Runtime and database artifacts
+tmp/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Local secrets
+.env
+.env.*
+!.env.example

@@ -1,0 +1,3 @@
+# Allow runtime task-type creation
+
+The routing model may classify work into user-configured task types and may also create a dynamic task type during planning. Every dynamic type derives its execution profile from a user-configured dynamic type template: the routing model may specialize instructions and narrow permissions, but cannot add tools, increase permissions, or exceed resource budgets. The execution fallback model is used by default. The dynamic type and resolved profile must remain visible in the execution plan before any execution unit can start. Dynamic types are task-scoped by default; only an explicit user-approved promotion may persist one for reuse.

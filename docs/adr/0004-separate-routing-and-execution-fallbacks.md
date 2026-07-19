@@ -1,0 +1,3 @@
+# Separate routing and execution fallbacks
+
+Symphony will configure routing and execution fallback roles independently, although both roles may reference the same underlying model. The routing fallback handles an unavailable routing model or repeatedly invalid plans; the execution fallback handles an execution unit whose task type has no usable task model. A task model's output failing acceptance does not activate the execution fallback; it creates a rescheduling event for the routing model. Keeping the roles distinct preserves failure attribution and prevents an execution fallback from silently becoming the system's scheduler or concealing quality failures.

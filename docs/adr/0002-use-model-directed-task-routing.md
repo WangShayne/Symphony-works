@@ -1,0 +1,3 @@
+# Use model-directed task routing
+
+Symphony will use a user-configured routing model to decide how work is dispatched, with separately configured task models plus routing and execution fallback roles, rather than require tracker labels or fields to select the route. The routing model will not modify code or documentation; task models own execution. It creates the initial execution plan and is invoked again only for a rescheduling event, while routine progress updates remain ledger-only. This favors semantic, user-extensible routing over deterministic metadata routing, so routing outputs and decisions must be observable and structurally validated.

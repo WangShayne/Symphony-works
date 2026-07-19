@@ -1,0 +1,3 @@
+# Require schema-valid execution plans
+
+The routing model communicates with the orchestrator through a versioned structured execution plan validated by JSON Schema. The plan identifies units, task types, execution profiles, dependencies, acceptance targets, and any dynamic task-type definition; prose is non-authoritative. Execution units may publish coordination proposals but cannot alter responsibilities or dependencies directly; only a validated plan revision can do so. Invalid routing output receives a bounded repair attempt and then activates the routing fallback model rather than entering orchestration state.

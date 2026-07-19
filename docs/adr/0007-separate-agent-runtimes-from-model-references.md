@@ -1,0 +1,3 @@
+# Separate agent runtimes from model references
+
+Execution profiles will select both a pluggable agent runtime and a model reference. The runtime owns sessions, tools, filesystem changes, and sandbox behavior; the model reference identifies the provider, model ID, endpoint, and credential reference. The orchestration layer depends on the runtime contract rather than Codex-specific protocol details, allowing additional coding-agent ecosystems to be added without redesigning task coordination. V1 ships Codex App Server as its only production runtime plus a deterministic simulated runtime for contract testing; other production runtimes are deferred.

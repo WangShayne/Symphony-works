@@ -10,6 +10,65 @@ defmodule SymphonyElixirWeb.ConfigurationLive do
   alias SymphonyElixir.Identity
   alias SymphonyElixir.Identity.Authorization
 
+  @runtime_model_roles [
+    %{
+      key: "routing",
+      label: "Routing model",
+      reference_field: "routing_model_reference_id",
+      default_reference_id: "routing-model",
+      default_model_id: "codex-routing-model",
+      default_context_window: 128_000,
+      default_capability_context_window: 64_000,
+      default_structured_output: true,
+      default_tool_use: true,
+      default_input_price: "0",
+      default_cached_input_price: "0",
+      default_output_price: "0"
+    },
+    %{
+      key: "routing_fallback",
+      label: "Routing fallback model",
+      reference_field: "routing_fallback_model_reference_id",
+      default_reference_id: "routing-fallback-model",
+      default_model_id: "codex-routing-fallback",
+      default_context_window: 64_000,
+      default_capability_context_window: 32_000,
+      default_structured_output: true,
+      default_tool_use: false,
+      default_input_price: "0",
+      default_cached_input_price: "0",
+      default_output_price: "0"
+    },
+    %{
+      key: "execution_fallback",
+      label: "Execution fallback model",
+      reference_field: "execution_fallback_model_reference_id",
+      default_reference_id: "execution-fallback-model",
+      default_model_id: "codex-execution-fallback",
+      default_context_window: 128_000,
+      default_capability_context_window: 64_000,
+      default_structured_output: true,
+      default_tool_use: true,
+      default_input_price: "0",
+      default_cached_input_price: "0",
+      default_output_price: "0"
+    },
+    %{
+      key: "task",
+      label: "Task primary model",
+      reference_field: "task_model_reference_id",
+      default_reference_id: "task-model",
+      default_model_id: "codex-task-primary",
+      default_context_window: 128_000,
+      default_capability_context_window: 96_000,
+      default_structured_output: true,
+      default_tool_use: true,
+      default_input_price: "0",
+      default_cached_input_price: "0",
+      default_output_price: "0"
+    }
+  ]
+
   @impl true
   def mount(_params, session, socket) do
     case trusted_admin_actor(session, :write_configuration) do
@@ -34,7 +93,8 @@ defmodule SymphonyElixirWeb.ConfigurationLive do
        exported: nil,
        error: nil,
        actor: actor,
-       auth_context: auth_context
+       auth_context: auth_context,
+       runtime_model_roles: @runtime_model_roles
      )}
   end
 
@@ -67,6 +127,16 @@ defmodule SymphonyElixirWeb.ConfigurationLive do
         {:error, reason} -> {:noreply, assign(socket, error: error_message(reason), actor: actor)}
       end
     end)
+  end
+
+  def handle_event("bind_runtime_model", %{"runtime_model" => params}, %{assigns: %{revision: revision}} = socket)
+      when not is_nil(revision) do
+    document = runtime_model_document(revision.document, params)
+
+    case Configuration.update_draft(revision.id, document, actor: "bootstrap-admin") do
+      {:ok, revision} -> {:noreply, assign(socket, revision: revision, exported: nil, error: nil)}
+      {:error, reason} -> {:noreply, assign(socket, error: error_message(reason))}
+    end
   end
 
   def handle_event("templates", _params, socket) do
@@ -198,6 +268,161 @@ defmodule SymphonyElixirWeb.ConfigurationLive do
   defp trusted_admin_context(%{"bootstrap_admin" => true}), do: %{"bootstrap_admin" => true}
   defp trusted_admin_context(%{"principal_id" => principal_id}) when is_binary(principal_id), do: %{"principal_id" => principal_id}
 
+  defp runtime_model_document(document, params) do
+    provider_id = field(params, "provider_id", "codex-provider")
+    endpoint = field(params, "endpoint", "http://127.0.0.1:4010")
+    credential_ref = field(params, "credential_ref", "00000000-0000-0000-0000-000000000001")
+    profile_id = field(params, "execution_profile_id", "general-profile")
+    references = runtime_model_references(params, provider_id, endpoint, credential_ref)
+    references_by_role = Map.new(references, fn {role, reference} -> {role.key, reference} end)
+
+    routing_reference = Map.fetch!(references_by_role, "routing")
+    routing_fallback_reference = Map.fetch!(references_by_role, "routing_fallback")
+    execution_fallback_reference = Map.fetch!(references_by_role, "execution_fallback")
+    task_reference = Map.fetch!(references_by_role, "task")
+
+    document
+    |> Map.put("providers", [
+      %{
+        "id" => provider_id,
+        "name" => field(params, "provider_name", "Codex Provider"),
+        "runtime_protocol" => "codex_app_server",
+        "endpoint" => endpoint,
+        "credential_ref" => credential_ref
+      }
+    ])
+    |> Map.put("model_references", Enum.map(references, fn {_role, reference} -> reference end))
+    |> Map.put("routing", %{
+      "model_reference_id" => routing_reference["id"],
+      "fallback_model_reference_id" => routing_fallback_reference["id"],
+      "execution_fallback_model_reference_id" => execution_fallback_reference["id"],
+      "profile" => %{
+        "id" => "routing-profile",
+        "runtime" => "codex",
+        "readonly" => true,
+        "allow_mutation" => false,
+        "high_risk_tools" => false,
+        "required_capabilities" => required_capabilities(routing_reference)
+      }
+    })
+    |> Map.put("execution_profiles", [
+      %{
+        "id" => profile_id,
+        "name" => field(params, "execution_profile_name", "General"),
+        "runtime" => "codex",
+        "model_reference_id" => task_reference["id"],
+        "instructions" => field(params, "instructions", "Implement the accepted task."),
+        "required_capabilities" => required_capabilities(task_reference)
+      }
+    ])
+  end
+
+  defp runtime_model_references(params, provider_id, endpoint, credential_ref) do
+    roles = Map.get(params, "roles", %{})
+
+    Enum.map(@runtime_model_roles, fn role ->
+      role_params = Map.get(roles, role.key, %{})
+      {role, runtime_model_reference(params, role_params, role, provider_id, endpoint, credential_ref)}
+    end)
+  end
+
+  defp runtime_model_reference(params, role_params, role, provider_id, endpoint, credential_ref) do
+    reference_id =
+      role_params
+      |> field("reference_id", field(params, role.reference_field, role.default_reference_id))
+
+    context_window =
+      role_params
+      |> field("context_window", to_string(role.default_context_window))
+      |> parse_positive_integer(role.default_context_window)
+
+    capability_context_window =
+      role_params
+      |> field("capability_context_window", to_string(role.default_capability_context_window))
+      |> parse_positive_integer(role.default_capability_context_window)
+
+    capabilities = %{
+      "structured_output" => parse_boolean(Map.get(role_params, "structured_output"), role.default_structured_output),
+      "tool_use" => parse_boolean(Map.get(role_params, "tool_use"), role.default_tool_use),
+      "context_window" => capability_context_window
+    }
+
+    prices = %{
+      "input" => parse_non_negative_number(Map.get(role_params, "input_price"), 0),
+      "cached_input" => parse_non_negative_number(Map.get(role_params, "cached_input_price"), 0),
+      "output" => parse_non_negative_number(Map.get(role_params, "output_price"), 0)
+    }
+
+    model_reference(
+      reference_id,
+      provider_id,
+      endpoint,
+      field(role_params, "model_id", role.default_model_id),
+      credential_ref,
+      context_window,
+      capabilities,
+      prices
+    )
+  end
+
+  defp required_capabilities(%{"capabilities" => capabilities}) do
+    %{
+      "structured_output" => capabilities["structured_output"],
+      "tool_use" => capabilities["tool_use"],
+      "context_window" => min(capabilities["context_window"], 64_000)
+    }
+  end
+
+  defp model_reference(id, provider_id, endpoint, model_id, credential_ref, context_window, capabilities, prices) do
+    %{
+      "id" => id,
+      "provider_id" => provider_id,
+      "endpoint" => endpoint,
+      "model_id" => model_id,
+      "credential_ref" => credential_ref,
+      "context_window" => context_window,
+      "capabilities" => capabilities,
+      "prices" => prices
+    }
+  end
+
+  defp field(params, field, default) do
+    case Map.get(params, field, default) do
+      value when is_binary(value) and value != "" -> value
+      _value -> default
+    end
+  end
+
+  defp parse_positive_integer(value, default) do
+    case Integer.parse(to_string(value)) do
+      {integer, ""} when integer > 0 -> integer
+      _other -> default
+    end
+  end
+
+  defp parse_boolean(value, default) do
+    case value |> to_string() |> String.downcase() |> String.trim() do
+      truthy when truthy in ["true", "1", "on", "yes"] -> true
+      falsy when falsy in ["false", "0", "off", "no"] -> false
+      _other -> default
+    end
+  end
+
+  defp parse_non_negative_number(value, default) do
+    value = to_string(value)
+
+    case Integer.parse(value) do
+      {integer, ""} when integer >= 0 ->
+        integer
+
+      _other ->
+        case Float.parse(value) do
+          {float, ""} when float >= 0 -> float
+          _other -> default
+        end
+    end
+  end
+
   @impl true
   def render(assigns) do
     ~H"""
@@ -297,6 +522,118 @@ defmodule SymphonyElixirWeb.ConfigurationLive do
             <input name="project[repository][target_branch]" value={@revision.document["automation_projects"] |> hd() |> Map.fetch!("repository") |> Map.fetch!("target_branch")} required />
           </label>
           <button type="submit">Update draft</button>
+        </form>
+
+        <form :if={@revision && @revision.status == :draft} id="runtime-model-form" phx-submit="bind_runtime_model">
+          <h2>Runtime models</h2>
+          <label>
+            Provider ID
+            <input name="runtime_model[provider_id]" value="codex-provider" required />
+          </label>
+          <label>
+            Provider name
+            <input name="runtime_model[provider_name]" value="Codex Provider" required />
+          </label>
+          <label>
+            Codex endpoint
+            <input name="runtime_model[endpoint]" value="http://127.0.0.1:4010" required />
+          </label>
+          <label>
+            Credential reference
+            <input name="runtime_model[credential_ref]" value="00000000-0000-0000-0000-000000000001" required />
+          </label>
+          <label>
+            Execution profile
+            <input name="runtime_model[execution_profile_id]" value="general-profile" required />
+          </label>
+          <fieldset :for={role <- @runtime_model_roles}>
+            <legend>{role.label}</legend>
+            <label>
+              Reference ID
+              <input
+                name={"runtime_model[roles][#{role.key}][reference_id]"}
+                value={role.default_reference_id}
+                required
+              />
+            </label>
+            <label>
+              Model ID
+              <input
+                name={"runtime_model[roles][#{role.key}][model_id]"}
+                value={role.default_model_id}
+                required
+              />
+            </label>
+            <label>
+              Context window
+              <input
+                name={"runtime_model[roles][#{role.key}][context_window]"}
+                value={role.default_context_window}
+                required
+              />
+            </label>
+            <label>
+              Capability context window
+              <input
+                name={"runtime_model[roles][#{role.key}][capability_context_window]"}
+                value={role.default_capability_context_window}
+                required
+              />
+            </label>
+            <label>
+              Structured output
+              <input
+                type="hidden"
+                name={"runtime_model[roles][#{role.key}][structured_output]"}
+                value="false"
+              />
+              <input
+                type="checkbox"
+                name={"runtime_model[roles][#{role.key}][structured_output]"}
+                value="true"
+                checked={role.default_structured_output}
+              />
+            </label>
+            <label>
+              Tool use
+              <input
+                type="hidden"
+                name={"runtime_model[roles][#{role.key}][tool_use]"}
+                value="false"
+              />
+              <input
+                type="checkbox"
+                name={"runtime_model[roles][#{role.key}][tool_use]"}
+                value="true"
+                checked={role.default_tool_use}
+              />
+            </label>
+            <label>
+              Input price
+              <input
+                name={"runtime_model[roles][#{role.key}][input_price]"}
+                value={role.default_input_price}
+                required
+              />
+            </label>
+            <label>
+              Cached input price
+              <input
+                name={"runtime_model[roles][#{role.key}][cached_input_price]"}
+                value={role.default_cached_input_price}
+                required
+              />
+            </label>
+            <label>
+              Output price
+              <input
+                name={"runtime_model[roles][#{role.key}][output_price]"}
+                value={role.default_output_price}
+                required
+              />
+            </label>
+          </fieldset>
+          <button type="submit">Bind runtime models</button>
         </form>
 
         <section :if={@active} id="active-revision">

@@ -4,12 +4,13 @@ defmodule SymphonyElixir.Configuration.Validator do
   """
 
   alias SymphonyElixir.Configuration.{Document, Exporter}
+  alias SymphonyElixir.Runtime.CapabilityProbe
 
   @spec validate(term(), keyword()) :: {:ok, map()} | {:error, {:invalid_configuration, list()} | tuple()}
   def validate(document, opts \\ []) do
     case Document.validate(document) do
       {:ok, _document} ->
-        with {:ok, probes} <- run_probes(document, Keyword.get(opts, :probes, [])) do
+        with {:ok, probes} <- run_probes(document, configured_probes(document, opts)) do
           {:ok,
            %{
              "schema" => "passed",
@@ -36,6 +37,23 @@ defmodule SymphonyElixir.Configuration.Validator do
     |> case do
       {:ok, evidence} -> {:ok, Enum.reverse(evidence)}
       {:error, _reason} = error -> error
+    end
+  end
+
+  defp configured_probes(document, opts) do
+    document
+    |> default_probes()
+    |> Kernel.++(extra_probes(opts))
+  end
+
+  defp default_probes(document) do
+    if CapabilityProbe.configured?(document), do: [CapabilityProbe], else: []
+  end
+
+  defp extra_probes(opts) do
+    case Keyword.get(opts, :probes, Application.get_env(:symphony_elixir, :configuration_probes, [])) do
+      probes when is_list(probes) -> probes
+      _other -> []
     end
   end
 end

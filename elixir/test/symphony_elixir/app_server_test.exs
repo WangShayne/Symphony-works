@@ -183,6 +183,241 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server health probe mode enforces read-only policy and rejects policy injection" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-health-probe-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "runtime-health")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-health-probe.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEx_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-health-probe.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-health"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-health"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-health-probe",
+        identifier: "MT-1002",
+        title: "Validate health probe policy",
+        description: "Ensure health probes cannot request write or network authority",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-1002",
+        labels: ["runtime"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Validate health policy", issue, health_probe: true)
+
+      trace = File.read!(trace_file)
+
+      payloads =
+        trace
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(fn line -> line |> String.trim_leading("JSON:") |> Jason.decode!() end)
+
+      thread_start = Enum.find(payloads, &(&1["method"] == "thread/start"))
+      turn_start = Enum.find(payloads, &(&1["method"] == "turn/start"))
+
+      assert get_in(thread_start, ["params", "approvalPolicy"]) == "never"
+      assert get_in(thread_start, ["params", "sandbox"]) == "read-only"
+      assert get_in(turn_start, ["params", "approvalPolicy"]) == "never"
+      assert get_in(turn_start, ["params", "sandboxPolicy", "type"]) == "readOnly"
+      assert get_in(turn_start, ["params", "sandboxPolicy", "networkAccess"]) == false
+
+      assert {:error, :invalid_session_policy_override} =
+               AppServer.start_session(workspace,
+                 session_policies: %{
+                   approval_policy: "never",
+                   thread_sandbox: "workspace-write",
+                   turn_sandbox_policy: %{"type" => "dangerFullAccess"}
+                 }
+               )
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server health probe binds provider model and declines effect approvals" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-health-provider-binding-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "runtime-health")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-health-provider-binding.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEx_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-health-provider-binding.trace}"
+      printf 'ARGS:%s\\n' "$*" >> "$trace_file"
+      if [ -n "${SYMPHONY_CODEX_PROVIDER_API_KEY:-}" ]; then
+        printf 'ENV_PRESENT:yes\\n' >> "$trace_file"
+      else
+        printf 'ENV_PRESENT:no\\n' >> "$trace_file"
+      fi
+      printf 'warning: reflected %s\\n' "${SYMPHONY_CODEX_PROVIDER_API_KEY:-missing}" >&2
+
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-health-provider"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-health-provider"}}}'
+            printf '%s\\n' '{"id":99,"method":"item/commandExecution/requestApproval","params":{"command":"env","cwd":"/tmp","reason":"BROKERED_PROVIDER_SECRET"}}'
+            ;;
+          4)
+            ;;
+          5)
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %{
+        id: "issue-health-provider-binding",
+        identifier: "MT-1003",
+        title: "Validate health provider binding"
+      }
+
+      test_pid = self()
+
+      log =
+        capture_log(fn ->
+          result =
+            AppServer.run(workspace, "Validate provider binding", issue,
+              health_probe: true,
+              on_message: fn message -> send(test_pid, {:health_probe_event, message}) end,
+              provider_binding: %{
+                provider_id: "provider-health",
+                model_id: "gpt-health-model",
+                endpoint: "https://models.example.test/v1",
+                wire_api: "responses",
+                credential_env: "SYMPHONY_CODEX_PROVIDER_API_KEY",
+                credential: "BROKERED_PROVIDER_SECRET"
+              }
+            )
+
+          send(test_pid, {:health_probe_result, result})
+        end)
+
+      assert_receive {:health_probe_result, {:error, {:approval_required, payload}}}
+
+      assert payload["method"] == "item/commandExecution/requestApproval"
+      refute inspect(payload) =~ "BROKERED_PROVIDER_SECRET"
+      refute log =~ "BROKERED_PROVIDER_SECRET"
+      assert log =~ "[REDACTED]"
+
+      assert_receive {:health_probe_event, %{event: :approval_declined, decision: "declined"} = event}
+      refute inspect(event) =~ "BROKERED_PROVIDER_SECRET"
+
+      trace = File.read!(trace_file)
+      refute trace =~ "BROKERED_PROVIDER_SECRET"
+      assert trace =~ "ENV_PRESENT:yes"
+      assert trace =~ "gpt-health-model"
+      assert trace =~ "https://models.example.test/v1"
+      assert trace =~ "shell_environment_policy.exclude"
+
+      payloads =
+        trace
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(fn line -> line |> String.trim_leading("JSON:") |> Jason.decode!() end)
+
+      thread_start = Enum.find(payloads, &(&1["method"] == "thread/start"))
+      turn_start = Enum.find(payloads, &(&1["method"] == "turn/start"))
+
+      assert get_in(thread_start, ["params", "model"]) == "gpt-health-model"
+      assert get_in(turn_start, ["params", "model"]) == "gpt-health-model"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server marks request-for-input events as a hard failure" do
     test_root =
       Path.join(

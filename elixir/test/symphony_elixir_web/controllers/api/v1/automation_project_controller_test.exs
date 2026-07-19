@@ -1,6 +1,8 @@
 defmodule SymphonyElixirWeb.Api.V1.AutomationProjectControllerTest do
   use SymphonyElixirWeb.ConnCase, async: false
 
+  alias SymphonyElixir.Security.SecretStore
+
   @bootstrap_token "test-bootstrap-token-with-32-bytes"
   @same_length_invalid_token String.duplicate("x", byte_size(@bootstrap_token))
 
@@ -9,6 +11,31 @@ defmodule SymphonyElixirWeb.Api.V1.AutomationProjectControllerTest do
 
     @impl true
     def validate(_document), do: {:error, {:model, %{"message" => "offline", "api_key" => "secret"}}}
+  end
+
+  defmodule FakeHealthAppServer do
+    def start_session(_workspace, opts) do
+      true = Keyword.fetch!(opts, :health_probe)
+
+      {:ok, %{thread_id: "probe-thread"}}
+    end
+
+    def run_turn(%{thread_id: "probe-thread"}, _prompt, %{identifier: "runtime-capability-probe"}, opts) do
+      true = Keyword.fetch!(opts, :health_probe)
+
+      {:ok, %{result: %{"task_type" => "general"}}}
+    end
+
+    def stop_session(%{thread_id: "probe-thread"}), do: :ok
+  end
+
+  setup do
+    previous = Application.get_env(:symphony_elixir, :runtime_health_app_server)
+    Application.put_env(:symphony_elixir, :runtime_health_app_server, FakeHealthAppServer)
+
+    on_exit(fn ->
+      Application.put_env(:symphony_elixir, :runtime_health_app_server, previous)
+    end)
   end
 
   test "configuration writes reject an unauthenticated request", %{conn: conn} do
@@ -265,6 +292,111 @@ defmodule SymphonyElixirWeb.Api.V1.AutomationProjectControllerTest do
              |> authenticated()
              |> post("/api/v1/configuration-revisions/#{revision_id}/activate")
              |> json_response(200)
+  end
+
+  test "REST updates, probes, and activates runtime model profile bindings", %{conn: conn} do
+    create =
+      conn
+      |> authenticated()
+      |> post("/api/v1/automation-projects", %{"project" => valid_project()})
+      |> json_response(201)
+
+    revision_id = create["data"]["id"]
+    {:ok, credential_ref} = SecretStore.put("codex-provider-token", "plain-provider-token", actor: "admin")
+    document = runtime_model_document(create["data"]["document"], credential_ref.id)
+
+    update =
+      build_conn()
+      |> authenticated()
+      |> patch("/api/v1/configuration-revisions/#{revision_id}", %{"document" => document})
+      |> json_response(200)
+
+    assert get_in(update, ["data", "document", "routing", "model_reference_id"]) == "routing-model"
+    assert get_in(update, ["data", "document", "routing", "fallback_model_reference_id"]) == "routing-fallback-model"
+
+    assert get_in(update, ["data", "document", "routing", "execution_fallback_model_reference_id"]) ==
+             "execution-fallback-model"
+
+    assert get_in(update, ["data", "document", "model_references", Access.at(0), "prices", "input"]) == 0
+
+    validate =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/configuration-revisions/#{revision_id}/validate")
+      |> json_response(200)
+
+    assert get_in(validate, ["data", "validation_evidence", "schema"]) == "passed"
+    assert [%{"probe" => "runtime_capability", "status" => "passed"}] = get_in(validate, ["data", "validation_evidence", "probes"])
+
+    active =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/configuration-revisions/#{revision_id}/activate")
+      |> json_response(200)
+
+    assert get_in(active, ["data", "document", "execution_profiles", Access.at(0), "model_reference_id"]) ==
+             "task-model"
+
+    encoded = Jason.encode!(active)
+    refute encoded =~ "plain-provider-token"
+    refute encoded =~ "\"api_key\""
+  end
+
+  test "REST activation rejects incompatible runtime model bindings atomically", %{conn: conn} do
+    valid_create =
+      conn
+      |> authenticated()
+      |> post("/api/v1/automation-projects", %{"project" => valid_project()})
+      |> json_response(201)
+
+    active_id = valid_create["data"]["id"]
+
+    build_conn()
+    |> authenticated()
+    |> post("/api/v1/configuration-revisions/#{active_id}/activate")
+    |> json_response(200)
+
+    incompatible_create =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/automation-projects", %{"project" => put_in(valid_project(), ["name"], "Rejected")})
+      |> json_response(201)
+
+    incompatible_id = incompatible_create["data"]["id"]
+
+    incompatible_document =
+      incompatible_create["data"]["document"]
+      |> runtime_model_document(stored_credential_ref())
+      |> put_in(["model_references", Access.at(1), "capabilities", "structured_output"], false)
+
+    build_conn()
+    |> authenticated()
+    |> patch("/api/v1/configuration-revisions/#{incompatible_id}", %{"document" => incompatible_document})
+    |> json_response(200)
+
+    response =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/configuration-revisions/#{incompatible_id}/activate")
+      |> json_response(422)
+
+    assert response["error"]["code"] == "invalid_configuration"
+
+    assert Enum.any?(
+             response["error"]["details"],
+             &(&1["path"] == ["routing", "fallback_model_reference_id"] and
+                 &1["message"] == "must reference a model with structured_output capability")
+           )
+
+    active =
+      build_conn()
+      |> authenticated()
+      |> get("/api/v1/configuration-revisions/active")
+      |> json_response(200)
+
+    assert active["data"]["id"] == active_id
+    refute Jason.encode!(response) =~ "plain-provider-token"
+    refute Jason.encode!(response) =~ "\"api_key\""
   end
 
   test "bootstrap Administrator creates, validates, activates, and reads an Automation Project",
@@ -533,6 +665,78 @@ defmodule SymphonyElixirWeb.Api.V1.AutomationProjectControllerTest do
         "url" => "git@github.com:WangShayne/Symphony-works.git",
         "target_branch" => "main"
       }
+    }
+  end
+
+  defp runtime_model_document(document, credential_ref) do
+    document
+    |> Map.put("providers", [
+      %{
+        "id" => "codex-provider",
+        "name" => "Codex Provider",
+        "runtime_protocol" => "codex_app_server",
+        "endpoint" => "http://127.0.0.1:4010",
+        "credential_ref" => credential_ref
+      }
+    ])
+    |> Map.put("model_references", [
+      rest_model_reference("routing-model", credential_ref),
+      rest_model_reference("routing-fallback-model", credential_ref),
+      rest_model_reference("execution-fallback-model", credential_ref),
+      rest_model_reference("task-model", credential_ref)
+    ])
+    |> Map.put("routing", %{
+      "model_reference_id" => "routing-model",
+      "fallback_model_reference_id" => "routing-fallback-model",
+      "execution_fallback_model_reference_id" => "execution-fallback-model",
+      "profile" => %{
+        "id" => "routing-profile",
+        "runtime" => "codex",
+        "readonly" => true,
+        "allow_mutation" => false,
+        "high_risk_tools" => false,
+        "required_capabilities" => %{
+          "structured_output" => true,
+          "tool_use" => true,
+          "context_window" => 64_000
+        }
+      }
+    })
+    |> Map.put("execution_profiles", [
+      %{
+        "id" => "general-profile",
+        "name" => "General",
+        "runtime" => "codex",
+        "model_reference_id" => "task-model",
+        "instructions" => "Implement the accepted task.",
+        "required_capabilities" => %{
+          "structured_output" => true,
+          "tool_use" => true,
+          "context_window" => 64_000
+        }
+      }
+    ])
+  end
+
+  defp stored_credential_ref do
+    {:ok, reference} = SecretStore.put("codex-provider-token", "plain-provider-token", actor: "admin")
+    reference.id
+  end
+
+  defp rest_model_reference(id, credential_ref) do
+    %{
+      "id" => id,
+      "provider_id" => "codex-provider",
+      "endpoint" => "http://127.0.0.1:4010",
+      "model_id" => id,
+      "credential_ref" => credential_ref,
+      "context_window" => 128_000,
+      "capabilities" => %{
+        "structured_output" => true,
+        "tool_use" => true,
+        "context_window" => 128_000
+      },
+      "prices" => %{"input" => 0, "cached_input" => 0, "output" => 0}
     }
   end
 

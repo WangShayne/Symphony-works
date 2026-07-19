@@ -15,18 +15,20 @@ defmodule SymphonyElixir.Configuration do
   alias SymphonyElixir.Repo
   alias SymphonyElixir.Security.SecretStore
 
-  @spec create_draft(map(), keyword()) :: {:ok, Revision.t()} | {:error, Ecto.Changeset.t()}
+  @spec create_draft(map(), keyword()) :: {:ok, Revision.t()} | {:error, tuple() | Ecto.Changeset.t()}
   def create_draft(document, opts) when is_map(document) do
     actor = Keyword.fetch!(opts, :actor)
 
-    %Revision{}
-    |> Revision.draft_changeset(%{
-      document: document,
-      schema_version: Map.get(document, "schema_version"),
-      content_hash: Document.content_hash(document),
-      created_by: actor
-    })
-    |> Repo.insert()
+    with :ok <- validate_runtime_credential_references(document) do
+      %Revision{}
+      |> Revision.draft_changeset(%{
+        document: document,
+        schema_version: Map.get(document, "schema_version"),
+        content_hash: Document.content_hash(document),
+        created_by: actor
+      })
+      |> Repo.insert()
+    end
   end
 
   @spec update_draft(Ecto.UUID.t(), map(), keyword()) ::
@@ -35,7 +37,8 @@ defmodule SymphonyElixir.Configuration do
     _actor = Keyword.fetch!(opts, :actor)
 
     with %Revision{} = revision <- Repo.get(Revision, id),
-         :ok <- validate_transition(revision.status, :draft_update) do
+         :ok <- validate_transition(revision.status, :draft_update),
+         :ok <- validate_runtime_credential_references(document) do
       revision
       |> Revision.update_draft_changeset(%{
         document: document,
@@ -46,6 +49,30 @@ defmodule SymphonyElixir.Configuration do
     else
       nil -> {:error, :not_found}
       {:error, _reason} = error -> error
+    end
+  end
+
+  defp validate_runtime_credential_references(document) do
+    invalid_reference? =
+      ["providers", "model_references"]
+      |> Enum.flat_map(fn key ->
+        document
+        |> Map.get(key, [])
+        |> List.wrap()
+      end)
+      |> Enum.filter(&(is_map(&1) and Map.has_key?(&1, "credential_ref")))
+      |> Enum.map(&Map.get(&1, "credential_ref"))
+      |> Enum.any?(&(not SecretStore.valid_reference_id?(&1)))
+
+    if invalid_reference? do
+      {:error,
+       {:invalid_credential_ref,
+        %{
+          "credential_ref" => "[REDACTED]",
+          "reason" => "invalid_reference"
+        }}}
+    else
+      :ok
     end
   end
 

@@ -16,13 +16,48 @@ defmodule SymphonyElixir.Configuration.Document do
     "integrations",
     "tool_groups"
   ]
-  @empty_map_sections ["routing", "budgets", "acceptance", "network", "retention"]
-  @top_level_fields ["schema_version", "automation_projects"] ++
+  @empty_map_sections ["budgets", "acceptance", "network", "retention"]
+  @top_level_fields ["schema_version", "automation_projects", "routing"] ++
                       @list_sections ++ @empty_map_sections
   @project_fields ["id", "name", "tracker", "repository"]
   @tracker_fields ["kind", "scope"]
   @repository_fields ["url", "target_branch"]
-  @provider_fields ["id", "name", "credential_ref"]
+  @provider_fields ["id", "name", "runtime_protocol", "endpoint", "credential_ref"]
+  @model_reference_fields [
+    "id",
+    "provider_id",
+    "endpoint",
+    "model_id",
+    "credential_ref",
+    "context_window",
+    "capabilities",
+    "prices"
+  ]
+  @routing_fields [
+    "model_reference_id",
+    "fallback_model_reference_id",
+    "execution_fallback_model_reference_id",
+    "profile"
+  ]
+  @routing_profile_fields [
+    "id",
+    "runtime",
+    "readonly",
+    "allow_mutation",
+    "high_risk_tools",
+    "required_capabilities"
+  ]
+  @execution_profile_fields [
+    "id",
+    "name",
+    "runtime",
+    "model_reference_id",
+    "instructions",
+    "required_capabilities",
+    "active"
+  ]
+  @capability_fields ["structured_output", "tool_use", "context_window"]
+  @price_fields ["input", "cached_input", "output"]
 
   @required_project_paths [
     ["id"],
@@ -68,9 +103,12 @@ defmodule SymphonyElixir.Configuration.Document do
       |> require_automation_projects(document)
       |> require_list_sections(document, @list_sections)
       |> require_providers(document)
+      |> require_model_references(document)
       |> require_empty_sections(document, @empty_map_sections, %{})
+      |> validate_routing(document)
       |> validate_task_types(document)
       |> validate_execution_profiles(document)
+      |> validate_model_bindings(document)
       |> reject_unknown_fields(document, @top_level_fields, [])
 
     case errors do
@@ -154,6 +192,37 @@ defmodule SymphonyElixir.Configuration.Document do
     end)
   end
 
+  defp require_model_references(errors, %{"model_references" => references})
+       when is_list(references) do
+    references
+    |> Enum.with_index()
+    |> Enum.reduce(errors, fn {reference, index}, acc ->
+      validate_model_reference(acc, reference, index)
+    end)
+  end
+
+  defp require_model_references(errors, _document), do: errors
+
+  defp validate_model_reference(errors, reference, index) when is_map(reference) do
+    prefix = ["model_references", Integer.to_string(index)]
+
+    errors
+    |> require_paths(reference, prefix, [
+      ["id"],
+      ["provider_id"],
+      ["endpoint"],
+      ["model_id"],
+      ["credential_ref"]
+    ])
+    |> require_positive_integer(reference, prefix, "context_window")
+    |> validate_capabilities(reference, prefix)
+    |> validate_prices(reference, prefix)
+    |> reject_unknown_fields(reference, @model_reference_fields, prefix)
+    |> validate_secret_reference(reference, prefix)
+  end
+
+  defp validate_model_reference(errors, _reference, _index), do: errors
+
   defp validate_secret_reference(errors, %{"credential_ref" => reference}, prefix) when is_binary(reference) do
     if SecretStore.valid_reference_id?(reference) do
       errors
@@ -163,6 +232,58 @@ defmodule SymphonyElixir.Configuration.Document do
   end
 
   defp validate_secret_reference(errors, _provider, _prefix), do: errors
+
+  defp validate_routing(errors, %{"routing" => routing} = document) when is_map(routing) and map_size(routing) == 0 do
+    if runtime_bindings_configured?(document) do
+      errors
+      |> require_path(routing, ["routing"], ["model_reference_id"])
+      |> require_path(routing, ["routing"], ["fallback_model_reference_id"])
+      |> require_path(routing, ["routing"], ["execution_fallback_model_reference_id"])
+      |> then(&[%{path: ["routing", "profile"], message: "is required"} | &1])
+    else
+      errors
+    end
+  end
+
+  defp validate_routing(errors, %{"routing" => routing, "model_references" => references})
+       when is_map(routing) and is_list(references) do
+    prefix = ["routing"]
+
+    errors
+    |> require_paths(routing, prefix, [
+      ["model_reference_id"],
+      ["fallback_model_reference_id"],
+      ["execution_fallback_model_reference_id"]
+    ])
+    |> validate_routing_profile(routing, prefix)
+    |> reject_unknown_fields(routing, @routing_fields, prefix)
+  end
+
+  defp validate_routing(errors, %{"routing" => _routing}) do
+    [%{path: ["routing"], message: "must be an object"} | errors]
+  end
+
+  defp validate_routing(errors, _document), do: [%{path: ["routing"], message: "is required"} | errors]
+
+  defp validate_routing_profile(errors, %{"profile" => profile}, prefix) when is_map(profile) do
+    profile_prefix = prefix ++ ["profile"]
+
+    errors
+    |> require_paths(profile, profile_prefix, [["id"], ["runtime"]])
+    |> require_boolean(profile, profile_prefix, "readonly", true)
+    |> require_boolean(profile, profile_prefix, "allow_mutation", false)
+    |> require_boolean(profile, profile_prefix, "high_risk_tools", false)
+    |> validate_required_capabilities(profile, profile_prefix)
+    |> reject_unknown_fields(profile, @routing_profile_fields, profile_prefix)
+  end
+
+  defp validate_routing_profile(errors, %{"profile" => _profile}, prefix) do
+    [%{path: prefix ++ ["profile"], message: "must be an object"} | errors]
+  end
+
+  defp validate_routing_profile(errors, _routing, prefix) do
+    [%{path: prefix ++ ["profile"], message: "is required"} | errors]
+  end
 
   defp require_project_paths(errors, project, prefix) do
     Enum.reduce(@required_project_paths, errors, fn path, acc ->
@@ -225,12 +346,18 @@ defmodule SymphonyElixir.Configuration.Document do
        when is_list(profiles) do
     Enum.reduce(Enum.with_index(profiles), errors, fn
       {profile, index}, acc when is_map(profile) ->
-        require_paths(acc, profile, ["execution_profiles", Integer.to_string(index)], [
+        prefix = ["execution_profiles", Integer.to_string(index)]
+
+        acc
+        |> require_paths(profile, prefix, [
           ["id"],
           ["name"],
           ["runtime"],
           ["instructions"]
         ])
+        |> require_active_model_reference(profile, prefix)
+        |> validate_required_capabilities(profile, prefix)
+        |> reject_unknown_fields(profile, @execution_profile_fields, prefix)
 
       {_profile, _index}, acc ->
         acc
@@ -238,6 +365,315 @@ defmodule SymphonyElixir.Configuration.Document do
   end
 
   defp validate_execution_profiles(errors, _document), do: errors
+
+  defp runtime_bindings_configured?(document) do
+    Map.get(document, "model_references", []) != [] or
+      Enum.any?(Map.get(document, "execution_profiles", []), fn
+        %{"active" => false} -> false
+        profile when is_map(profile) -> true
+        _profile -> false
+      end)
+  end
+
+  defp require_active_model_reference(errors, %{"active" => false}, _prefix), do: errors
+
+  defp require_active_model_reference(errors, profile, prefix) do
+    require_path(errors, profile, prefix, ["model_reference_id"])
+  end
+
+  defp validate_model_bindings(errors, document) do
+    references = model_reference_index(document)
+    providers = provider_index(document)
+
+    errors
+    |> validate_provider_protocols(document)
+    |> validate_model_provider_references(document, providers)
+    |> validate_routing_model_bindings(document, references)
+    |> validate_execution_model_bindings(document, references)
+  end
+
+  defp validate_provider_protocols(errors, %{"providers" => providers}) when is_list(providers) do
+    Enum.reduce(Enum.with_index(providers), errors, fn
+      {provider, index}, acc when is_map(provider) ->
+        case Map.get(provider, "runtime_protocol") do
+          "codex_app_server" ->
+            acc
+
+          value when is_binary(value) ->
+            [%{path: ["providers", Integer.to_string(index), "runtime_protocol"], message: "must be codex_app_server"} | acc]
+
+          _value ->
+            acc
+        end
+
+      {_provider, _index}, acc ->
+        acc
+    end)
+  end
+
+  defp validate_provider_protocols(errors, _document), do: errors
+
+  defp validate_model_provider_references(errors, %{"model_references" => references}, providers)
+       when is_list(references) do
+    Enum.reduce(Enum.with_index(references), errors, fn
+      {reference, index}, acc when is_map(reference) ->
+        provider_id = Map.get(reference, "provider_id")
+
+        case Map.fetch(providers, provider_id) do
+          {:ok, {provider, provider_index}} ->
+            acc
+            |> require_path(provider, ["providers", Integer.to_string(provider_index)], ["runtime_protocol"])
+            |> require_path(provider, ["providers", Integer.to_string(provider_index)], ["endpoint"])
+
+          :error ->
+            [
+              %{
+                path: ["model_references", Integer.to_string(index), "provider_id"],
+                message: "must reference an existing provider"
+              }
+              | acc
+            ]
+        end
+
+      {_reference, _index}, acc ->
+        acc
+    end)
+  end
+
+  defp validate_model_provider_references(errors, _document, _providers), do: errors
+
+  defp validate_routing_model_bindings(errors, %{"routing" => routing}, references)
+       when is_map(routing) and map_size(routing) > 0 do
+    errors
+    |> validate_runtime_name(routing, ["routing", "profile"], "profile")
+    |> validate_model_reference_id(routing, references, ["routing"], "model_reference_id")
+    |> validate_model_reference_id(routing, references, ["routing"], "fallback_model_reference_id")
+    |> validate_model_reference_id(routing, references, ["routing"], "execution_fallback_model_reference_id")
+    |> validate_binding_capabilities(
+      Map.get(routing, "fallback_model_reference_id"),
+      routing_required_capabilities(routing),
+      references,
+      ["routing", "fallback_model_reference_id"]
+    )
+    |> validate_binding_capabilities(
+      Map.get(routing, "model_reference_id"),
+      routing_required_capabilities(routing),
+      references,
+      ["routing", "model_reference_id"]
+    )
+  end
+
+  defp validate_routing_model_bindings(errors, _document, _references), do: errors
+
+  defp validate_execution_model_bindings(errors, %{"execution_profiles" => profiles} = document, references)
+       when is_list(profiles) do
+    execution_fallback_model_id = execution_fallback_model_id(document)
+
+    Enum.reduce(Enum.with_index(profiles), errors, fn
+      {%{"active" => false}, _index}, acc ->
+        acc
+
+      {profile, index}, acc when is_map(profile) ->
+        prefix = ["execution_profiles", Integer.to_string(index)]
+        model_id = Map.get(profile, "model_reference_id")
+
+        acc
+        |> validate_runtime_name(profile, prefix, "runtime")
+        |> validate_model_reference_id(profile, references, prefix, "model_reference_id")
+        |> validate_binding_capabilities(
+          model_id,
+          Map.get(profile, "required_capabilities", %{}),
+          references,
+          prefix ++ ["model_reference_id"]
+        )
+        |> validate_binding_capabilities(
+          execution_fallback_model_id,
+          Map.get(profile, "required_capabilities", %{}),
+          references,
+          prefix ++ ["execution_fallback_model_reference_id"]
+        )
+
+      {_profile, _index}, acc ->
+        acc
+    end)
+  end
+
+  defp validate_execution_model_bindings(errors, _document, _references), do: errors
+
+  defp execution_fallback_model_id(%{"routing" => %{"execution_fallback_model_reference_id" => model_id}}),
+    do: model_id
+
+  defp execution_fallback_model_id(_document), do: nil
+
+  defp validate_model_reference_id(errors, value, references, prefix, field) do
+    case Map.get(value, field) do
+      nil ->
+        errors
+
+      id when is_binary(id) ->
+        if Map.has_key?(references, id) do
+          errors
+        else
+          [%{path: prefix ++ [field], message: "must reference an existing model"} | errors]
+        end
+
+      _other ->
+        [%{path: prefix ++ [field], message: "must reference an existing model"} | errors]
+    end
+  end
+
+  defp validate_runtime_name(errors, %{"profile" => %{"runtime" => runtime}}, prefix, _field) do
+    validate_runtime_name(errors, %{"runtime" => runtime}, prefix, "runtime")
+  end
+
+  defp validate_runtime_name(errors, %{"runtime" => "codex"}, _prefix, _field), do: errors
+
+  defp validate_runtime_name(errors, %{"runtime" => runtime}, prefix, field) when is_binary(runtime) do
+    [%{path: prefix ++ [field], message: "must be compatible with codex_app_server"} | errors]
+  end
+
+  defp validate_runtime_name(errors, _value, _prefix, _field), do: errors
+
+  defp validate_binding_capabilities(errors, model_id, required, references, path)
+       when is_binary(model_id) and is_map(required) do
+    case Map.fetch(references, model_id) do
+      {:ok, model} -> enforce_capability_ceiling(errors, Map.get(model, "capabilities", %{}), required, path)
+      :error -> errors
+    end
+  end
+
+  defp validate_binding_capabilities(errors, _model_id, _required, _references, _path), do: errors
+
+  defp routing_required_capabilities(%{"profile" => %{"required_capabilities" => capabilities}})
+       when is_map(capabilities),
+       do: capabilities
+
+  defp routing_required_capabilities(_routing), do: %{}
+
+  defp enforce_capability_ceiling(errors, capabilities, required, path) do
+    capabilities = if is_map(capabilities), do: capabilities, else: %{}
+
+    errors
+    |> enforce_boolean_capability(capabilities, required, path, "structured_output")
+    |> enforce_boolean_capability(capabilities, required, path, "tool_use")
+    |> enforce_context_window(capabilities, required, path)
+  end
+
+  defp enforce_boolean_capability(errors, capabilities, required, path, capability) do
+    if Map.get(required, capability) == true and Map.get(capabilities, capability) != true do
+      [%{path: path, message: "must reference a model with #{capability} capability"} | errors]
+    else
+      errors
+    end
+  end
+
+  defp enforce_context_window(errors, capabilities, required, path) do
+    required_window = Map.get(required, "context_window")
+    available_window = Map.get(capabilities, "context_window")
+
+    if is_integer(required_window) and is_integer(available_window) and available_window < required_window do
+      [%{path: path, message: "must reference a model with sufficient context_window capability"} | errors]
+    else
+      errors
+    end
+  end
+
+  defp validate_capabilities(errors, %{"capabilities" => capabilities}, prefix)
+       when is_map(capabilities) do
+    errors
+    |> require_boolean(capabilities, prefix ++ ["capabilities"], "structured_output", nil)
+    |> require_boolean(capabilities, prefix ++ ["capabilities"], "tool_use", nil)
+    |> require_positive_integer(capabilities, prefix ++ ["capabilities"], "context_window")
+    |> reject_unknown_fields(capabilities, @capability_fields, prefix ++ ["capabilities"])
+  end
+
+  defp validate_capabilities(errors, _value, prefix) do
+    [%{path: prefix ++ ["capabilities"], message: "is required"} | errors]
+  end
+
+  defp validate_required_capabilities(errors, %{"required_capabilities" => capabilities}, prefix)
+       when is_map(capabilities) do
+    errors
+    |> validate_optional_boolean(capabilities, prefix ++ ["required_capabilities"], "structured_output")
+    |> validate_optional_boolean(capabilities, prefix ++ ["required_capabilities"], "tool_use")
+    |> validate_optional_positive_integer(capabilities, prefix ++ ["required_capabilities"], "context_window")
+    |> reject_unknown_fields(capabilities, @capability_fields, prefix ++ ["required_capabilities"])
+  end
+
+  defp validate_required_capabilities(errors, _value, _prefix), do: errors
+
+  defp validate_prices(errors, %{"prices" => prices}, prefix) when is_map(prices) do
+    errors
+    |> require_price(prices, prefix, "input")
+    |> require_price(prices, prefix, "cached_input")
+    |> require_price(prices, prefix, "output")
+    |> reject_unknown_fields(prices, @price_fields, prefix ++ ["prices"])
+  end
+
+  defp validate_prices(errors, _value, prefix), do: [%{path: prefix ++ ["prices"], message: "is required"} | errors]
+
+  defp require_price(errors, prices, prefix, field) do
+    case Map.get(prices, field) do
+      value when is_number(value) and value >= 0 -> errors
+      _value -> [%{path: prefix ++ ["prices", field], message: "must be a non-negative number"} | errors]
+    end
+  end
+
+  defp require_boolean(errors, value, prefix, field, expected) do
+    case Map.get(value, field) do
+      ^expected when is_boolean(expected) ->
+        errors
+
+      actual when is_boolean(actual) and is_nil(expected) ->
+        errors
+
+      _actual when is_nil(expected) ->
+        [%{path: prefix ++ [field], message: "must be a boolean"} | errors]
+
+      _actual ->
+        [%{path: prefix ++ [field], message: "must be #{expected}"} | errors]
+    end
+  end
+
+  defp validate_optional_boolean(errors, value, prefix, field) do
+    case Map.get(value, field) do
+      nil -> errors
+      actual when is_boolean(actual) -> errors
+      _actual -> [%{path: prefix ++ [field], message: "must be a boolean"} | errors]
+    end
+  end
+
+  defp require_positive_integer(errors, value, prefix, field) do
+    case Map.get(value, field) do
+      actual when is_integer(actual) and actual > 0 -> errors
+      _actual -> [%{path: prefix ++ [field], message: "must be a positive integer"} | errors]
+    end
+  end
+
+  defp validate_optional_positive_integer(errors, value, prefix, field) do
+    case Map.get(value, field) do
+      nil -> errors
+      actual when is_integer(actual) and actual > 0 -> errors
+      _actual -> [%{path: prefix ++ [field], message: "must be a positive integer"} | errors]
+    end
+  end
+
+  defp model_reference_index(%{"model_references" => references}) when is_list(references) do
+    references
+    |> Enum.filter(&is_map/1)
+    |> Map.new(fn reference -> {Map.get(reference, "id"), reference} end)
+  end
+
+  defp model_reference_index(_document), do: %{}
+
+  defp provider_index(%{"providers" => providers}) when is_list(providers) do
+    providers
+    |> Enum.with_index()
+    |> Enum.filter(fn {provider, _index} -> is_map(provider) end)
+    |> Map.new(fn {provider, index} -> {Map.get(provider, "id"), {provider, index}} end)
+  end
+
+  defp provider_index(_document), do: %{}
 
   defp require_empty_sections(errors, document, sections, empty_value) do
     Enum.reduce(sections, errors, fn section, acc ->

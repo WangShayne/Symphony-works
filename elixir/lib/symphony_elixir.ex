@@ -36,6 +36,7 @@ defmodule SymphonyElixir.Application do
   @doc false
   @spec start_runtime() :: Supervisor.on_start()
   def start_runtime do
+    :ok = SymphonyElixir.Identity.validate_auth_configuration!()
     :ok = BootstrapPlug.validate_configuration!()
     :ok = MasterKey.validate_configuration!()
     :ok = SymphonyElixir.LogFile.configure()

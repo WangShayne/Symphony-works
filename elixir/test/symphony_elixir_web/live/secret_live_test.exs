@@ -5,6 +5,7 @@ defmodule SymphonyElixirWeb.SecretLiveTest do
 
   alias SymphonyElixir.Configuration
   alias SymphonyElixir.Configuration.{Document, Revision}
+  alias SymphonyElixir.Identity
   alias SymphonyElixir.Repo
   alias SymphonyElixir.Security.SecretStore
 
@@ -62,6 +63,32 @@ defmodule SymphonyElixirWeb.SecretLiveTest do
 
     assert html =~ "Secret could not be stored"
     refute html =~ "plain-value"
+  end
+
+  test "mounted bootstrap secrets Dashboard cannot store after bootstrap retires", %{conn: conn} do
+    conn = put_req_header(conn, "authorization", "Bearer #{@bootstrap_token}")
+    {:ok, view, _html} = live(conn, "/configuration/secrets")
+
+    assert {:ok, _admin} =
+             Identity.upsert_oidc_principal(%{
+               issuer: "https://issuer.example.test",
+               subject: "retiring-admin",
+               email: "admin@example.test",
+               roles: [:administrator]
+             })
+
+    before_references = SecretStore.list_references()
+    refute Enum.any?(before_references, &(&1.name == "github"))
+
+    view
+    |> form("#secret-form", secret: %{"name" => "github", "value" => "plain-value"})
+    |> render_submit()
+
+    assert_redirect(view, "/auth/login")
+
+    after_references = SecretStore.list_references()
+    refute Enum.any?(after_references, &(&1.name == "github"))
+    assert MapSet.new(after_references, & &1.id) == MapSet.new(before_references, & &1.id)
   end
 
   test "dashboard lists persisted references and replaces a selected secret after remount", %{conn: conn} do

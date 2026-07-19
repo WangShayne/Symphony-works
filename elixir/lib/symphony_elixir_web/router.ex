@@ -14,13 +14,23 @@ defmodule SymphonyElixirWeb.Router do
     plug(:put_secure_browser_headers)
   end
 
-  pipeline :configuration_api do
+  pipeline :trusted_admin_api do
     plug(:accepts, ["json"])
-    plug(SymphonyElixirWeb.Auth.BootstrapPlug)
+    plug(SymphonyElixirWeb.Auth.TrustedAdminPlug, surface: :api)
   end
 
-  pipeline :bootstrap_admin do
-    plug(SymphonyElixirWeb.Auth.BootstrapPlug)
+  pipeline :authenticated_browser do
+    plug(SymphonyElixirWeb.Auth.SessionPlug)
+  end
+
+  pipeline :authenticated_api do
+    plug(:accepts, ["json"])
+    plug(SymphonyElixirWeb.Auth.BearerPlug)
+    plug(SymphonyElixirWeb.Plugs.Authorize)
+  end
+
+  pipeline :trusted_admin_browser do
+    plug(SymphonyElixirWeb.Auth.TrustedAdminPlug, surface: :browser)
   end
 
   scope "/", SymphonyElixirWeb do
@@ -35,17 +45,36 @@ defmodule SymphonyElixirWeb.Router do
     pipe_through(:browser)
 
     live("/", DashboardLive, :index)
+    get("/auth/login", Auth.Controller, :login)
+    get("/auth/logout", Auth.Controller, :logout)
+    get("/auth/oidc/start", Auth.Controller, :start)
+    get("/auth/oidc/callback", Auth.Controller, :callback)
   end
 
   scope "/", SymphonyElixirWeb do
-    pipe_through([:browser, :bootstrap_admin])
+    pipe_through([:browser, :authenticated_browser])
+
+    live("/tasks", PlaceholderLive, :index)
+    live("/:locale/tasks", PlaceholderLive, :index)
+    live("/interventions", PlaceholderLive, :index)
+    live("/projects", PlaceholderLive, :index)
+    live("/models", PlaceholderLive, :index)
+    live("/profiles", PlaceholderLive, :index)
+    live("/integrations", PlaceholderLive, :index)
+    live("/audit", PlaceholderLive, :index)
+    live("/health", PlaceholderLive, :index)
+    live("/backups", PlaceholderLive, :index)
+  end
+
+  scope "/", SymphonyElixirWeb do
+    pipe_through([:browser, :trusted_admin_browser])
 
     live("/configuration", ConfigurationLive, :index)
     live("/configuration/secrets", Configuration.SecretLive, :index)
   end
 
   scope "/api/v1", SymphonyElixirWeb.Api.V1 do
-    pipe_through(:configuration_api)
+    pipe_through(:trusted_admin_api)
 
     post("/automation-projects", AutomationProjectController, :create)
     get("/configuration/templates", AutomationProjectController, :templates)
@@ -67,6 +96,15 @@ defmodule SymphonyElixirWeb.Router do
     get("/configuration-revisions/active", AutomationProjectController, :active)
     post("/configuration-task-pins", AutomationProjectController, :pin_task)
     get("/configuration-task-pins/:task_id", AutomationProjectController, :pinned_task)
+  end
+
+  scope "/api/v1", SymphonyElixirWeb.Api.V1 do
+    pipe_through(:authenticated_api)
+
+    get("/tasks", PlaceholderController, :index)
+    post("/tasks/:id/retry", PlaceholderController, :accepted)
+    get("/configuration", PlaceholderController, :index, resource: "configuration")
+    get("/secrets", PlaceholderController, :index, resource: "secrets")
   end
 
   scope "/", SymphonyElixirWeb do

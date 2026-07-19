@@ -7,9 +7,18 @@ defmodule SymphonyElixirWeb.ConfigurationLive do
 
   alias SymphonyElixir.Configuration
   alias SymphonyElixir.Configuration.Document
+  alias SymphonyElixir.Identity
+  alias SymphonyElixir.Identity.Authorization
 
   @impl true
-  def mount(_params, %{"bootstrap_admin" => true}, socket) do
+  def mount(_params, session, socket) do
+    case trusted_admin_actor(session, :write_configuration) do
+      {:ok, actor} -> mount_configuration(socket, actor, trusted_admin_context(session))
+      {:error, _reason} -> {:ok, redirect(socket, to: "/auth/login")}
+    end
+  end
+
+  defp mount_configuration(socket, actor, auth_context) do
     active =
       case Configuration.active() do
         {:ok, revision} -> revision
@@ -23,95 +32,126 @@ defmodule SymphonyElixirWeb.ConfigurationLive do
        previous_active: nil,
        templates: nil,
        exported: nil,
-       error: nil
+       error: nil,
+       actor: actor,
+       auth_context: auth_context
      )}
   end
 
   @impl true
   def handle_event("create", params, socket) do
-    result =
-      case params do
-        %{"project" => project} when is_map(project) ->
-          Configuration.create_draft(Document.for_project(project), actor: "bootstrap-admin")
+    authorize_event(socket, :write_configuration, fn actor ->
+      result =
+        case params do
+          %{"project" => project} when is_map(project) ->
+            Configuration.create_draft(Document.for_project(project), actor: actor)
 
-        _invalid_params ->
-          {:error, %{project: ["is required"]}}
+          _invalid_params ->
+            {:error, %{project: ["is required"]}}
+        end
+
+      case result do
+        {:ok, revision} -> {:noreply, assign(socket, revision: revision, exported: nil, error: nil, actor: actor)}
+        {:error, reason} -> {:noreply, assign(socket, error: error_message(reason), actor: actor)}
       end
-
-    case result do
-      {:ok, revision} -> {:noreply, assign(socket, revision: revision, exported: nil, error: nil)}
-      {:error, reason} -> {:noreply, assign(socket, error: error_message(reason))}
-    end
+    end)
   end
 
   def handle_event("update_draft", %{"project" => project}, %{assigns: %{revision: revision}} = socket)
       when not is_nil(revision) do
-    document = Document.for_project(project)
+    authorize_event(socket, :write_configuration, fn actor ->
+      document = Document.for_project(project)
 
-    case Configuration.update_draft(revision.id, document, actor: "bootstrap-admin") do
-      {:ok, revision} -> {:noreply, assign(socket, revision: revision, exported: nil, error: nil)}
-      {:error, reason} -> {:noreply, assign(socket, error: error_message(reason))}
-    end
+      case Configuration.update_draft(revision.id, document, actor: actor) do
+        {:ok, revision} -> {:noreply, assign(socket, revision: revision, exported: nil, error: nil, actor: actor)}
+        {:error, reason} -> {:noreply, assign(socket, error: error_message(reason), actor: actor)}
+      end
+    end)
   end
 
   def handle_event("templates", _params, socket) do
-    {:noreply, assign(socket, templates: Configuration.templates(), error: nil)}
+    authorize_event(socket, :write_configuration, fn actor ->
+      {:noreply, assign(socket, templates: Configuration.templates(), error: nil, actor: actor)}
+    end)
   end
 
   def handle_event("import_workflow", %{"workflow" => workflow}, socket) do
-    case Configuration.import(Map.take(workflow, ["content"]), actor: "bootstrap-admin") do
-      {:ok, revision} -> {:noreply, assign(socket, revision: revision, exported: nil, error: nil)}
-      {:error, reason} -> {:noreply, assign(socket, error: error_message(reason))}
-    end
+    authorize_event(socket, :write_configuration, fn actor ->
+      case Configuration.import(Map.take(workflow, ["content"]), actor: actor) do
+        {:ok, revision} -> {:noreply, assign(socket, revision: revision, exported: nil, error: nil, actor: actor)}
+        {:error, reason} -> {:noreply, assign(socket, error: error_message(reason), actor: actor)}
+      end
+    end)
   end
 
   def handle_event("import_workflow", _params, socket) do
-    {:noreply, assign(socket, error: "Invalid configuration")}
+    authorize_event(socket, :write_configuration, fn actor ->
+      {:noreply, assign(socket, error: "Invalid configuration", actor: actor)}
+    end)
   end
 
   def handle_event("validate", _params, %{assigns: %{revision: revision}} = socket)
       when not is_nil(revision) do
-    case Configuration.validate(revision.id, actor: "bootstrap-admin", probes: configured_probes()) do
-      {:ok, validated} -> {:noreply, assign(socket, revision: validated, error: nil)}
-      {:error, reason} -> {:noreply, assign(socket, error: error_message(reason))}
-    end
+    authorize_event(socket, :write_configuration, fn actor ->
+      case Configuration.validate(revision.id, actor: actor, probes: configured_probes()) do
+        {:ok, validated} -> {:noreply, assign(socket, revision: validated, error: nil, actor: actor)}
+        {:error, reason} -> {:noreply, assign(socket, error: error_message(reason), actor: actor)}
+      end
+    end)
   end
 
   def handle_event("activate", _params, %{assigns: %{revision: revision}} = socket)
       when not is_nil(revision) do
-    previous_active = socket.assigns.active
+    authorize_event(socket, :write_configuration, fn actor ->
+      previous_active = socket.assigns.active
 
-    case Configuration.activate(revision.id, actor: "bootstrap-admin", probes: configured_probes()) do
-      {:ok, active} ->
-        {:noreply,
-         assign(socket,
-           revision: active,
-           active: active,
-           previous_active: previous_active,
-           exported: nil,
-           error: nil
-         )}
+      case Configuration.activate(revision.id, actor: actor, probes: configured_probes()) do
+        {:ok, active} ->
+          {:noreply,
+           assign(socket,
+             revision: active,
+             active: active,
+             previous_active: previous_active,
+             exported: nil,
+             error: nil,
+             actor: actor
+           )}
 
-      {:error, reason} ->
-        {:noreply, assign(socket, error: error_message(reason))}
-    end
+        {:error, reason} ->
+          {:noreply, assign(socket, error: error_message(reason), actor: actor)}
+      end
+    end)
   end
 
   def handle_event("export", _params, %{assigns: %{active: active}} = socket) when not is_nil(active) do
-    case Configuration.export(active.id, redacted: true) do
-      {:ok, exported} -> {:noreply, assign(socket, exported: Jason.encode!(exported), error: nil)}
-      {:error, reason} -> {:noreply, assign(socket, error: error_message(reason))}
-    end
+    authorize_event(socket, :write_configuration, fn actor ->
+      case Configuration.export(active.id, redacted: true) do
+        {:ok, exported} -> {:noreply, assign(socket, exported: Jason.encode!(exported), error: nil, actor: actor)}
+        {:error, reason} -> {:noreply, assign(socket, error: error_message(reason), actor: actor)}
+      end
+    end)
   end
 
   def handle_event("rollback", %{"id" => id}, socket) do
-    case Configuration.rollback(id, actor: "bootstrap-admin", probes: configured_probes()) do
-      {:ok, active} ->
-        {:noreply, assign(socket, revision: active, active: active, previous_active: nil, exported: nil, error: nil)}
+    authorize_event(socket, :write_configuration, fn actor ->
+      case Configuration.rollback(id, actor: actor, probes: configured_probes()) do
+        {:ok, active} ->
+          socket =
+            assign(socket,
+              revision: active,
+              active: active,
+              previous_active: nil,
+              exported: nil,
+              error: nil,
+              actor: actor
+            )
 
-      {:error, reason} ->
-        {:noreply, assign(socket, error: error_message(reason))}
-    end
+          {:noreply, socket}
+
+        {:error, reason} ->
+          {:noreply, assign(socket, error: error_message(reason), actor: actor)}
+      end
+    end)
   end
 
   defp error_message(:not_found), do: "Configuration revision not found"
@@ -128,6 +168,35 @@ defmodule SymphonyElixirWeb.ConfigurationLive do
       _other -> []
     end
   end
+
+  defp authorize_event(socket, action, fun) when is_function(fun, 1) do
+    case trusted_admin_actor(socket.assigns.auth_context, action) do
+      {:ok, actor} -> fun.(actor)
+      {:error, _reason} -> {:noreply, redirect(socket, to: "/auth/login")}
+    end
+  end
+
+  defp trusted_admin_actor(%{"bootstrap_admin" => true}, _action) do
+    if Identity.bootstrap_retired?(), do: {:error, :unauthorized}, else: {:ok, "bootstrap-admin"}
+  end
+
+  defp trusted_admin_actor(%{"principal_id" => principal_id}, action) when is_binary(principal_id) do
+    case Identity.get_principal(principal_id) do
+      {:ok, principal} ->
+        case Authorization.authorize(principal, action) do
+          :ok -> {:ok, principal.id}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp trusted_admin_actor(_session, _action), do: {:error, :unauthorized}
+
+  defp trusted_admin_context(%{"bootstrap_admin" => true}), do: %{"bootstrap_admin" => true}
+  defp trusted_admin_context(%{"principal_id" => principal_id}) when is_binary(principal_id), do: %{"principal_id" => principal_id}
 
   @impl true
   def render(assigns) do
@@ -160,7 +229,7 @@ defmodule SymphonyElixirWeb.ConfigurationLive do
               required
             />
           </label>
-          <label>
+          <label class="wide-field">
             Repository URL
             <input
               name="project[repository][url]"
@@ -219,7 +288,7 @@ defmodule SymphonyElixirWeb.ConfigurationLive do
             Tracker scope
             <input name="project[tracker][scope]" value={@revision.document["automation_projects"] |> hd() |> Map.fetch!("tracker") |> Map.fetch!("scope")} required />
           </label>
-          <label>
+          <label class="wide-field">
             Repository URL
             <input name="project[repository][url]" value={@revision.document["automation_projects"] |> hd() |> Map.fetch!("repository") |> Map.fetch!("url")} required />
           </label>

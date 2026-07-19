@@ -7,6 +7,8 @@ defmodule SymphonyElixirWeb.Auth.BootstrapPlug do
 
   import Plug.Conn
 
+  alias SymphonyElixir.Identity.Principal
+
   @behaviour Plug
   @minimum_token_bytes 32
 
@@ -29,12 +31,13 @@ defmodule SymphonyElixirWeb.Auth.BootstrapPlug do
   def call(conn, _opts) do
     expected = Application.get_env(:symphony_elixir, :bootstrap_token)
 
-    with ["Bearer " <> presented] <- get_req_header(conn, "authorization"),
+    with false <- SymphonyElixir.Identity.bootstrap_retired?(),
+         ["Bearer " <> presented] <- get_req_header(conn, "authorization"),
          true <- valid_token?(presented, expected) do
       conn
       |> fetch_session()
       |> put_session("bootstrap_admin", true)
-      |> assign(:current_principal, %{id: "bootstrap-admin", roles: [:administrator]})
+      |> assign(:current_principal, %Principal{id: "bootstrap-admin", subject: "bootstrap", roles: [:administrator]})
     else
       _ -> reject(conn)
     end

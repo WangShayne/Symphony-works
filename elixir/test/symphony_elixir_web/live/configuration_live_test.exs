@@ -5,6 +5,7 @@ defmodule SymphonyElixirWeb.ConfigurationLiveTest do
 
   alias SymphonyElixir.Configuration
   alias SymphonyElixir.Configuration.{Document, Revision}
+  alias SymphonyElixir.Identity
   alias SymphonyElixir.Repo
 
   @bootstrap_token "test-bootstrap-token-with-32-bytes"
@@ -83,6 +84,28 @@ defmodule SymphonyElixirWeb.ConfigurationLiveTest do
 
     assert render_submit(view, "create", %{}) =~ "Invalid configuration"
     assert has_element?(view, ~s([role="alert"]))
+  end
+
+  test "mounted bootstrap Dashboard cannot create after bootstrap retires", %{conn: conn} do
+    conn = put_req_header(conn, "authorization", "Bearer #{@bootstrap_token}")
+    {:ok, view, _html} = live(conn, "/configuration")
+
+    assert {:ok, _admin} =
+             Identity.upsert_oidc_principal(%{
+               issuer: "https://issuer.example.test",
+               subject: "retiring-admin",
+               email: "admin@example.test",
+               roles: [:administrator]
+             })
+
+    assert Repo.aggregate(Revision, :count) == 0
+
+    view
+    |> form("#project-form", project: valid_project())
+    |> render_submit()
+
+    assert_redirect(view, "/auth/login")
+    assert Repo.aggregate(Revision, :count) == 0
   end
 
   test "Dashboard reports when a validated revision disappears before activation", %{conn: conn} do

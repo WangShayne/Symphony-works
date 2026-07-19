@@ -26,6 +26,8 @@ if config_env() != :test do
   end
 
   config :symphony_elixir,
+    env: config_env(),
+    auth: [mode: :oidc],
     bootstrap_token: System.get_env("SYMPHONY_BOOTSTRAP_TOKEN"),
     master_key_base64: master_key_base64
 end

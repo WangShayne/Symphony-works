@@ -6,49 +6,65 @@ defmodule SymphonyElixirWeb.Configuration.SecretLive do
   use Phoenix.LiveView
 
   alias SymphonyElixir.Configuration
+  alias SymphonyElixir.Identity
+  alias SymphonyElixir.Identity.Authorization
   alias SymphonyElixir.Security.SecretStore
 
   @impl true
-  def mount(_params, %{"bootstrap_admin" => true}, socket) do
+  def mount(_params, session, socket) do
+    case trusted_admin_actor(session, :write_secret) do
+      {:ok, actor} -> mount_secrets(socket, actor, trusted_admin_context(session))
+      {:error, _reason} -> {:ok, redirect(socket, to: "/auth/login")}
+    end
+  end
+
+  defp mount_secrets(socket, actor, auth_context) do
     {:ok,
      assign(socket,
        error: nil,
        bind_message: nil,
        reference: nil,
-       references: SecretStore.list_references()
+       references: SecretStore.list_references(),
+       actor: actor,
+       auth_context: auth_context
      )}
   end
 
   @impl true
   def handle_event("save", %{"secret" => %{"name" => name, "value" => value} = params}, socket) do
-    result =
-      case selected_reference(params) do
-        {:ok, nil} ->
-          SecretStore.put(name, value, actor: "bootstrap-admin")
+    authorize_event(socket, :write_secret, fn actor ->
+      result =
+        case selected_reference(params) do
+          {:ok, nil} ->
+            SecretStore.put(name, value, actor: actor)
 
+          {:ok, reference} ->
+            SecretStore.replace(reference, value, actor: actor)
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      case result do
         {:ok, reference} ->
-          SecretStore.replace(reference, value, actor: "bootstrap-admin")
+          {:noreply,
+           assign(socket,
+             reference: reference,
+             references: SecretStore.list_references(),
+             error: nil,
+             actor: actor
+           )}
 
-        {:error, reason} ->
-          {:error, reason}
+        {:error, _reason} ->
+          {:noreply, assign(socket, error: "Secret could not be stored", actor: actor)}
       end
-
-    case result do
-      {:ok, reference} ->
-        {:noreply,
-         assign(socket,
-           reference: reference,
-           references: SecretStore.list_references(),
-           error: nil
-         )}
-
-      {:error, _reason} ->
-        {:noreply, assign(socket, error: "Secret could not be stored")}
-    end
+    end)
   end
 
   def handle_event("save", _params, socket) do
-    {:noreply, assign(socket, error: "Secret could not be stored")}
+    authorize_event(socket, :write_secret, fn actor ->
+      {:noreply, assign(socket, error: "Secret could not be stored", actor: actor)}
+    end)
   end
 
   def handle_event(
@@ -63,27 +79,31 @@ defmodule SymphonyElixirWeb.Configuration.SecretLive do
         },
         socket
       ) do
-    result =
-      with {:ok, reference} <- SecretStore.reference_for_id(secret_id) do
-        Configuration.bind_provider_credential(
-          revision_id,
-          %{"id" => provider_id, "name" => provider_name},
-          SecretStore.export_reference(reference),
-          actor: "bootstrap-admin"
-        )
+    authorize_event(socket, :write_secret, fn actor ->
+      result =
+        with {:ok, reference} <- SecretStore.reference_for_id(secret_id) do
+          Configuration.bind_provider_credential(
+            revision_id,
+            %{"id" => provider_id, "name" => provider_name},
+            SecretStore.export_reference(reference),
+            actor: actor
+          )
+        end
+
+      case result do
+        {:ok, _revision} ->
+          {:noreply, assign(socket, bind_message: "Provider credential bound", error: nil, actor: actor)}
+
+        {:error, _reason} ->
+          {:noreply, assign(socket, error: "Provider credential could not be bound", actor: actor)}
       end
-
-    case result do
-      {:ok, _revision} ->
-        {:noreply, assign(socket, bind_message: "Provider credential bound", error: nil)}
-
-      {:error, _reason} ->
-        {:noreply, assign(socket, error: "Provider credential could not be bound")}
-    end
+    end)
   end
 
   def handle_event("bind_provider", _params, socket) do
-    {:noreply, assign(socket, error: "Provider credential could not be bound")}
+    authorize_event(socket, :write_secret, fn actor ->
+      {:noreply, assign(socket, error: "Provider credential could not be bound", actor: actor)}
+    end)
   end
 
   @impl true
@@ -165,4 +185,33 @@ defmodule SymphonyElixirWeb.Configuration.SecretLive do
   defp selected_reference(%{"reference_id" => ""}), do: {:ok, nil}
   defp selected_reference(%{"reference_id" => id}) when is_binary(id), do: SecretStore.reference_for_id(id)
   defp selected_reference(_params), do: {:ok, nil}
+
+  defp authorize_event(socket, action, fun) when is_function(fun, 1) do
+    case trusted_admin_actor(socket.assigns.auth_context, action) do
+      {:ok, actor} -> fun.(actor)
+      {:error, _reason} -> {:noreply, redirect(socket, to: "/auth/login")}
+    end
+  end
+
+  defp trusted_admin_actor(%{"bootstrap_admin" => true}, _action) do
+    if Identity.bootstrap_retired?(), do: {:error, :unauthorized}, else: {:ok, "bootstrap-admin"}
+  end
+
+  defp trusted_admin_actor(%{"principal_id" => principal_id}, action) when is_binary(principal_id) do
+    case Identity.get_principal(principal_id) do
+      {:ok, principal} ->
+        case Authorization.authorize(principal, action) do
+          :ok -> {:ok, principal.id}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp trusted_admin_actor(_session, _action), do: {:error, :unauthorized}
+
+  defp trusted_admin_context(%{"bootstrap_admin" => true}), do: %{"bootstrap_admin" => true}
+  defp trusted_admin_context(%{"principal_id" => principal_id}) when is_binary(principal_id), do: %{"principal_id" => principal_id}
 end

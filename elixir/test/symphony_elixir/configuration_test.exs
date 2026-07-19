@@ -3,6 +3,7 @@ defmodule SymphonyElixir.ConfigurationTest do
 
   alias SymphonyElixir.Configuration
   alias SymphonyElixir.Configuration.{Document, Exporter, Validator}
+  alias SymphonyElixir.Security.SecretStore
 
   defmodule FailingProbe do
     @behaviour SymphonyElixir.Configuration.Probe
@@ -215,6 +216,125 @@ defmodule SymphonyElixir.ConfigurationTest do
       |> Map.put("execution_profiles", templates["execution_profiles"])
 
     assert {:ok, ^document} = Document.validate(document)
+  end
+
+  test "draft revision binds provider-owned credential references without tracker duplication or plaintext" do
+    {:ok, reference} = SecretStore.put("linear-api-token", "plain-provider-token", actor: "bootstrap-admin")
+    {:ok, draft} = Configuration.create_draft(valid_document(), actor: "bootstrap-admin")
+
+    assert {:ok, updated} =
+             Configuration.bind_provider_credential(
+               draft.id,
+               %{"id" => "linear", "name" => "Linear"},
+               SecretStore.export_reference(reference),
+               actor: "bootstrap-admin"
+             )
+
+    assert updated.status == :draft
+    assert updated.document["automation_projects"] |> hd() |> get_in(["tracker", "credential_ref"]) == nil
+
+    assert updated.document["providers"] == [
+             %{
+               "id" => "linear",
+               "name" => "Linear",
+               "credential_ref" => reference.id
+             }
+           ]
+
+    refute Jason.encode!(updated.document) =~ "plain-provider-token"
+    refute Jason.encode!(updated.document) =~ "linear-api-token"
+  end
+
+  test "provider credential binding rejects missing, mismatched, and non-draft revisions" do
+    {:ok, reference} = SecretStore.put("linear-api-token", "plain-provider-token", actor: "bootstrap-admin")
+    {:ok, draft} = Configuration.create_draft(valid_document(), actor: "bootstrap-admin")
+    {:ok, active} = Configuration.activate(draft.id, actor: "bootstrap-admin")
+    {:ok, next_draft} = Configuration.create_draft(valid_document(), actor: "bootstrap-admin")
+
+    provider = %{"id" => "linear", "name" => "Linear"}
+    missing_reference = %{"id" => Ecto.UUID.generate(), "name" => "linear-api-token"}
+    mismatched_reference = %{"id" => reference.id, "name" => "wrong-name"}
+
+    assert {:error, :not_found} =
+             Configuration.bind_provider_credential(next_draft.id, provider, missing_reference, actor: "bootstrap-admin")
+
+    assert {:error, :reference_mismatch} =
+             Configuration.bind_provider_credential(next_draft.id, provider, mismatched_reference, actor: "bootstrap-admin")
+
+    assert {:error, {:invalid_transition, :active, :draft}} =
+             Configuration.bind_provider_credential(active.id, provider, SecretStore.export_reference(reference), actor: "bootstrap-admin")
+  end
+
+  test "provider credential binding normalizes atom maps and replaces existing providers" do
+    {:ok, first_reference} = SecretStore.put("linear-api-token", "first-provider-token", actor: "bootstrap-admin")
+    {:ok, second_reference} = SecretStore.put("linear-api-token-next", "second-provider-token", actor: "bootstrap-admin")
+    {:ok, draft} = Configuration.create_draft(valid_document(), actor: "bootstrap-admin")
+
+    assert {:ok, first} =
+             Configuration.bind_provider_credential(
+               draft.id,
+               %{id: "linear", name: "Linear"},
+               %{id: first_reference.id, name: first_reference.name},
+               actor: "bootstrap-admin"
+             )
+
+    assert get_in(first.document, ["providers", Access.at(0), "credential_ref"]) == first_reference.id
+
+    assert {:ok, second} =
+             Configuration.bind_provider_credential(
+               draft.id,
+               %{"id" => "linear", "name" => "Linear"},
+               %{id: second_reference.id, name: second_reference.name},
+               actor: "bootstrap-admin"
+             )
+
+    assert second.document["providers"] == [
+             %{
+               "id" => "linear",
+               "name" => "Linear",
+               "credential_ref" => second_reference.id
+             }
+           ]
+
+    refute Jason.encode!(second.document) =~ "second-provider-token"
+    refute Jason.encode!(second.document) =~ "linear-api-token-next"
+  end
+
+  test "provider credential binding rejects missing revisions and malformed input" do
+    {:ok, reference} = SecretStore.put("linear-api-token", "plain-provider-token", actor: "bootstrap-admin")
+    {:ok, draft} = Configuration.create_draft(valid_document(), actor: "bootstrap-admin")
+
+    assert {:error, :not_found} =
+             Configuration.bind_provider_credential(
+               Ecto.UUID.generate(),
+               %{"id" => "linear", "name" => "Linear"},
+               SecretStore.export_reference(reference),
+               actor: "bootstrap-admin"
+             )
+
+    assert {:error, :invalid_provider} =
+             Configuration.bind_provider_credential(
+               draft.id,
+               %{"id" => "", "name" => "Linear"},
+               SecretStore.export_reference(reference),
+               actor: "bootstrap-admin"
+             )
+
+    assert {:error, :invalid_provider} =
+             Configuration.bind_provider_credential(
+               draft.id,
+               %{},
+               SecretStore.export_reference(reference),
+               actor: "bootstrap-admin"
+             )
+
+    assert {:error, :invalid_reference} =
+             Configuration.bind_provider_credential(
+               draft.id,
+               %{"id" => "linear", "name" => "Linear"},
+               %{},
+               actor: "bootstrap-admin"
+             )
   end
 
   defp valid_document do

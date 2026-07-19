@@ -19,6 +19,7 @@ defmodule SymphonyElixir.Application do
 
   use Application
 
+  alias SymphonyElixir.Security.MasterKey
   alias SymphonyElixirWeb.Auth.BootstrapPlug
 
   @dialyzer {:nowarn_function, start_burrito_cli: 0}
@@ -36,6 +37,7 @@ defmodule SymphonyElixir.Application do
   @spec start_runtime() :: Supervisor.on_start()
   def start_runtime do
     :ok = BootstrapPlug.validate_configuration!()
+    :ok = MasterKey.validate_configuration!()
     :ok = SymphonyElixir.LogFile.configure()
 
     children = [

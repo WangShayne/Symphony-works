@@ -6,6 +6,7 @@ defmodule SymphonyElixir.Linear.Adapter do
   @behaviour SymphonyElixir.Tracker
 
   alias SymphonyElixir.Linear.{AgentTool, Client}
+  alias SymphonyElixir.Security.SecretStore
   alias SymphonyElixir.Tracker.Issue
 
   @spec validate_config(map()) :: :ok | {:error, term()}
@@ -14,7 +15,7 @@ defmodule SymphonyElixir.Linear.Adapter do
       not present_string?(tracker_settings.endpoint) ->
         {:error, :invalid_linear_endpoint}
 
-      not present_string?(tracker_settings.api_key) ->
+      not present_secret_reference?(tracker_settings.provider["credential_ref"]) ->
         {:error, :missing_linear_api_token}
 
       not present_string?(tracker_settings.project_slug) ->
@@ -43,7 +44,10 @@ defmodule SymphonyElixir.Linear.Adapter do
   end
 
   @spec secret_environment_names(map()) :: [String.t()]
-  def secret_environment_names(tracker_settings), do: tracker_settings.secret_environment_names
+  def secret_environment_names(tracker_settings) do
+    tracker_settings.secret_environment_names
+    |> Enum.uniq()
+  end
 
   defp client_module do
     Application.get_env(:symphony_elixir, :linear_client_module, Client)
@@ -51,4 +55,6 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   defp present_string?(value) when is_binary(value), do: String.trim(value) != ""
   defp present_string?(_value), do: false
+
+  defp present_secret_reference?(value), do: SecretStore.valid_reference_id?(value)
 end

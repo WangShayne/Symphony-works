@@ -395,6 +395,129 @@ defmodule SymphonyElixirWeb.Api.V1.AutomationProjectControllerTest do
     assert encoded =~ "[REDACTED]"
   end
 
+  test "bootstrap Administrator binds a secret reference to a draft provider without returning plaintext",
+       %{conn: conn} do
+    secret =
+      conn
+      |> authenticated()
+      |> post("/api/v1/secrets", %{"secret" => %{"name" => "linear-api-token", "value" => "plain-api-token"}})
+      |> json_response(201)
+
+    reference = secret["data"]
+
+    create =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/automation-projects", %{"project" => valid_project()})
+      |> json_response(201)
+
+    revision_id = create["data"]["id"]
+
+    bind =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/configuration-revisions/#{revision_id}/providers/linear/credential-ref", %{
+        "provider" => %{"name" => "Linear"},
+        "credential_ref" => reference
+      })
+      |> json_response(200)
+
+    assert %{
+             "data" => %{
+               "id" => ^revision_id,
+               "status" => "draft",
+               "document" => %{
+                 "providers" => [
+                   %{
+                     "id" => "linear",
+                     "name" => "Linear",
+                     "credential_ref" => secret_id
+                   }
+                 ]
+               }
+             }
+           } = bind
+
+    assert secret_id == reference["id"]
+
+    encoded = Jason.encode!(bind)
+    refute encoded =~ "plain-api-token"
+    refute encoded =~ "linear-api-token"
+    refute encoded =~ "\"api_key\""
+
+    assert %{"data" => %{"status" => "validated"}} =
+             build_conn()
+             |> authenticated()
+             |> post("/api/v1/configuration-revisions/#{revision_id}/validate")
+             |> json_response(200)
+
+    assert %{"data" => %{"status" => "active"}} =
+             build_conn()
+             |> authenticated()
+             |> post("/api/v1/configuration-revisions/#{revision_id}/activate")
+             |> json_response(200)
+
+    active =
+      build_conn()
+      |> authenticated()
+      |> get("/api/v1/configuration-revisions/active")
+      |> json_response(200)
+
+    assert get_in(active, ["data", "document", "providers", Access.at(0), "credential_ref"]) == reference["id"]
+
+    exported = Jason.encode!(active)
+    refute exported =~ "plain-api-token"
+    refute exported =~ "linear-api-token"
+    refute exported =~ "\"api_key\""
+  end
+
+  test "provider credential binding endpoint returns sanitized validation errors", %{conn: conn} do
+    secret =
+      conn
+      |> authenticated()
+      |> post("/api/v1/secrets", %{"secret" => %{"name" => "linear-api-token", "value" => "plain-api-token"}})
+      |> json_response(201)
+
+    reference = secret["data"]
+
+    assert %{"error" => %{"code" => "not_found"}} =
+             build_conn()
+             |> authenticated()
+             |> post("/api/v1/configuration-revisions/#{Ecto.UUID.generate()}/providers/linear/credential-ref", %{
+               "provider" => %{"name" => "Linear"},
+               "credential_ref" => reference
+             })
+             |> json_response(404)
+
+    create =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/automation-projects", %{"project" => valid_project()})
+      |> json_response(201)
+
+    revision_id = create["data"]["id"]
+
+    invalid_reference =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/configuration-revisions/#{revision_id}/providers/linear/credential-ref", %{
+        "provider" => %{"name" => "Linear"},
+        "credential_ref" => %{}
+      })
+      |> json_response(422)
+
+    assert invalid_reference["error"]["code"] == "invalid_configuration"
+    refute Jason.encode!(invalid_reference) =~ "plain-api-token"
+
+    malformed =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/configuration-revisions/#{revision_id}/providers/linear/credential-ref", %{})
+      |> json_response(422)
+
+    assert malformed["error"]["code"] == "invalid_configuration"
+  end
+
   defp authenticated(conn) do
     conn
     |> put_req_header("accept", "application/json")

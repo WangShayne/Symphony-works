@@ -6,6 +6,8 @@ defmodule SymphonyElixir.Configuration.Document do
   Later configuration slices extend the same document instead of creating parallel stores.
   """
 
+  alias SymphonyElixir.Security.SecretStore
+
   @list_sections [
     "providers",
     "model_references",
@@ -20,6 +22,7 @@ defmodule SymphonyElixir.Configuration.Document do
   @project_fields ["id", "name", "tracker", "repository"]
   @tracker_fields ["kind", "scope"]
   @repository_fields ["url", "target_branch"]
+  @provider_fields ["id", "name", "credential_ref"]
 
   @required_project_paths [
     ["id"],
@@ -64,6 +67,7 @@ defmodule SymphonyElixir.Configuration.Document do
       |> require_schema_version(document)
       |> require_automation_projects(document)
       |> require_list_sections(document, @list_sections)
+      |> require_providers(document)
       |> require_empty_sections(document, @empty_map_sections, %{})
       |> validate_task_types(document)
       |> validate_execution_profiles(document)
@@ -100,6 +104,14 @@ defmodule SymphonyElixir.Configuration.Document do
     [%{path: ["automation_projects"], message: "must contain exactly one project"} | errors]
   end
 
+  defp require_providers(errors, %{"providers" => providers}) when is_list(providers) do
+    providers
+    |> Enum.with_index()
+    |> Enum.reduce(errors, fn {provider, index}, acc -> validate_provider(acc, provider, index) end)
+  end
+
+  defp require_providers(errors, _document), do: errors
+
   defp validate_project(errors, project, index) when is_map(project) do
     prefix = ["automation_projects", Integer.to_string(index)]
 
@@ -119,6 +131,38 @@ defmodule SymphonyElixir.Configuration.Document do
       | errors
     ]
   end
+
+  defp validate_provider(errors, provider, index) when is_map(provider) do
+    prefix = ["providers", Integer.to_string(index)]
+
+    errors
+    |> require_provider_paths(provider, prefix)
+    |> reject_unknown_fields(provider, @provider_fields, prefix)
+    |> validate_secret_reference(provider, prefix)
+  end
+
+  defp validate_provider(errors, _provider, index) do
+    [%{path: ["providers", Integer.to_string(index)], message: "must be an object"} | errors]
+  end
+
+  defp require_provider_paths(errors, provider, prefix) do
+    Enum.reduce([["id"], ["name"], ["credential_ref"]], errors, fn path, acc ->
+      case fetch_path(provider, path) do
+        value when is_binary(value) and value != "" -> acc
+        _ -> [%{path: prefix ++ path, message: "is required"} | acc]
+      end
+    end)
+  end
+
+  defp validate_secret_reference(errors, %{"credential_ref" => reference}, prefix) when is_binary(reference) do
+    if SecretStore.valid_reference_id?(reference) do
+      errors
+    else
+      [%{path: prefix ++ ["credential_ref"], message: "must be an opaque secret reference"} | errors]
+    end
+  end
+
+  defp validate_secret_reference(errors, _provider, _prefix), do: errors
 
   defp require_project_paths(errors, project, prefix) do
     Enum.reduce(@required_project_paths, errors, fn path, acc ->

@@ -22,8 +22,8 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
 included Linear adapter serves `linear_graphql` so repo skills can make raw Linear GraphQL calls.
-Symphony executes that tool with its configured auth and removes `LINEAR_API_KEY` from the Codex
-child environment, so the agent does not need a second tracker login.
+Symphony executes that tool through its credential broker with the configured opaque provider
+reference, so the agent does not need a second tracker login or direct token access.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
@@ -37,8 +37,9 @@ tracker issue can become a dispatch candidate again after restart.
 
 1. Make sure your codebase is set up to work well with agents: see
    [Harness engineering](https://openai.com/index/harness-engineering/).
-2. Get a new personal token in Linear via Settings → Security & access → Personal API keys, and
-   set it as the `LINEAR_API_KEY` environment variable.
+2. Get a new personal token in Linear via Settings → Security & access → Personal API keys, then
+   store it through Symphony's Secret Store Dashboard or REST API to receive an opaque
+   `credential_ref`.
 3. Copy this directory's `WORKFLOW.md` to your repo.
 4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to your repo.
    - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
@@ -75,24 +76,67 @@ mise exec -- ./bin/symphony ./WORKFLOW.md
 ### Persistent configuration bootstrap
 
 The configuration control plane requires an external bootstrap Administrator token with at least
-32 bytes. Generate the token outside SQLite, export it only to the service process, and run the
-database migrations before opening the Dashboard or REST API.
+32 bytes and an external Secret Store master key. Generate both outside SQLite, export them only to
+the service process, and run the database migrations before opening the Dashboard or REST API.
 
 ```bash
 export SYMPHONY_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)"
+export SYMPHONY_MASTER_KEY="$(openssl rand -base64 32)"
 mise exec -- mix ecto.setup
 ```
 
 SQLite defaults to `~/.local/share/symphony/symphony.db`. Set `SYMPHONY_DATA_ROOT` to move the
 managed data directory, or set `SYMPHONY_DATABASE_PATH` to choose the complete database path. The
 repository creates parent directories, enables WAL and foreign-key enforcement, and keeps the
-bootstrap token in process configuration rather than the database.
+bootstrap token and master key in process configuration rather than the database.
+
+### Secret Store and provider credentials
+
+Provider tokens are stored encrypted in SQLite and referenced from configuration documents only by
+opaque metadata:
+
+```json
+"<secret uuid>"
+```
+
+Create or replace a secret through the Dashboard at `/configuration/secrets`, or through REST:
+
+```bash
+POST /api/v1/secrets
+{"secret":{"name":"linear-api-token","value":"<token>"}}
+
+PATCH /api/v1/secrets/<secret uuid>
+{"secret":{"value":"<replacement token>"}}
+```
+
+Bind the returned reference to a draft provider entry before validation/activation:
+
+```bash
+POST /api/v1/configuration-revisions/<revision uuid>/providers/linear/credential-ref
+{
+  "provider": {"name": "Linear"},
+  "credential_ref": "<secret uuid>"
+}
+```
+
+Only `providers[*].credential_ref` is stored. Do not put provider tokens or plaintext credential
+fields in `WORKFLOW.md` or configuration revisions.
+
+Rotate encrypted rows by supplying the current and replacement master keys from the environment;
+the task does not accept keys as command arguments:
+
+```bash
+export SYMPHONY_MASTER_KEY="<current base64 key>"
+export SYMPHONY_NEW_MASTER_KEY="<new base64 key>"
+mise exec -- mix secrets.rotate
+```
 
 ## Burrito releases
 
 Symphony ships self-contained executables built with
 [Burrito](https://github.com/burrito-elixir/burrito). They embed Erlang/OTP, Elixir, and Symphony,
-but still expect `codex`, `git`, and the selected tracker credentials on the target machine.
+but still expect `codex`, `git`, the external Secret Store master key, and any brokered provider
+references needed by the selected tracker on the target machine.
 
 Supported release targets:
 
@@ -158,8 +202,8 @@ Notes:
 
 - If a value is missing, defaults are used.
 - `tracker.kind` selects an adapter. Adapter-owned endpoint, scope, and auth settings belong under
-  `tracker.provider`; the current Linear adapter still accepts the older flat `endpoint`,
-  `api_key`, `project_slug`, and `assignee` aliases for compatibility.
+  `tracker.provider`; the current Linear adapter authenticates through a provider-owned
+  `credential_ref`.
 - `tracker.required_labels` is optional. When set, an issue must have every
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
@@ -183,11 +227,9 @@ Notes:
   `git clone ... .` there, along with any other setup commands you need.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
-- For the Linear adapter, `tracker.provider.api_key` reads from `LINEAR_API_KEY` when unset or
-  when value is `$LINEAR_API_KEY`. The legacy flat `tracker.api_key` alias behaves the same way.
-- Do not put a literal tracker token in a repo-owned `WORKFLOW.md` if Codex can read that
-  workspace. Use `$VAR`/host-side secret references so Symphony can keep the token out of the
-  child environment.
+- For the Linear adapter, bind a stored provider `credential_ref` to the draft configuration
+  provider entry. Authentication reads only that opaque reference through the credential broker.
+- Do not put a literal tracker token in a repo-owned `WORKFLOW.md` or configuration revision.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
@@ -196,7 +238,7 @@ Notes:
 ```yaml
 tracker:
   provider:
-    api_key: $LINEAR_API_KEY
+    credential_ref: "<secret uuid>"
 workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
 hooks:
@@ -215,11 +257,9 @@ codex:
 ### Linear adapter profile
 
 - Config: use `tracker.kind: linear` with `tracker.provider.endpoint` (default
-  `https://api.linear.app/graphql`), `api_key` (defaults to `LINEAR_API_KEY` and accepts
-  `$VAR`), required `project_slug`, and optional `assignee` (a Linear user ID or `me`,
-  defaulting to `LINEAR_ASSIGNEE`).
-  The legacy flat `tracker.endpoint`, `api_key`, `project_slug`, and `assignee` aliases remain
-  supported. `required_labels`, `active_states`, and `terminal_states` stay under `tracker`.
+  `https://api.linear.app/graphql`), required `credential_ref`, required `project_slug`, and
+  optional `assignee` (a Linear user ID or `me`, defaulting to `LINEAR_ASSIGNEE`).
+  `required_labels`, `active_states`, and `terminal_states` stay under `tracker`.
 - Scope and paging: candidate reads filter the configured project slug and requested state names,
   following Linear pages of 50. ID refreshes are also project-scoped and batch up to 50 IDs. Empty
   state/ID lists return `{:ok, []}` without a Linear request.
@@ -234,9 +274,8 @@ codex:
   active/terminal states, required labels, claims, retries, and concurrency.
 - Tool: the Linear adapter advertises `linear_graphql`, accepting either a raw query string or an
   object with nonblank `query` and optional object `variables`. Symphony executes it host-side
-  with the session-bound endpoint/token and strips declared token environment variables from the
-  Codex child. `project_slug` scopes scheduler reads, not raw tool calls; the tool can access
-  whatever the configured Linear token can access.
+  with the configured endpoint and a brokered provider credential. `project_slug` scopes scheduler
+  reads, not raw tool calls; the tool can access whatever the bound Linear credential can access.
 - Responsibility and errors: `linear_graphql` adds no idempotency key, retry, scope guard, or
   rate-limit policy, so workflows own idempotent mutations and handling provider errors. Read/config
   failures use `{:error, :missing_linear_api_token}`, `{:error, :missing_linear_project_slug}`,
@@ -286,9 +325,11 @@ resources and launch a real `codex app-server` session:
 
 ```bash
 cd elixir
-export LINEAR_API_KEY=...
 make e2e
 ```
+
+Before running it, bind the active Linear provider to a Secret Store `credential_ref` through the
+Dashboard or REST API.
 
 Optional environment variables:
 

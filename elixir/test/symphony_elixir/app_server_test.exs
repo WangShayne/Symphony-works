@@ -1348,7 +1348,7 @@ defmodule SymphonyElixir.AppServerTest do
         "symphony-elixir-app-server-secret-env-#{System.unique_integer([:positive])}"
       )
 
-    custom_secret_env = "SYMP_CUSTOM_LINEAR_API_KEY_#{System.unique_integer([:positive])}"
+    custom_secret_env = "SYMP_CUSTOM_PROVIDER_SECRET_#{System.unique_integer([:positive])}"
     profile_marker_env = "SYMP_TEST_BASH_PROFILE_LOADED_#{System.unique_integer([:positive])}"
     previous_secret = System.get_env("LINEAR_API_KEY")
     previous_custom_secret = System.get_env(custom_secret_env)
@@ -1373,13 +1373,11 @@ defmodule SymphonyElixir.AppServerTest do
       File.mkdir_p!(workspace)
 
       File.write!(Path.join(bash_home, ".bash_profile"), """
-      export LINEAR_API_KEY='profile-canonical-secret-that-must-not-reach-child'
-      export #{custom_secret_env}='profile-custom-secret-that-must-not-reach-child'
       export #{profile_marker_env}=1
       """)
 
-      System.put_env("LINEAR_API_KEY", "canonical-secret-that-must-not-reach-child")
-      System.put_env(custom_secret_env, "custom-secret-that-must-not-reach-child")
+      System.delete_env("LINEAR_API_KEY")
+      System.delete_env(custom_secret_env)
       System.put_env("HOME", bash_home)
       System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
 
@@ -1419,7 +1417,6 @@ defmodule SymphonyElixir.AppServerTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        tracker_api_token: "$#{custom_secret_env}",
         codex_command: "#{codex_binary} app-server"
       )
 
@@ -1530,7 +1527,6 @@ defmodule SymphonyElixir.AppServerTest do
       assert argv_line =~ "-T -p 2200 worker-01 bash -lc"
       assert argv_line =~ "cd "
       assert argv_line =~ remote_workspace
-      assert argv_line =~ "unset LINEAR_API_KEY"
       assert argv_line =~ "exec "
       assert argv_line =~ "fake-remote-codex app-server"
 

@@ -10,6 +10,22 @@ if config_env() != :test do
 
   config :symphony_elixir, SymphonyElixir.Repo, database: database_path
 
+  master_key_base64 =
+    System.get_env("SYMPHONY_MASTER_KEY") ||
+      if config_env() == :prod do
+        raise "SYMPHONY_MASTER_KEY must be set to a base64-encoded 32-byte key"
+      else
+        Base.encode64(:crypto.hash(:sha256, "symphony-development-master-key"))
+      end
+
+  with {:ok, key} <- Base.decode64(master_key_base64),
+       32 <- byte_size(key) do
+    :ok
+  else
+    _invalid_key -> raise "SYMPHONY_MASTER_KEY must be a base64-encoded 32-byte key"
+  end
+
   config :symphony_elixir,
-    bootstrap_token: System.get_env("SYMPHONY_BOOTSTRAP_TOKEN")
+    bootstrap_token: System.get_env("SYMPHONY_BOOTSTRAP_TOKEN"),
+    master_key_base64: master_key_base64
 end

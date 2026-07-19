@@ -41,6 +41,7 @@ defmodule SymphonyElixirWeb.Router do
     pipe_through([:browser, :bootstrap_admin])
 
     live("/configuration", ConfigurationLive, :index)
+    live("/configuration/secrets", Configuration.SecretLive, :index)
   end
 
   scope "/api/v1", SymphonyElixirWeb.Api.V1 do
@@ -50,6 +51,15 @@ defmodule SymphonyElixirWeb.Router do
     get("/configuration/templates", AutomationProjectController, :templates)
     post("/configuration-revisions/import-workflow", AutomationProjectController, :import_workflow)
     patch("/configuration-revisions/:id", AutomationProjectController, :update)
+    post("/secrets", SecretController, :create)
+    patch("/secrets/:id", SecretController, :replace)
+
+    post(
+      "/configuration-revisions/:id/providers/:provider_id/credential-ref",
+      AutomationProjectController,
+      :bind_provider_credential
+    )
+
     post("/configuration-revisions/:id/validate", AutomationProjectController, :validate)
     post("/configuration-revisions/:id/activate", AutomationProjectController, :activate)
     post("/configuration-revisions/:id/rollback", AutomationProjectController, :rollback)

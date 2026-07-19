@@ -6,12 +6,14 @@ defmodule SymphonyElixir.Configuration do
   the complete snapshot and switches the single active pointer in one transaction.
   """
 
+  import Ecto.Changeset
   import Ecto.Query
 
   alias Ecto.Multi
   alias SymphonyElixir.Configuration.{Document, Exporter, Revision, TaskPin, Templates, Validator}
   alias SymphonyElixir.Configuration.WorkflowImporter
   alias SymphonyElixir.Repo
+  alias SymphonyElixir.Security.SecretStore
 
   @spec create_draft(map(), keyword()) :: {:ok, Revision.t()} | {:error, Ecto.Changeset.t()}
   def create_draft(document, opts) when is_map(document) do
@@ -140,6 +142,30 @@ defmodule SymphonyElixir.Configuration do
     end
   end
 
+  @spec bind_provider_credential(Ecto.UUID.t(), map(), SecretStore.secret_reference(), keyword()) ::
+          {:ok, Revision.t()} | {:error, term()}
+  def bind_provider_credential(id, provider, reference, opts) do
+    actor = Keyword.fetch!(opts, :actor)
+
+    with %Revision{} = revision <- Repo.get(Revision, id),
+         :ok <- validate_transition(revision.status, :draft),
+         {:ok, provider} <- normalize_provider(provider),
+         {:ok, reference} <- SecretStore.reference_metadata(reference),
+         document <- put_provider_credential(revision.document, provider, reference),
+         {:ok, document} <- Document.validate(document) do
+      revision
+      |> change(%{
+        document: document,
+        content_hash: Document.content_hash(document),
+        created_by: revision.created_by || actor
+      })
+      |> Repo.update()
+    else
+      nil -> {:error, :not_found}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   @spec active() :: {:ok, Revision.t()} | {:error, :not_found}
   def active do
     case Repo.one(from(revision in Revision, where: revision.status == :active)) do
@@ -212,6 +238,7 @@ defmodule SymphonyElixir.Configuration do
     end
   end
 
+  defp validate_transition(:draft, :draft), do: :ok
   defp validate_transition(:draft, :validated), do: :ok
   defp validate_transition(:draft, :draft_update), do: :ok
   defp validate_transition(:superseded, :rollback), do: :ok
@@ -221,6 +248,33 @@ defmodule SymphonyElixir.Configuration do
   end
 
   defp now, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+  defp normalize_provider(%{"id" => id, "name" => name}) when is_binary(id) and is_binary(name) do
+    id = String.trim(id)
+    name = String.trim(name)
+
+    if id != "" and name != "" do
+      {:ok, %{"id" => id, "name" => name}}
+    else
+      {:error, :invalid_provider}
+    end
+  end
+
+  defp normalize_provider(%{id: id, name: name}), do: normalize_provider(%{"id" => id, "name" => name})
+  defp normalize_provider(_provider), do: {:error, :invalid_provider}
+
+  defp put_provider_credential(document, provider, reference) do
+    providers = Map.get(document, "providers", [])
+    provider = Map.put(provider, "credential_ref", SecretStore.export_reference(reference))
+
+    providers =
+      case Enum.split_with(providers, &(Map.get(&1, "id") == provider["id"])) do
+        {[], rest} -> rest ++ [provider]
+        {[_existing | _duplicates], rest} -> rest ++ [provider]
+      end
+
+    Map.put(document, "providers", providers)
+  end
 
   defp new_multi do
     # Avoid expanding MapSet's nested opaque type on Elixir 1.19 / OTP 28.

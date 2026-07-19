@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Linear.Client do
 
   require Logger
   alias SymphonyElixir.Config
+  alias SymphonyElixir.Security.{CredentialBroker, SecretStore}
   alias SymphonyElixir.Tracker.Issue
 
   @issue_page_size 50
@@ -147,10 +148,12 @@ defmodule SymphonyElixir.Linear.Client do
         post_graphql_request(request_payload, headers, tracker_settings.endpoint)
       end)
 
-    with {:ok, headers} <- graphql_headers(tracker_settings),
-         {:ok, %{status: 200, body: body}} <- request_fun.(payload, headers) do
-      {:ok, body}
-    else
+    credential_broker = Keyword.get(opts, :credential_broker, &CredentialBroker.with_secret/3)
+
+    case request_with_brokered_credential(tracker_settings, payload, request_fun, credential_broker) do
+      {:ok, %{status: 200, body: body}} ->
+        {:ok, body}
+
       {:ok, response} ->
         Logger.error(
           "Linear GraphQL request failed status=#{response.status}" <>
@@ -370,18 +373,23 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
-  defp graphql_headers(tracker_settings) do
-    case tracker_settings.api_key do
-      nil ->
-        {:error, :missing_linear_api_token}
+  defp request_with_brokered_credential(tracker_settings, payload, request_fun, credential_broker) do
+    case tracker_settings.provider["credential_ref"] do
+      reference when is_binary(reference) ->
+        credential_broker.(reference, :linear_graphql, fn token ->
+          request_fun.(payload, graphql_headers(token))
+        end)
 
-      token ->
-        {:ok,
-         [
-           {"Authorization", token},
-           {"Content-Type", "application/json"}
-         ]}
+      _missing ->
+        {:error, :missing_linear_api_token}
     end
+  end
+
+  defp graphql_headers(token) do
+    [
+      {"Authorization", token},
+      {"Content-Type", "application/json"}
+    ]
   end
 
   defp post_graphql_request(payload, headers, endpoint) do
@@ -557,7 +565,7 @@ defmodule SymphonyElixir.Linear.Client do
     tracker = Config.settings!().tracker
 
     cond do
-      is_nil(tracker.api_key) -> {:error, :missing_linear_api_token}
+      not SecretStore.valid_reference_id?(tracker.provider["credential_ref"]) -> {:error, :missing_linear_api_token}
       is_nil(tracker.project_slug) -> {:error, :missing_linear_project_slug}
       true -> {:ok, tracker}
     end

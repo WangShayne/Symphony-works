@@ -3,6 +3,7 @@ tracker:
   kind: linear
   provider:
     project_slug: "symphony-0c79b11b75ea"
+    credential_ref: "00000000-0000-0000-0000-000000000000"
   required_labels: []
   active_states:
     - Todo

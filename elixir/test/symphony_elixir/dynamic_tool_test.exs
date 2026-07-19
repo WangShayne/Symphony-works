@@ -46,7 +46,6 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
   test "bound tools keep the adapter and auth snapshot from session startup" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "linear",
-      tracker_api_token: "session-token",
       tracker_project_slug: "session-project"
     )
 
@@ -70,7 +69,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert_received {:bound_linear_client_called, "query Viewer { viewer { id } }", %{}, [tracker_settings: tracker_settings]}
 
-    assert tracker_settings.api_key == "session-token"
+    assert tracker_settings.provider["credential_ref"] == "00000000-0000-0000-0000-000000000001"
+
     assert tracker_settings.project_slug == "session-project"
     assert response["success"] == true
   end
@@ -278,7 +278,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert Jason.decode!(missing_token["output"]) == %{
              "error" => %{
-               "message" => "Symphony is missing Linear auth. Set `tracker.provider.api_key` in `WORKFLOW.md` or export `LINEAR_API_KEY`."
+               "message" => "Symphony is missing Linear auth. Configure a Linear `credential_ref` in the active provider settings."
              }
            }
 

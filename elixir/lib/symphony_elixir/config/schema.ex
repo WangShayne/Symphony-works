@@ -6,6 +6,7 @@ defmodule SymphonyElixir.Config.Schema do
   import Ecto.Changeset
 
   alias SymphonyElixir.PathSafety
+  alias SymphonyElixir.Security.SecretStore
 
   @primary_key false
   @linear_endpoint "https://api.linear.app/graphql"
@@ -50,7 +51,6 @@ defmodule SymphonyElixir.Config.Schema do
     embedded_schema do
       field(:kind, :string)
       field(:endpoint, :string)
-      field(:api_key, :string)
       field(:project_slug, :string)
       field(:assignee, :string)
       field(:provider, :map, default: %{})
@@ -68,7 +68,6 @@ defmodule SymphonyElixir.Config.Schema do
         [
           :kind,
           :endpoint,
-          :api_key,
           :project_slug,
           :assignee,
           :provider,
@@ -398,31 +397,29 @@ defmodule SymphonyElixir.Config.Schema do
   defp finalize_settings(settings) do
     provider = normalize_optional_map(settings.tracker.provider) || %{}
 
-    {api_key, assignee, provider, secret_environment_names} =
+    {assignee, provider, secret_environment_names} =
       case settings.tracker.kind do
         "linear" ->
           linear_provider =
             provider
             |> Map.put_new("endpoint", settings.tracker.endpoint || @linear_endpoint)
-            |> Map.put_new("api_key", settings.tracker.api_key)
             |> Map.put_new("project_slug", settings.tracker.project_slug)
             |> Map.put_new("assignee", settings.tracker.assignee)
+            |> Map.delete("api_key")
 
-          resolved_api_key =
-            resolve_secret_setting(linear_provider["api_key"], System.get_env("LINEAR_API_KEY"))
+          credential_ref = normalize_optional_reference(linear_provider["credential_ref"])
 
           resolved_assignee =
             resolve_secret_setting(linear_provider["assignee"], System.get_env("LINEAR_ASSIGNEE"))
 
           {
-            resolved_api_key,
             resolved_assignee,
-            linear_provider,
-            ["LINEAR_API_KEY" | env_reference_names([linear_provider["api_key"]])]
+            Map.put(linear_provider, "credential_ref", credential_ref),
+            []
           }
 
         _ ->
-          {settings.tracker.api_key, settings.tracker.assignee, provider, []}
+          {settings.tracker.assignee, provider, []}
       end
 
     {active_states, terminal_states} =
@@ -440,7 +437,6 @@ defmodule SymphonyElixir.Config.Schema do
     tracker = %{
       settings.tracker
       | endpoint: Map.get(provider, "endpoint", settings.tracker.endpoint),
-        api_key: api_key,
         project_slug: Map.get(provider, "project_slug", settings.tracker.project_slug),
         assignee: assignee,
         provider: provider,
@@ -474,6 +470,14 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp normalize_optional_map(nil), do: nil
   defp normalize_optional_map(value) when is_map(value), do: normalize_keys(value)
+
+  defp normalize_optional_reference(nil), do: nil
+
+  defp normalize_optional_reference(value) when is_binary(value) do
+    if SecretStore.valid_reference_id?(value), do: value, else: nil
+  end
+
+  defp normalize_optional_reference(_value), do: nil
 
   defp normalize_key(value) when is_atom(value), do: Atom.to_string(value)
   defp normalize_key(value), do: to_string(value)
@@ -544,15 +548,6 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp env_reference_name(_value), do: :error
-
-  defp env_reference_names(values) when is_list(values) do
-    Enum.flat_map(values, fn value ->
-      case env_reference_name(value) do
-        {:ok, env_name} -> [env_name]
-        :error -> []
-      end
-    end)
-  end
 
   defp resolve_env_token(env_name) do
     case System.get_env(env_name) do

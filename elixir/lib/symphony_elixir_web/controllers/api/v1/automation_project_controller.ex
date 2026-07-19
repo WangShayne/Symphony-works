@@ -94,6 +94,26 @@ defmodule SymphonyElixirWeb.Api.V1.AutomationProjectController do
     end
   end
 
+  @spec bind_provider_credential(Plug.Conn.t(), map()) :: Plug.Conn.t()
+  def bind_provider_credential(
+        conn,
+        %{"id" => id, "provider_id" => provider_id, "credential_ref" => credential_ref} = params
+      ) do
+    actor = conn.assigns.current_principal.id
+    provider_params = Map.get(params, "provider", %{})
+    provider = %{"id" => provider_id, "name" => Map.get(provider_params, "name", provider_id)}
+
+    case Configuration.bind_provider_credential(id, provider, credential_ref, actor: actor) do
+      {:ok, revision} -> json(conn, %{data: serialize(revision)})
+      {:error, :not_found} -> not_found(conn)
+      {:error, reason} -> validation_error(conn, reason)
+    end
+  end
+
+  def bind_provider_credential(conn, _params) do
+    validation_error(conn, :invalid_provider_credential_binding)
+  end
+
   @spec export(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def export(conn, %{"id" => id}) do
     case Configuration.export(id, redacted: true) do

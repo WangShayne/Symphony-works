@@ -118,7 +118,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "linear",
-      tracker_api_token: "token",
+      tracker_credential_ref: "00000000-0000-0000-0000-000000000001",
       tracker_project_slug: nil,
       prompt: "Semantic-invalid prompt"
     )
@@ -224,7 +224,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
     assert SymphonyElixir.Tracker.adapter() == Adapter
-    assert SymphonyElixir.Tracker.bind_agent_tools().secret_environment_names == ["LINEAR_API_KEY"]
+    assert SymphonyElixir.Tracker.bind_agent_tools().secret_environment_names == []
   end
 
   test "linear adapter delegates reads and advertises its native agent tool" do

@@ -4,7 +4,6 @@ defmodule SymphonyElixir.CoreTest do
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
-      tracker_api_token: nil,
       tracker_project_slug: nil,
       poll_interval_ms: nil,
       tracker_active_states: nil,
@@ -39,21 +38,21 @@ defmodule SymphonyElixir.CoreTest do
     assert message =~ "tracker.active_states"
 
     write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_api_token: "token",
+      tracker_credential_ref: "00000000-0000-0000-0000-000000000001",
       tracker_project_slug: nil
     )
 
     assert {:error, :missing_linear_project_slug} = Config.validate!()
 
     write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_api_token: "   ",
+      tracker_credential_ref: nil,
       tracker_project_slug: "project"
     )
 
     assert {:error, :missing_linear_api_token} = Config.validate!()
 
     write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_api_token: "token",
+      tracker_credential_ref: "00000000-0000-0000-0000-000000000001",
       tracker_project_slug: ""
     )
 
@@ -102,12 +101,9 @@ defmodule SymphonyElixir.CoreTest do
 
   test "current WORKFLOW.md file is valid and complete" do
     original_workflow_path = Workflow.workflow_file_path()
-    previous_linear_api_key = System.get_env("LINEAR_API_KEY")
 
     on_exit(fn -> Workflow.set_workflow_file_path(original_workflow_path) end)
-    on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
 
-    System.put_env("LINEAR_API_KEY", "test-linear-api-key")
     Workflow.clear_workflow_file_path()
 
     assert {:ok, %{config: config, prompt: prompt}} = Workflow.load()
@@ -132,20 +128,14 @@ defmodule SymphonyElixir.CoreTest do
     assert Config.workflow_prompt() == prompt
   end
 
-  test "linear api token resolves from LINEAR_API_KEY env var" do
-    previous_linear_api_key = System.get_env("LINEAR_API_KEY")
-    env_api_key = "test-linear-api-key"
-
-    on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
-    System.put_env("LINEAR_API_KEY", env_api_key)
-
+  test "linear credentials come only from provider-owned opaque references" do
     write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_api_token: nil,
       tracker_project_slug: "project",
       codex_command: "/bin/sh app-server"
     )
 
-    assert Config.settings!().tracker.api_key == env_api_key
+    assert Config.settings!().tracker.provider["credential_ref"] == "00000000-0000-0000-0000-000000000001"
+
     assert Config.settings!().tracker.project_slug == "project"
     assert :ok = Config.validate!()
   end
@@ -1357,11 +1347,7 @@ defmodule SymphonyElixir.CoreTest do
 
   test "in-repo WORKFLOW.md renders correctly" do
     workflow_path = Workflow.workflow_file_path()
-    previous_linear_api_key = System.get_env("LINEAR_API_KEY")
 
-    on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
-
-    System.put_env("LINEAR_API_KEY", "test-linear-api-key")
     Workflow.set_workflow_file_path(Path.expand("WORKFLOW.md", File.cwd!()))
 
     issue = %Issue{

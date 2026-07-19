@@ -527,6 +527,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                  Client.graphql(
                    "query Viewer { viewer { id } }",
                    %{},
+                   credential_broker: test_credential_broker("bound-token"),
                    request_fun: fn _payload, _headers ->
                      {:ok,
                       %{
@@ -576,9 +577,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                "query Viewer { viewer { id } }",
                %{},
                tracker_settings: %{
-                 api_key: "bound-token",
-                 endpoint: "https://bound.example.test/graphql"
+                 endpoint: "https://bound.example.test/graphql",
+                 provider: %{"credential_ref" => "00000000-0000-0000-0000-000000000002"}
                },
+               credential_broker: test_credential_broker("bound-token"),
                request_fun: fn payload, headers ->
                  send(parent, {:bound_graphql_request, payload, headers})
                  {:ok, %{status: 200, body: %{"data" => %{"viewer" => %{"id" => "viewer-bound"}}}}}
@@ -897,10 +899,6 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   end
 
   test "config reads defaults for optional settings" do
-    previous_linear_api_key = System.get_env("LINEAR_API_KEY")
-    on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
-    System.delete_env("LINEAR_API_KEY")
-
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
       workspace_root: nil,
@@ -911,13 +909,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       codex_turn_timeout_ms: nil,
       codex_read_timeout_ms: nil,
       codex_stall_timeout_ms: nil,
-      tracker_api_token: nil,
       tracker_project_slug: nil
     )
 
     config = Config.settings!()
     assert config.tracker.endpoint == "https://api.linear.app/graphql"
-    assert config.tracker.api_key == nil
     assert config.tracker.project_slug == nil
     assert config.tracker.required_labels == []
     assert config.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
@@ -1075,34 +1071,27 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.settings!().codex.command == "codex app-server"
   end
 
-  test "config resolves $VAR references for env-backed secret and path values" do
+  test "config resolves $VAR references for path values without owning secret env names" do
     workspace_env_var = "SYMP_WORKSPACE_ROOT_#{System.unique_integer([:positive])}"
-    api_key_env_var = "SYMP_LINEAR_API_KEY_#{System.unique_integer([:positive])}"
     workspace_root = Path.join("/tmp", "symphony-workspace-root")
-    api_key = "resolved-secret"
     codex_bin = Path.join(["~", "bin", "codex"])
 
     previous_workspace_root = System.get_env(workspace_env_var)
-    previous_api_key = System.get_env(api_key_env_var)
 
     System.put_env(workspace_env_var, workspace_root)
-    System.put_env(api_key_env_var, api_key)
 
     on_exit(fn ->
       restore_env(workspace_env_var, previous_workspace_root)
-      restore_env(api_key_env_var, previous_api_key)
     end)
 
     write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_api_token: "$#{api_key_env_var}",
       workspace_root: "$#{workspace_env_var}",
       codex_command: "#{codex_bin} app-server"
     )
 
     config = Config.settings!()
-    assert config.tracker.api_key == api_key
-    assert config.tracker.provider["api_key"] == "$#{api_key_env_var}"
-    assert config.tracker.secret_environment_names == ["LINEAR_API_KEY", api_key_env_var]
+    assert config.tracker.provider["credential_ref"] == "00000000-0000-0000-0000-000000000001"
+    assert config.tracker.secret_environment_names == []
     assert config.workspace.root == Path.expand(workspace_root)
     assert config.codex.command == "#{codex_bin} app-server"
   end
@@ -1112,9 +1101,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              Schema.parse(%{
                tracker: %{
                  kind: "linear",
+                 api_key: "$LEGACY_LINEAR_TOKEN",
                  provider: %{
                    endpoint: "https://linear.example.test/graphql",
-                   api_key: "provider-token",
+                   api_key: "$LEGACY_PROVIDER_LINEAR_TOKEN",
+                   credential_ref: "00000000-0000-0000-0000-000000000003",
                    project_slug: "provider-project",
                    extra: %{team: "platform"}
                  }
@@ -1122,17 +1113,59 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              })
 
     assert settings.tracker.endpoint == "https://linear.example.test/graphql"
-    assert settings.tracker.api_key == "provider-token"
+    assert settings.tracker.provider["credential_ref"] == "00000000-0000-0000-0000-000000000003"
     assert settings.tracker.project_slug == "provider-project"
-    assert settings.tracker.secret_environment_names == ["LINEAR_API_KEY"]
+    assert settings.tracker.secret_environment_names == []
 
     assert settings.tracker.provider == %{
              "endpoint" => "https://linear.example.test/graphql",
-             "api_key" => "provider-token",
+             "credential_ref" => "00000000-0000-0000-0000-000000000003",
              "project_slug" => "provider-project",
              "assignee" => nil,
              "extra" => %{"team" => "platform"}
            }
+  end
+
+  test "schema resolves linear assignee env references without treating api keys as plaintext credentials" do
+    missing_env = "SYMP_LINEAR_ASSIGNEE_MISSING_#{System.unique_integer([:positive])}"
+    empty_env = "SYMP_LINEAR_ASSIGNEE_EMPTY_#{System.unique_integer([:positive])}"
+    present_env = "SYMP_LINEAR_ASSIGNEE_PRESENT_#{System.unique_integer([:positive])}"
+
+    previous_empty = System.get_env(empty_env)
+    previous_present = System.get_env(present_env)
+
+    System.delete_env(missing_env)
+    System.put_env(empty_env, "")
+    System.put_env(present_env, "agent@example.com")
+
+    on_exit(fn ->
+      System.delete_env(missing_env)
+      restore_env(empty_env, previous_empty)
+      restore_env(present_env, previous_present)
+    end)
+
+    base_tracker = %{
+      kind: "linear",
+      provider: %{
+        credential_ref: "00000000-0000-0000-0000-000000000004",
+        project_slug: "provider-project"
+      }
+    }
+
+    assert {:ok, missing_settings} =
+             Schema.parse(%{tracker: put_in(base_tracker, [:provider, :assignee], "$#{missing_env}")})
+
+    assert missing_settings.tracker.assignee == nil
+
+    assert {:ok, empty_settings} =
+             Schema.parse(%{tracker: put_in(base_tracker, [:provider, :assignee], "$#{empty_env}")})
+
+    assert empty_settings.tracker.assignee == nil
+
+    assert {:ok, present_settings} =
+             Schema.parse(%{tracker: put_in(base_tracker, [:provider, :assignee], "$#{present_env}")})
+
+    assert present_settings.tracker.assignee == "agent@example.com"
   end
 
   test "linear adapter rejects invalid provider values without crashing config parsing" do
@@ -1147,11 +1180,28 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert {:error, :missing_linear_api_token} =
              Config.validate_settings(invalid_secret_settings)
 
+    assert {:ok, invalid_reference_type_settings} =
+             Schema.parse(%{
+               tracker: %{
+                 kind: "linear",
+                 provider: %{credential_ref: 123, project_slug: "project"}
+               }
+             })
+
+    assert invalid_reference_type_settings.tracker.provider["credential_ref"] == nil
+
+    assert {:error, :missing_linear_api_token} =
+             Config.validate_settings(invalid_reference_type_settings)
+
     assert {:ok, invalid_endpoint_settings} =
              Schema.parse(%{
                tracker: %{
                  kind: "linear",
-                 provider: %{api_key: "token", project_slug: "project", endpoint: 123}
+                 provider: %{
+                   credential_ref: "00000000-0000-0000-0000-000000000005",
+                   project_slug: "project",
+                   endpoint: 123
+                 }
                }
              })
 
@@ -1162,7 +1212,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              Schema.parse(%{
                tracker: %{
                  kind: "linear",
-                 provider: %{api_key: "token", project_slug: "project", assignee: 123}
+                 provider: %{
+                   credential_ref: "00000000-0000-0000-0000-000000000006",
+                   project_slug: "project",
+                   assignee: 123
+                 }
                }
              })
 
@@ -1174,7 +1228,6 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert {:ok, settings} = Schema.parse(%{tracker: %{kind: "future-tracker"}})
 
     assert settings.tracker.endpoint == nil
-    assert settings.tracker.api_key == nil
     assert settings.tracker.active_states == nil
     assert settings.tracker.terminal_states == nil
     assert settings.tracker.provider == %{}
@@ -1199,12 +1252,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: "env:#{api_key_env_var}",
+      tracker_credential_ref: nil,
       workspace_root: "env:#{workspace_env_var}"
     )
 
-    config = Config.settings!()
-    assert config.tracker.api_key == "env:#{api_key_env_var}"
-    assert config.workspace.root == "env:#{workspace_env_var}"
+    assert {:ok, %{config: config}} = Workflow.load(Workflow.workflow_file_path())
+    assert {:ok, settings} = Schema.parse(config)
+
+    assert settings.tracker.provider["credential_ref"] == nil
+    assert {:error, :missing_linear_api_token} = Config.validate_settings(settings)
   end
 
   test "config supports per-state max concurrent agent overrides" do
@@ -1280,34 +1336,22 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
   test "schema parse normalizes policy keys and env-backed fallbacks" do
     missing_workspace_env = "SYMP_MISSING_WORKSPACE_#{System.unique_integer([:positive])}"
-    empty_secret_env = "SYMP_EMPTY_SECRET_#{System.unique_integer([:positive])}"
-    missing_secret_env = "SYMP_MISSING_SECRET_#{System.unique_integer([:positive])}"
-
     previous_missing_workspace_env = System.get_env(missing_workspace_env)
-    previous_empty_secret_env = System.get_env(empty_secret_env)
-    previous_missing_secret_env = System.get_env(missing_secret_env)
-    previous_linear_api_key = System.get_env("LINEAR_API_KEY")
 
     System.delete_env(missing_workspace_env)
-    System.put_env(empty_secret_env, "")
-    System.delete_env(missing_secret_env)
-    System.put_env("LINEAR_API_KEY", "fallback-linear-token")
 
     on_exit(fn ->
       restore_env(missing_workspace_env, previous_missing_workspace_env)
-      restore_env(empty_secret_env, previous_empty_secret_env)
-      restore_env(missing_secret_env, previous_missing_secret_env)
-      restore_env("LINEAR_API_KEY", previous_linear_api_key)
     end)
 
     assert {:ok, settings} =
              Schema.parse(%{
-               tracker: %{kind: "linear", api_key: "$#{empty_secret_env}"},
+               tracker: %{kind: "linear", api_key: "$IGNORED_SECRET_ENV"},
                workspace: %{root: "$#{missing_workspace_env}"},
                codex: %{approval_policy: %{reject: %{sandbox_approval: true}}}
              })
 
-    assert settings.tracker.api_key == nil
+    assert settings.tracker.provider["credential_ref"] == nil
     assert settings.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
 
     assert settings.codex.approval_policy == %{
@@ -1316,11 +1360,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert {:ok, settings} =
              Schema.parse(%{
-               tracker: %{kind: "linear", api_key: "$#{missing_secret_env}"},
+               tracker: %{kind: "linear", api_key: "$IGNORED_MISSING_SECRET_ENV"},
                workspace: %{root: ""}
              })
 
-    assert settings.tracker.api_key == "fallback-linear-token"
+    assert settings.tracker.provider["credential_ref"] == nil
     assert settings.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
   end
 
@@ -1576,5 +1620,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  defp test_credential_broker(token) do
+    fn _reference, :linear_graphql, fun -> fun.(token) end
   end
 end

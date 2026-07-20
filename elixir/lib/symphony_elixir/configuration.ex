@@ -209,13 +209,16 @@ defmodule SymphonyElixir.Configuration do
   @spec pin_for_task(String.t(), keyword()) :: {:ok, TaskPin.t()} | {:error, term()}
   def pin_for_task(task_id, opts) when is_binary(task_id) do
     actor = Keyword.get(opts, :actor, "system")
+    revision_id = Keyword.get(opts, :revision_id)
 
     case Repo.get_by(TaskPin, task_id: task_id) do
       %TaskPin{} = pin ->
-        {:ok, pin}
+        validate_existing_pin(pin, revision_id)
 
       nil ->
-        insert_task_pin(task_id, actor)
+        task_id
+        |> insert_task_pin(actor, revision_id)
+        |> resolve_pin_insert_race(task_id, revision_id)
     end
   end
 
@@ -251,8 +254,9 @@ defmodule SymphonyElixir.Configuration do
     end
   end
 
-  defp insert_task_pin(task_id, actor) do
-    with {:ok, revision} <- active() do
+  defp insert_task_pin(task_id, actor, revision_id) do
+    with {:ok, revision} <- pin_revision(revision_id),
+         :ok <- validate_pin_revision_status(revision.status) do
       %TaskPin{}
       |> TaskPin.changeset(%{
         task_id: task_id,
@@ -262,6 +266,28 @@ defmodule SymphonyElixir.Configuration do
         pinned_by: actor
       })
       |> Repo.insert()
+    end
+  end
+
+  defp pin_revision(nil), do: active()
+  defp pin_revision(revision_id), do: fetch_revision(Repo, revision_id)
+
+  defp validate_pin_revision_status(status) when status in [:active, :superseded], do: :ok
+  defp validate_pin_revision_status(status), do: {:error, {:invalid_pin_revision_status, status}}
+
+  defp validate_existing_pin(pin, nil), do: {:ok, pin}
+  defp validate_existing_pin(%TaskPin{revision_id: revision_id} = pin, revision_id), do: {:ok, pin}
+
+  defp validate_existing_pin(%TaskPin{revision_id: revision_id}, _requested_revision_id) do
+    {:error, {:configuration_pin_conflict, revision_id}}
+  end
+
+  defp resolve_pin_insert_race({:ok, _pin} = result, _task_id, _revision_id), do: result
+
+  defp resolve_pin_insert_race({:error, _reason} = error, task_id, revision_id) do
+    case Repo.get_by(TaskPin, task_id: task_id) do
+      %TaskPin{} = pin -> validate_existing_pin(pin, revision_id)
+      nil -> error
     end
   end
 

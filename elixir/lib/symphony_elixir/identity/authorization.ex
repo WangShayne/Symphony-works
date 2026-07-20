@@ -16,7 +16,7 @@ defmodule SymphonyElixir.Identity.Authorization do
   ]
 
   @read_actions [:read_task, :read_configuration, :read_audit, :read_health]
-  @operator_actions [:retry_task, :cancel_task]
+  @operator_actions [:create_task, :retry_task, :cancel_task]
   @admin_actions [:write_configuration, :write_secret, :manage_identity]
 
   @spec authorize(Principal.t() | map() | nil, atom()) :: :ok | {:error, :unauthorized | :forbidden}
@@ -46,15 +46,30 @@ defmodule SymphonyElixir.Identity.Authorization do
   end
 
   @spec action_for_path(String.t(), String.t()) :: atom()
-  def action_for_path(_method, path) do
+  def action_for_path(method, path) do
+    cond do
+      String.starts_with?(path, "/api/v1/") -> api_action_for_path(method, path)
+      String.starts_with?(path, "/configuration") -> configuration_action_for_path(path)
+      true -> :read_task
+    end
+  end
+
+  defp api_action_for_path(method, path) do
     cond do
       String.starts_with?(path, "/api/v1/secrets") -> :write_secret
       String.starts_with?(path, "/api/v1/configuration") -> :write_configuration
+      method == "POST" and path == "/api/v1/tasks" -> :create_task
       String.contains?(path, "/retry") -> :retry_task
       String.starts_with?(path, "/api/v1/tasks") -> :read_task
-      String.starts_with?(path, "/configuration/secrets") -> :write_secret
-      String.starts_with?(path, "/configuration") -> :write_configuration
       true -> :read_task
+    end
+  end
+
+  defp configuration_action_for_path(path) do
+    if String.starts_with?(path, "/configuration/secrets") do
+      :write_secret
+    else
+      :write_configuration
     end
   end
 

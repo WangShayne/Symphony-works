@@ -1071,6 +1071,25 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.settings!().codex.command == "codex app-server"
   end
 
+  test "workflow server settings accept port zero and reject negative ports" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      server_port: 0,
+      server_host: "0.0.0.0"
+    )
+
+    assert :ok = Config.validate!()
+    assert %{port: 0, host: "0.0.0.0"} = Config.settings!().server
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      server_port: -1,
+      server_host: "127.0.0.1"
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "server.port"
+    assert message =~ "must be greater than or equal to 0"
+  end
+
   test "config resolves $VAR references for path values without owning secret env names" do
     workspace_env_var = "SYMP_WORKSPACE_ROOT_#{System.unique_integer([:positive])}"
     workspace_root = Path.join("/tmp", "symphony-workspace-root")

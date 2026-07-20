@@ -85,6 +85,20 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @spec orchestrator_lifecycle_enabled?() :: boolean()
+  def orchestrator_lifecycle_enabled? do
+    Application.get_env(:symphony_elixir, :orchestrator_lifecycle_enabled, true)
+  end
+
+  @spec task_creation_effect_adapter() :: module()
+  def task_creation_effect_adapter do
+    Application.get_env(
+      :symphony_elixir,
+      :task_creation_effect_adapter,
+      SymphonyElixir.Effects.SimulatedAdapter
+    )
+  end
+
   @spec validate!() :: :ok | {:error, term()}
   def validate! do
     WorkflowStore.force_reload()

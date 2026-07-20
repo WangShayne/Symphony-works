@@ -349,6 +349,7 @@ defmodule SymphonyElixir.CoreTest do
 
     hook_marker = Path.join(test_root, "before-run-started")
     hook_fifo = Path.join(test_root, "before-run-blocker")
+    hook_pid_file = Path.join(test_root, "before-run-pids")
     runtime_supervisor_name = Module.concat(__MODULE__, "AgentRuntimeSupervisor#{issue_suffix}")
     task_supervisor_name = Module.concat(__MODULE__, "TaskSupervisor#{issue_suffix}")
     orchestrator_name = Module.concat(__MODULE__, "RestartOrchestrator#{issue_suffix}")
@@ -367,10 +368,13 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     on_exit(fn ->
+      terminate_hook_processes(hook_pid_file)
+
       if pid = Process.whereis(runtime_supervisor_name) do
         GenServer.stop(pid)
       end
 
+      terminate_hook_processes(hook_pid_file)
       restore_app_env(:memory_tracker_issues, previous_memory_issues)
       restart_default_runtime!()
       File.rm_rf(test_root)
@@ -388,7 +392,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_kind: "memory",
       workspace_root: test_root,
       poll_interval_ms: 10,
-      hook_before_run: "mkfifo \"#{hook_fifo}\"; : > \"#{hook_marker}\"; read _ < \"#{hook_fifo}\"",
+      hook_before_run: "printf '%s\\n' $$ >> \"#{hook_pid_file}\"; mkfifo \"#{hook_fifo}\"; : > \"#{hook_marker}\"; read _ < \"#{hook_fifo}\"",
       hook_timeout_ms: 60_000
     )
 
@@ -1129,6 +1133,50 @@ defmodule SymphonyElixir.CoreTest do
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
   defp restore_app_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
+
+  defp terminate_hook_processes(pid_file) do
+    pid_file
+    |> hook_pids()
+    |> Enum.each(&terminate_os_process/1)
+  end
+
+  defp hook_pids(pid_file) do
+    if File.exists?(pid_file), do: read_hook_pids(pid_file), else: []
+  end
+
+  defp read_hook_pids(pid_file) do
+    pid_file
+    |> File.read!()
+    |> String.split("\n", trim: true)
+    |> Enum.flat_map(&parse_hook_pid/1)
+    |> Enum.uniq()
+  end
+
+  defp parse_hook_pid(pid) do
+    case Integer.parse(pid) do
+      {integer, ""} when integer > 0 -> [integer]
+      _invalid -> []
+    end
+  end
+
+  defp terminate_os_process(pid) do
+    pid_string = Integer.to_string(pid)
+    _term = System.cmd("kill", ["-TERM", pid_string], stderr_to_stdout: true)
+    Process.sleep(20)
+
+    if os_process_alive?(pid_string) do
+      _kill = System.cmd("kill", ["-KILL", pid_string], stderr_to_stdout: true)
+    end
+
+    :ok
+  end
+
+  defp os_process_alive?(pid_string) do
+    case System.cmd("kill", ["-0", pid_string], stderr_to_stdout: true) do
+      {_output, 0} -> true
+      {_output, _status} -> false
+    end
+  end
 
   defp restart_default_runtime! do
     if Process.whereis(SymphonyElixir.AgentRuntimeSupervisor) do

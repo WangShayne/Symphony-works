@@ -14,6 +14,7 @@ defmodule SymphonyElixir.Identity.AuthorizationTest do
     assert {:error, :forbidden} = Authorization.authorize(viewer, :write_configuration)
 
     assert :ok = Authorization.authorize(operator, :read_task)
+    assert :ok = Authorization.authorize(operator, :create_task)
     assert :ok = Authorization.authorize(operator, :retry_task)
     assert {:error, :forbidden} = Authorization.authorize(operator, :write_secret)
 
@@ -45,10 +46,13 @@ defmodule SymphonyElixir.Identity.AuthorizationTest do
     viewer = %Principal{id: "v", subject: "viewer@example.test", roles: [:viewer]}
 
     assert {:error, :forbidden} = Authorization.authorize(viewer, :unknown_action)
+    assert :create_task = Authorization.action_for_path("POST", "/api/v1/tasks")
+    assert :read_task = Authorization.action_for_path("GET", "/api/v1/tasks")
     assert :write_secret = Authorization.action_for_path("GET", "/api/v1/secrets")
     assert :write_configuration = Authorization.action_for_path("GET", "/api/v1/configuration")
     assert :retry_task = Authorization.action_for_path("POST", "/api/v1/tasks/demo/retry")
     assert :read_task = Authorization.action_for_path("GET", "/api/v1/tasks")
+    assert :read_task = Authorization.action_for_path("GET", "/api/v1/unknown")
     assert :write_secret = Authorization.action_for_path("GET", "/configuration/secrets")
     assert :write_configuration = Authorization.action_for_path("GET", "/configuration")
     assert :read_task = Authorization.action_for_path("GET", "/unknown")

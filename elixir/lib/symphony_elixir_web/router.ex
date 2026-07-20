@@ -54,8 +54,10 @@ defmodule SymphonyElixirWeb.Router do
   scope "/", SymphonyElixirWeb do
     pipe_through([:browser, :authenticated_browser])
 
-    live("/tasks", PlaceholderLive, :index)
-    live("/:locale/tasks", PlaceholderLive, :index)
+    live("/tasks", TaskLive, :index)
+    live("/tasks/:id", TaskLive, :show)
+    live("/:locale/tasks", TaskLive, :index)
+    live("/:locale/tasks/:id", TaskLive, :show)
     live("/interventions", PlaceholderLive, :index)
     live("/projects", PlaceholderLive, :index)
     live("/models", PlaceholderLive, :index)
@@ -101,7 +103,9 @@ defmodule SymphonyElixirWeb.Router do
   scope "/api/v1", SymphonyElixirWeb.Api.V1 do
     pipe_through(:authenticated_api)
 
-    get("/tasks", PlaceholderController, :index)
+    get("/tasks", TaskController, :index)
+    post("/tasks", TaskController, :create)
+    get("/tasks/:id", TaskController, :show)
     post("/tasks/:id/retry", PlaceholderController, :accepted)
     get("/configuration", PlaceholderController, :index, resource: "configuration")
     get("/secrets", PlaceholderController, :index, resource: "secrets")

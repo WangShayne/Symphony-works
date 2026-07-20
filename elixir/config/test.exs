@@ -13,3 +13,5 @@ config :symphony_elixir, SymphonyElixir.Repo,
   database: Path.join(System.tmp_dir!(), "symphony_test_#{partition}.db"),
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: 10
+
+config :symphony_elixir, :orchestrator_lifecycle_enabled, false

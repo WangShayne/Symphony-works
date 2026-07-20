@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.ConfigurationTest do
   use SymphonyElixir.DataCase, async: false
 
-  alias SymphonyElixir.Configuration
+  alias SymphonyElixir.{Config, Configuration}
   alias SymphonyElixir.Configuration.{Document, Exporter, Validator}
   alias SymphonyElixir.Security.SecretStore
 
@@ -17,6 +17,28 @@ defmodule SymphonyElixir.ConfigurationTest do
 
     @impl true
     def validate(_document), do: {:ok, %{"kind" => "model", "api_key" => "secret"}}
+  end
+
+  test "runtime coordination accessors honor application overrides" do
+    previous_lifecycle = Application.get_env(:symphony_elixir, :orchestrator_lifecycle_enabled)
+    previous_adapter = Application.get_env(:symphony_elixir, :task_creation_effect_adapter)
+
+    on_exit(fn ->
+      restore_env(:orchestrator_lifecycle_enabled, previous_lifecycle)
+      restore_env(:task_creation_effect_adapter, previous_adapter)
+    end)
+
+    Application.delete_env(:symphony_elixir, :orchestrator_lifecycle_enabled)
+    assert Config.orchestrator_lifecycle_enabled?()
+
+    Application.put_env(:symphony_elixir, :orchestrator_lifecycle_enabled, false)
+    refute Config.orchestrator_lifecycle_enabled?()
+
+    Application.delete_env(:symphony_elixir, :task_creation_effect_adapter)
+    assert Config.task_creation_effect_adapter() == SymphonyElixir.Effects.SimulatedAdapter
+
+    Application.put_env(:symphony_elixir, :task_creation_effect_adapter, PassingProbe)
+    assert Config.task_creation_effect_adapter() == PassingProbe
   end
 
   test "Administrator creates, validates, and atomically activates one Automation Project" do
@@ -178,6 +200,48 @@ defmodule SymphonyElixir.ConfigurationTest do
 
     assert {:ok, existing_pin} = Configuration.pin_for_task("task-1", actor: "scheduler")
     assert existing_pin.id == pinned.id
+  end
+
+  test "task recovery pins its captured active revision and refuses a different explicit revision" do
+    {:ok, first_draft} = Configuration.create_draft(valid_document(), actor: "bootstrap-admin")
+    {:ok, first_active} = Configuration.activate(first_draft.id, actor: "bootstrap-admin")
+
+    replacement =
+      put_in(valid_document(), ["automation_projects", Access.at(0), "name"], "Replacement")
+
+    {:ok, replacement_draft} = Configuration.create_draft(replacement, actor: "bootstrap-admin")
+    {:ok, replacement_active} = Configuration.activate(replacement_draft.id, actor: "bootstrap-admin")
+    first_active_id = first_active.id
+
+    assert {:ok, pin} =
+             Configuration.pin_for_task("recovered-task",
+               actor: "scheduler",
+               revision_id: first_active.id
+             )
+
+    assert pin.revision_id == first_active.id
+
+    assert {:ok, same_pin} =
+             Configuration.pin_for_task("recovered-task",
+               actor: "scheduler",
+               revision_id: first_active.id
+             )
+
+    assert same_pin.id == pin.id
+
+    assert {:error, {:configuration_pin_conflict, ^first_active_id}} =
+             Configuration.pin_for_task("recovered-task",
+               actor: "scheduler",
+               revision_id: replacement_active.id
+             )
+
+    {:ok, draft} = Configuration.create_draft(valid_document(), actor: "bootstrap-admin")
+
+    assert {:error, {:invalid_pin_revision_status, :draft}} =
+             Configuration.pin_for_task("draft-task",
+               actor: "scheduler",
+               revision_id: draft.id
+             )
   end
 
   test "Administrator rolls back to a prior immutable revision and exports redacted configuration" do
@@ -355,4 +419,7 @@ defmodule SymphonyElixir.ConfigurationTest do
       %{"id" => "tracker", "kind" => "github", "credential_ref" => "secret:#{secret}"}
     ])
   end
+
+  defp restore_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
+  defp restore_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
 end

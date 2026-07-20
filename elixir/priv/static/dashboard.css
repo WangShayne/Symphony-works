@@ -733,7 +733,7 @@ pre,
 
 .configuration-page #runtime-model-form fieldset {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.72rem;
   margin: 0;
   padding: 0.9rem;
@@ -808,14 +808,19 @@ pre,
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .configuration-page #runtime-model-form fieldset {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
 }
 
 @media (max-width: 560px) {
   .metric-grid {
     grid-template-columns: 1fr;
+  }
+
+  .configuration-page #workflow-import-form {
+    grid-template-columns: 1fr;
+  }
+
+  .configuration-page #workflow-import-form textarea {
+    grid-row: auto;
   }
 
   .section-card,

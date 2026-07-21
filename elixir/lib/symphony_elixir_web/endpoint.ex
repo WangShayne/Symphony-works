@@ -18,9 +18,10 @@ defmodule SymphonyElixirWeb.Endpoint do
 
   plug(Plug.RequestId)
   plug(Plug.Telemetry, event_prefix: [:phoenix, :endpoint])
+  plug(SymphonyElixirWeb.Plugs.TaskBodyReader)
 
   plug(Plug.Parsers,
-    parsers: [:urlencoded, :multipart, :json],
+    parsers: [:urlencoded, {:multipart, length: 65_536, read_length: 65_536}, :json],
     pass: ["*/*"],
     body_reader: {SymphonyElixirWeb.Plugs.TaskBodyReader, :read_body, []},
     json_decoder: Jason

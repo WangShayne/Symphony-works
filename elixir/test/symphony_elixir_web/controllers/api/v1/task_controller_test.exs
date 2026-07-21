@@ -139,6 +139,51 @@ defmodule SymphonyElixirWeb.Api.V1.TaskControllerTest do
     assert %{"error" => %{"code" => "idempotency_conflict"}} = json_response(conflict, 409)
   end
 
+  test "task creation authorization follows the matched route for canonical and trailing slash paths", %{
+    conn: conn,
+    operator: operator,
+    viewer: viewer
+  } do
+    for path <- ["/api/v1/tasks", "/api/v1/tasks/"],
+        {principal, expected_status} <- [{viewer, 403}, {operator, 201}] do
+      key = "route-auth-#{principal.id}-#{System.unique_integer([:positive])}"
+
+      response =
+        conn
+        |> api_conn(principal)
+        |> put_req_header("idempotency-key", key)
+        |> post(path, task_payload(%{"external_id" => "GH-ROUTE-#{key}"}))
+
+      assert response.status == expected_status
+    end
+  end
+
+  test "oversized task creation bodies are rejected before parsing across supported content types", %{
+    conn: conn,
+    operator: operator,
+    viewer: viewer
+  } do
+    for path <- ["/api/v1/tasks", "/api/v1/tasks/"],
+        principal <- [viewer, operator],
+        {content_type, body} <- oversized_task_bodies() do
+      task_count = Repo.aggregate(TaskProjection, :count, :task_id)
+      effect_count = Repo.aggregate(Effects.Record, :count, :operation_id)
+      audit_count = length(Audit.list())
+
+      assert_error_sent(:request_entity_too_large, fn ->
+        conn
+        |> api_conn(principal)
+        |> put_req_header("content-type", content_type)
+        |> put_req_header("idempotency-key", "oversized-#{System.unique_integer([:positive])}")
+        |> post(path, body)
+      end)
+
+      assert Repo.aggregate(TaskProjection, :count, :task_id) == task_count
+      assert Repo.aggregate(Effects.Record, :count, :operation_id) == effect_count
+      assert length(Audit.list()) == audit_count
+    end
+  end
+
   test "unauthenticated oversized task JSON is rejected before auth or task creation", %{
     conn: conn
   } do
@@ -643,6 +688,43 @@ defmodule SymphonyElixirWeb.Api.V1.TaskControllerTest do
       )
 
     %{"task" => task}
+  end
+
+  defp oversized_task_bodies do
+    json =
+      task_payload(%{"summary" => String.duplicate("oversized task body ", 4_000)})
+      |> Jason.encode!()
+
+    form =
+      "task[external_id]=GH-OVERSIZED&task[summary]=" <>
+        URI.encode_www_form(String.duplicate("oversized task body ", 4_000))
+
+    boundary = "symphony-boundary"
+
+    multipart =
+      [
+        "--#{boundary}",
+        ~s(content-disposition: form-data; name="task[external_id]"),
+        "",
+        "GH-OVERSIZED",
+        "--#{boundary}",
+        ~s(content-disposition: form-data; name="task[summary]"),
+        "",
+        String.duplicate("oversized task body ", 4_000),
+        "--#{boundary}--",
+        ""
+      ]
+      |> Enum.join("\r\n")
+
+    assert byte_size(json) > 65_536
+    assert byte_size(form) > 65_536
+    assert byte_size(multipart) > 65_536
+
+    [
+      {"application/json", json},
+      {"application/x-www-form-urlencoded", form},
+      {"multipart/form-data; boundary=#{boundary}", multipart}
+    ]
   end
 
   defp coordination_attrs(task, principal, key, configuration_revision) do

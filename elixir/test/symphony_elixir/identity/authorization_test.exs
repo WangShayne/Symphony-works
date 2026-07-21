@@ -47,6 +47,7 @@ defmodule SymphonyElixir.Identity.AuthorizationTest do
 
     assert {:error, :forbidden} = Authorization.authorize(viewer, :unknown_action)
     assert :create_task = Authorization.action_for_path("POST", "/api/v1/tasks")
+    assert :create_task = Authorization.action_for_path("POST", "/api/v1/tasks/")
     assert :read_task = Authorization.action_for_path("GET", "/api/v1/tasks")
     assert :write_secret = Authorization.action_for_path("GET", "/api/v1/secrets")
     assert :write_configuration = Authorization.action_for_path("GET", "/api/v1/configuration")

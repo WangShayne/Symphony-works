@@ -47,6 +47,8 @@ defmodule SymphonyElixir.Identity.Authorization do
 
   @spec action_for_path(String.t(), String.t()) :: atom()
   def action_for_path(method, path) do
+    path = canonical_path(path)
+
     cond do
       String.starts_with?(path, "/api/v1/") -> api_action_for_path(method, path)
       String.starts_with?(path, "/configuration") -> configuration_action_for_path(path)
@@ -75,4 +77,11 @@ defmodule SymphonyElixir.Identity.Authorization do
 
   defp localized_label(labels, "zh-CN"), do: Map.fetch!(labels, "zh-CN")
   defp localized_label(labels, _locale), do: Map.fetch!(labels, "en")
+
+  defp canonical_path(path) do
+    case String.trim_trailing(path, "/") do
+      "" -> "/"
+      canonical -> canonical
+    end
+  end
 end

@@ -26,7 +26,26 @@ defmodule SymphonyElixirWeb.Router do
   pipeline :authenticated_api do
     plug(:accepts, ["json"])
     plug(SymphonyElixirWeb.Auth.BearerPlug)
-    plug(SymphonyElixirWeb.Plugs.Authorize)
+  end
+
+  pipeline :api_read_task do
+    plug(SymphonyElixirWeb.Plugs.Authorize, action: :read_task)
+  end
+
+  pipeline :api_create_task do
+    plug(SymphonyElixirWeb.Plugs.Authorize, action: :create_task)
+  end
+
+  pipeline :api_retry_task do
+    plug(SymphonyElixirWeb.Plugs.Authorize, action: :retry_task)
+  end
+
+  pipeline :api_write_configuration do
+    plug(SymphonyElixirWeb.Plugs.Authorize, action: :write_configuration)
+  end
+
+  pipeline :api_write_secret do
+    plug(SymphonyElixirWeb.Plugs.Authorize, action: :write_secret)
   end
 
   pipeline :trusted_admin_browser do
@@ -102,13 +121,33 @@ defmodule SymphonyElixirWeb.Router do
   end
 
   scope "/api/v1", SymphonyElixirWeb.Api.V1 do
-    pipe_through(:authenticated_api)
+    pipe_through([:authenticated_api, :api_read_task])
 
     get("/tasks", TaskController, :index)
-    post("/tasks", TaskController, :create)
     get("/tasks/:id", TaskController, :show)
+  end
+
+  scope "/api/v1", SymphonyElixirWeb.Api.V1 do
+    pipe_through([:authenticated_api, :api_create_task])
+
+    post("/tasks", TaskController, :create)
+  end
+
+  scope "/api/v1", SymphonyElixirWeb.Api.V1 do
+    pipe_through([:authenticated_api, :api_retry_task])
+
     post("/tasks/:id/retry", PlaceholderController, :accepted)
+  end
+
+  scope "/api/v1", SymphonyElixirWeb.Api.V1 do
+    pipe_through([:authenticated_api, :api_write_configuration])
+
     get("/configuration", PlaceholderController, :index, resource: "configuration")
+  end
+
+  scope "/api/v1", SymphonyElixirWeb.Api.V1 do
+    pipe_through([:authenticated_api, :api_write_secret])
+
     get("/secrets", PlaceholderController, :index, resource: "secrets")
   end
 

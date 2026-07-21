@@ -182,7 +182,6 @@ defmodule SymphonyElixir.Effects do
       nil ->
         case Repo.get_by(Record, dedupe_hash: attrs.dedupe_hash) do
           %Record{} = record -> resolve_existing_record(record, attrs, :dedupe_conflict)
-          nil -> {:error, :effect_persistence_failed}
         end
     end
   end

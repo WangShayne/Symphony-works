@@ -44,7 +44,11 @@ defmodule SymphonyElixir.SourceControl.AdapterSupport do
     signature_payload =
       marker_signature_payload(provider, repository, action, dedupe_digest, intent_digest, operation_digest)
 
-    with {:ok, signature} <- Transport.sign_marker_payload(signature_payload) do
+    # The facade installs the credential in process scope around the callback;
+    # capture prevents Dialyzer from treating that higher-order path as absent.
+    sign_marker_payload = Function.capture(Transport, :sign_marker_payload, 1)
+
+    with {:ok, signature} <- sign_marker_payload.(signature_payload) do
       dedupe_prefix = "<!-- symphony:dedupe-sha256=#{dedupe_digest} "
       replay_prefix = dedupe_prefix <> "intent-sha256=#{intent_digest} "
       operation_token = "operation-sha256=#{operation_digest}"

@@ -971,16 +971,14 @@ defmodule SymphonyElixir.SourceControl.GitHub do
        )
        when is_binary(repository) and is_binary(parent_external_id) and is_binary(operation_id) and
               is_binary(dedupe_key) and is_binary(body) do
-    # The credential is process-scoped, which Dialyzer cannot follow through
-    # the adapter callback boundary.
-    apply(AdapterSupport, :comment_marker, [
+    AdapterSupport.comment_marker(
       :github,
       repository,
       parent_external_id,
       operation_id,
       dedupe_key,
       body
-    ])
+    )
   end
 
   defp comment_marker(_repository, _change_request, _operation_id, _dedupe_key, _body),

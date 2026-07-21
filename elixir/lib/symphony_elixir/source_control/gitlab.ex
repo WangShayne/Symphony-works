@@ -817,16 +817,14 @@ defmodule SymphonyElixir.SourceControl.GitLab do
   @spec gitlab_comment_marker(atom(), String.t(), String.t(), String.t(), String.t(), String.t()) ::
           {:ok, AdapterSupport.operation_marker()} | {:error, term()}
   defp gitlab_comment_marker(provider, repository, parent_external_id, operation_id, dedupe_key, body) do
-    # The credential is process-scoped, which Dialyzer cannot follow through
-    # the adapter callback boundary.
-    apply(AdapterSupport, :comment_marker, [
+    AdapterSupport.comment_marker(
       provider,
       repository,
       parent_external_id,
       operation_id,
       dedupe_key,
       body
-    ])
+    )
   end
 
   defp gitlab_comment_decision({:found, found}, _config, _repo, _cr, _body, _marker, _bot_actor_id) do

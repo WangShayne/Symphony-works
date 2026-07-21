@@ -310,6 +310,31 @@ defmodule SymphonyElixir.Configuration do
     Repo.get_by!(TaskPin, task_id: task_id)
   end
 
+  @spec pinned_revision_for_task(String.t()) ::
+          {:ok, Revision.t()} | {:error, :not_found | :invalid_task_pin}
+  def pinned_revision_for_task(task_id) when is_binary(task_id) do
+    query =
+      from(pin in TaskPin,
+        join: revision in Revision,
+        on: revision.id == pin.revision_id,
+        where: pin.task_id == ^task_id,
+        select: {pin, revision}
+      )
+
+    case Repo.one(query) do
+      {%TaskPin{content_hash: content_hash}, %Revision{content_hash: content_hash} = revision} ->
+        {:ok, revision}
+
+      {%TaskPin{}, %Revision{}} ->
+        {:error, :invalid_task_pin}
+
+      nil ->
+        {:error, :not_found}
+    end
+  end
+
+  def pinned_revision_for_task(_task_id), do: {:error, :not_found}
+
   @spec export(Ecto.UUID.t(), keyword()) :: {:ok, map()} | {:error, :not_found}
   def export(id, opts) do
     case Repo.get(Revision, id) do

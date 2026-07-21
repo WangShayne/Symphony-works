@@ -19,7 +19,7 @@ defmodule SymphonyElixir.Security.CredentialBroker do
   def with_secret(_reference, _purpose, _fun), do: {:error, :invalid_callback}
 
   defp fetch_secret(reference) do
-    SecretStore.fetch(reference)
+    SecretStore.fetch(reference, log: false)
   rescue
     _exception -> {:error, :not_found}
   end

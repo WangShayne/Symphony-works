@@ -86,7 +86,7 @@ defmodule SymphonyElixir.Security.SecretStore do
           {:ok, String.t()} | {:error, :not_found | :decrypt_failed | :invalid_reference | :reference_mismatch}
   def fetch(reference, opts \\ []) do
     with {:ok, normalized} <- normalize_reference(reference),
-         %Secret{} = secret <- Repo.get(Secret, normalized.id),
+         %Secret{} = secret <- Repo.get(Secret, normalized.id, log: Keyword.get(opts, :log, :debug)),
          :ok <- verify_reference_name(secret, normalized.name),
          key <- Keyword.get(opts, :key, current_key!()),
          {:ok, plaintext} <- decrypt(secret, key) do

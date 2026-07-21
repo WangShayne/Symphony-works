@@ -55,7 +55,7 @@ defmodule SymphonyElixir.SourceControl.EffectAdapter do
   def execute(%Record{} = record) do
     with {:ok, invocation} <- invocation(record) do
       invocation
-      |> with_runtime_credential(record, &dispatch(record, &1))
+      |> with_runtime_credential(&dispatch(record, &1))
       |> normalize_execution_result()
     end
   end
@@ -77,13 +77,21 @@ defmodule SymphonyElixir.SourceControl.EffectAdapter do
 
   def reconcile(%Record{}), do: {:unknown, :invalid_source_control_effect}
 
-  defp invocation(%Record{action: action, intent: intent}) do
+  defp invocation(%Record{action: action, intent: intent} = record) do
     with {:ok, action} <- normalize_action(action),
          {:ok, intent} <- normalize_intent(intent),
-         {:ok, config} <- config_for(action, intent) do
-      {:ok, %{action: action, intent: intent, config: config}}
+         {:ok, intent_config} <- config_for(action, intent),
+         {:ok, runtime} <- pinned_runtime(record, intent_config),
+         {:ok, intent} <- put_invocation_config(action, intent, runtime.config) do
+      {:ok,
+       %{
+         action: action,
+         intent: intent,
+         config: runtime.config,
+         credential_ref: runtime.credential_ref
+       }}
     else
-      _invalid -> {:error, :invalid_effect}
+      {:error, reason} when is_atom(reason) -> {:error, reason}
     end
   end
 
@@ -139,84 +147,85 @@ defmodule SymphonyElixir.SourceControl.EffectAdapter do
     end
   end
 
-  defp with_runtime_credential(%{config: config} = invocation, record, fun) do
-    case {provider_value(config), credential_reference(record.task_id, config)} do
+  defp with_runtime_credential(
+         %{config: config, credential_ref: credential_ref} = invocation,
+         fun
+       ) do
+    case {provider_value(config), credential_ref} do
       {"fixture", _reference} ->
         fun.(invocation)
 
-      {_provider, {:ok, reference}} ->
+      {_provider, reference} when is_binary(reference) and byte_size(reference) > 0 ->
         CredentialBroker.with_secret(reference, :source_control_effect, fn credential ->
           invocation
           |> put_invocation_credential(credential)
           |> fun.()
         end)
 
-      {_provider, {:error, reason}} ->
-        {:error, reason}
-    end
-  end
-
-  defp credential_reference(task_id, config) do
-    resolver =
-      Application.get_env(
-        :symphony_elixir,
-        :source_control_effect_credential_resolver,
-        &pinned_credential_reference/2
-      )
-
-    case resolver.(task_id, config) do
-      {:ok, reference} when is_binary(reference) and byte_size(reference) > 0 ->
-        {:ok, reference}
-
-      {:error, reason} when is_atom(reason) ->
-        {:error, reason}
-
-      _invalid ->
+      {_provider, _missing} ->
         {:error, :missing_credential_reference}
     end
-  rescue
-    _exception -> {:error, :missing_credential_reference}
-  catch
-    _kind, _reason -> {:error, :missing_credential_reference}
   end
 
-  defp pinned_credential_reference(task_id, config) do
-    pin = Configuration.pinned_for_task!(task_id)
-    integration_id = value(config, :id)
-
-    pin.document
-    |> value(:integrations)
-    |> Enum.find(&matching_integration?(&1, integration_id, config))
-    |> case do
-      integration when is_map(integration) ->
-        case value(integration, :credential_ref) do
-          reference when is_binary(reference) and byte_size(reference) > 0 -> {:ok, reference}
-          _missing -> {:error, :missing_credential_reference}
-        end
-
-      _missing ->
-        {:error, :missing_credential_reference}
-    end
-  rescue
-    _exception -> {:error, :missing_credential_reference}
-  end
-
-  defp matching_integration?(integration, integration_id, config) when is_map(integration) do
-    value(integration, :id) == integration_id and value(integration, :kind) == "source_control" and
-      provider_value(integration) == provider_value(config) and
-      repository_matches?(integration, config)
-  end
-
-  defp matching_integration?(_integration, _integration_id, _config), do: false
-
-  defp repository_matches?(integration, config) do
-    with integration_settings when is_map(integration_settings) <- value(integration, :settings),
-         config_settings when is_map(config_settings) <- value(config, :settings) do
-      value(integration_settings, :repository) == value(config_settings, :repository)
+  defp pinned_runtime(%Record{} = record, config) do
+    with integration_id when is_binary(integration_id) and byte_size(integration_id) > 0 <-
+           value(config, :id),
+         {:ok, revision} <- Configuration.pinned_revision_for_task(record.task_id),
+         integrations when is_list(integrations) <- value(revision.document, :integrations),
+         {:ok, integration} <- unique_integration(integrations, integration_id),
+         :ok <- validate_pinned_integration(integration, record),
+         runtime_config <- json_value(integration) do
+      {:ok,
+       %{
+         config: runtime_config,
+         credential_ref: value(integration, :credential_ref)
+       }}
     else
-      _invalid -> false
+      _invalid -> {:error, :missing_credential_reference}
+    end
+  rescue
+    _exception -> {:error, :missing_credential_reference}
+  end
+
+  defp unique_integration(integrations, integration_id) do
+    if Enum.all?(integrations, &valid_integration_entry?/1) do
+      case Enum.filter(integrations, &(value(&1, :id) == integration_id)) do
+        [integration] -> {:ok, integration}
+        _missing_or_ambiguous -> {:error, :missing_credential_reference}
+      end
+    else
+      {:error, :missing_credential_reference}
     end
   end
+
+  defp valid_integration_entry?(integration) when is_map(integration) do
+    Enum.all?([value(integration, :id), value(integration, :kind)], fn field ->
+      is_binary(field) and String.trim(field) != ""
+    end) and is_map(value(integration, :settings))
+  end
+
+  defp valid_integration_entry?(_integration), do: false
+
+  defp validate_pinned_integration(
+         integration,
+         %Record{provider: expected_provider, target: expected_target}
+       ) do
+    with "source_control" <- value(integration, :kind),
+         ^expected_provider <- provider_value(integration),
+         {:ok, ^expected_target} <- repository(integration) do
+      :ok
+    else
+      _mismatch -> {:error, :missing_credential_reference}
+    end
+  end
+
+  defp put_invocation_config("ensure_change_request", intent, config) do
+    attrs = value(intent, :attrs)
+    {:ok, Map.put(intent, "attrs", Map.put(attrs, "repo", config))}
+  end
+
+  defp put_invocation_config(_action, intent, config),
+    do: {:ok, Map.put(intent, "config", config)}
 
   defp put_invocation_credential(
          %{action: "ensure_change_request", intent: intent} = invocation,

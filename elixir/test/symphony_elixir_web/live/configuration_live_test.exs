@@ -301,7 +301,8 @@ defmodule SymphonyElixirWeb.ConfigurationLiveTest do
         "credential_ref" => reference.id,
         "repository" => "WangShayne/Symphony-works",
         "base_branch" => "main",
-        "endpoint" => "https://source-control.example.test/api/v4"
+        "endpoint" => "https://source-control.example.test/api/v4",
+        "bot_actor_id" => "424242"
       }
     )
     |> render_submit()

@@ -29,6 +29,32 @@ defmodule SymphonyElixir.SourceControl.Transport do
     end
   end
 
+  @spec sign_marker_payload(String.t()) :: {:ok, String.t()} | {:error, :invalid_configuration}
+  def sign_marker_payload(payload) when is_binary(payload) do
+    with {:ok, credential} <- scoped_credential() do
+      signature =
+        :crypto.mac(:hmac, :sha256, credential, payload)
+        |> Base.encode16(case: :lower)
+
+      {:ok, signature}
+    end
+  end
+
+  def sign_marker_payload(_payload), do: {:error, :invalid_configuration}
+
+  @spec valid_marker_signature?(String.t(), String.t()) :: boolean()
+  def valid_marker_signature?(payload, signature)
+      when is_binary(payload) and is_binary(signature) do
+    with {:ok, expected} <- sign_marker_payload(payload),
+         true <- byte_size(expected) == byte_size(signature) do
+      :crypto.hash_equals(expected, signature)
+    else
+      _invalid -> false
+    end
+  end
+
+  def valid_marker_signature?(_payload, _signature), do: false
+
   @spec request(map(), :github | :gitlab, request()) ::
           {:ok, response()} | {:error, term()}
   def request(config, provider, request)
@@ -172,6 +198,18 @@ defmodule SymphonyElixir.SourceControl.Transport do
       {:ok, credential}
     else
       {:error, :invalid_configuration}
+    end
+  end
+
+  defp scoped_credential do
+    case Process.get(@credential_key) do
+      credential when is_binary(credential) ->
+        if String.trim(credential) != "",
+          do: {:ok, credential},
+          else: {:error, :invalid_configuration}
+
+      _missing ->
+        {:error, :invalid_configuration}
     end
   end
 

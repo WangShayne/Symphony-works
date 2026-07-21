@@ -175,7 +175,8 @@ defmodule SymphonyElixir.SourceControlContractTest do
       settings: %{
         "repository" => "acme/widget",
         "base_branch" => "main",
-        "api_base_url" => "https://api.github.test"
+        "api_base_url" => "https://api.github.test",
+        "bot_actor_id" => "424242"
       },
       transport: {FixtureTransport, transport}
     }
@@ -192,8 +193,18 @@ defmodule SymphonyElixir.SourceControlContractTest do
              change_request_write: :allowed
            }
 
+    assert health.credential_actor == %{id: "424242", matched?: true}
+
     requests = FixtureTransport.requests(transport)
-    assert Enum.map(requests, & &1.method) == [:get, :get, :get]
+    assert Enum.map(requests, & &1.method) == [:get, :get, :get, :get]
+
+    assert Enum.map(requests, & &1.path) == [
+             "/repos/acme/widget",
+             "/repos/acme/widget/branches/main",
+             "/repos/acme/widget/rules/branches/main",
+             "/user"
+           ]
+
     assert Enum.all?(requests, &(get_in(&1, [:headers, "authorization"]) == "Bearer github-secret-value"))
 
     evidence = inspect(health)
@@ -235,8 +246,18 @@ defmodule SymphonyElixir.SourceControlContractTest do
              change_request_write: :allowed
            }
 
+    assert health.credential_actor == %{id: "31337", matched?: true}
+
     requests = FixtureTransport.requests(transport)
-    assert Enum.map(requests, & &1.method) == [:get, :get, :get]
+    assert Enum.map(requests, & &1.method) == [:get, :get, :get, :get]
+
+    assert Enum.map(requests, & &1.path) == [
+             "/projects/acme%2Fwidget",
+             "/projects/acme%2Fwidget/repository/branches/main",
+             "/projects/acme%2Fwidget/protected_branches/main",
+             "/user"
+           ]
+
     assert Enum.all?(requests, &(get_in(&1, [:headers, "private-token"]) == "gitlab-secret-value"))
     refute inspect(health) =~ "gitlab-secret-value"
   end
@@ -322,18 +343,23 @@ defmodule SymphonyElixir.SourceControlContractTest do
              )
   end
 
-  test "GitHub creates one draft pull request with a hidden reconciliation marker" do
-    {:ok, transport} =
-      FixtureTransport.start_link(fixture_path("github", "create_change_request.json"))
-
+  test "GitHub creates one draft pull request from a provider-authoritative 201 payload" do
     attrs = %{
-      repo: github_config(transport),
+      repo: nil,
       head: "symphony/ABC-9",
       base: "main",
       title: "ABC-9",
       body: "Accepted implementation",
       draft: true
     }
+
+    {:ok, transport} =
+      start_transport([
+        github_list([]),
+        github_create(github_pull(9, attrs))
+      ])
+
+    attrs = %{attrs | repo: github_config(transport)}
 
     assert {:ok, change_request} =
              SourceControl.ensure_change_request(attrs,
@@ -346,28 +372,35 @@ defmodule SymphonyElixir.SourceControlContractTest do
     assert change_request.number == 9
     assert change_request.draft?
     assert change_request.disposition == :created
+    assert change_request.repository == "acme/widget"
+    assert change_request.head_branch == "symphony/ABC-9"
+    assert change_request.base_branch == "main"
 
     [_list, create] = FixtureTransport.requests(transport)
     assert create.method == :post
     assert create.json["draft"] == true
-    assert create.json["body"] =~ "Accepted implementation"
-
-    assert create.json["body"] =~
-             ~r/<!-- symphony:dedupe-sha256=[0-9a-f]{64} intent-sha256=[0-9a-f]{64} operation-sha256=[0-9a-f]{64} -->/
+    assert create.json["body"] == "Accepted implementation"
+    refute create.json["body"] =~ "symphony:"
   end
 
-  test "GitLab creates one draft merge request with a hidden reconciliation marker" do
-    {:ok, transport} =
-      FixtureTransport.start_link(fixture_path("gitlab", "create_change_request.json"))
-
+  test "GitLab creates one draft merge request after canonical project lookup" do
     attrs = %{
-      repo: gitlab_config(transport),
+      repo: nil,
       head: "symphony/ABC-10",
       base: "main",
       title: "ABC-10",
       body: "Accepted implementation",
       draft: true
     }
+
+    {:ok, transport} =
+      start_transport([
+        gitlab_project(),
+        gitlab_list([]),
+        gitlab_create(gitlab_merge_request(10, attrs))
+      ])
+
+    attrs = %{attrs | repo: gitlab_config(transport)}
 
     assert {:ok, change_request} =
              SourceControl.ensure_change_request(attrs,
@@ -376,16 +409,17 @@ defmodule SymphonyElixir.SourceControlContractTest do
              )
 
     assert change_request.provider == :gitlab
-    assert change_request.external_id == "1010"
+    assert change_request.external_id == "10010"
     assert change_request.number == 10
     assert change_request.draft?
     assert change_request.disposition == :created
 
-    [_list, create] = FixtureTransport.requests(transport)
+    [project_lookup, _list, create] = FixtureTransport.requests(transport)
+    assert project_lookup.path == "/projects/acme%2Fwidget"
     assert create.method == :post
     assert create.json["title"] == "Draft: ABC-10"
-    assert create.json["description"] =~ "Accepted implementation"
-    assert create.json["description"] =~ "<!-- symphony:dedupe-sha256="
+    assert create.json["description"] == "Accepted implementation"
+    refute create.json["description"] =~ "symphony:"
   end
 
   test "GitHub state separates required checks, mergeability, and observed human merge" do
@@ -560,12 +594,9 @@ defmodule SymphonyElixir.SourceControlContractTest do
     refute Enum.any?(requests, &String.ends_with?(&1.path, "/merge"))
   end
 
-  test "GitHub follows pagination and reconciles the same Change Request on replay" do
-    {:ok, transport} =
-      FixtureTransport.start_link(fixture_path("github", "replay_change_request.json"))
-
+  test "GitHub follows pagination and treats an existing complete identity as a conflict" do
     attrs = %{
-      repo: github_config(transport),
+      repo: nil,
       head: "symphony/ABC-18",
       base: "main",
       title: "ABC-18",
@@ -573,12 +604,22 @@ defmodule SymphonyElixir.SourceControlContractTest do
       draft: true
     }
 
+    {:ok, transport} =
+      start_transport([
+        github_list([], github_next_page_header()),
+        github_list([]),
+        github_create(github_pull(18, attrs)),
+        github_list([], github_next_page_header()),
+        github_list([github_pull(18, attrs, %{"body" => copied_marker_body()})])
+      ])
+
+    attrs = %{attrs | repo: github_config(transport)}
+
     operation = [operation_id: "task-18:create-cr", dedupe_key: "ABC-18:delivery"]
     assert {:ok, created} = SourceControl.ensure_change_request(attrs, operation)
     assert created.disposition == :created
-    assert {:ok, replayed} = SourceControl.ensure_change_request(attrs, operation)
-    assert replayed.external_id == created.external_id
-    assert replayed.disposition == :reconciled
+
+    assert {:error, :conflict} = SourceControl.ensure_change_request(attrs, operation)
 
     requests = FixtureTransport.requests(transport)
     assert Enum.count(requests, &(&1.method == :post)) == 1
@@ -588,12 +629,9 @@ defmodule SymphonyElixir.SourceControlContractTest do
            |> Enum.map(&get_in(&1, [:query, "page"])) == [1, 2, 1, 2]
   end
 
-  test "GitLab reconciles an unknown create outcome before returning" do
-    {:ok, transport} =
-      FixtureTransport.start_link(fixture_path("gitlab", "unknown_change_request.json"))
-
+  test "GitLab returns unknown_outcome for an unknown create without follow-up reconciliation" do
     attrs = %{
-      repo: gitlab_config(transport),
+      repo: nil,
       head: "symphony/ABC-19",
       base: "main",
       title: "ABC-19",
@@ -601,15 +639,166 @@ defmodule SymphonyElixir.SourceControlContractTest do
       draft: true
     }
 
-    assert {:ok, reconciled} =
+    {:ok, transport} =
+      start_transport([
+        gitlab_project(),
+        gitlab_list([]),
+        %{"method" => "POST", "path" => "/projects/acme%2Fwidget/merge_requests", "error" => "timeout"}
+      ])
+
+    attrs = %{attrs | repo: gitlab_config(transport)}
+
+    assert {:error, :unknown_outcome} =
              SourceControl.ensure_change_request(attrs,
                operation_id: "task-19:create-cr",
                dedupe_key: "ABC-19:delivery"
              )
 
-    assert reconciled.external_id == "19019"
-    assert reconciled.disposition == :reconciled
-    assert Enum.map(FixtureTransport.requests(transport), & &1.method) == [:get, :post, :get]
+    assert Enum.map(FixtureTransport.requests(transport), & &1.method) == [:get, :get, :post]
+  end
+
+  test "provider create conflicts and transient failures return unknown_outcome without retrying create" do
+    attrs = %{
+      repo: nil,
+      head: "symphony/ABC-20",
+      base: "main",
+      title: "ABC-20",
+      body: "Accepted implementation",
+      draft: true
+    }
+
+    for status <- [409, 422, 500, 502, 503, 504] do
+      {:ok, transport} =
+        start_transport([
+          github_list([]),
+          github_create(%{"message" => "unsafe to classify"}, status)
+        ])
+
+      assert {:error, :unknown_outcome} =
+               SourceControl.ensure_change_request(%{attrs | repo: github_config(transport)},
+                 operation_id: "task-20:create-gh-#{status}",
+                 dedupe_key: "ABC-20:gh:#{status}"
+               )
+
+      assert Enum.map(FixtureTransport.requests(transport), & &1.method) == [:get, :post]
+    end
+
+    for status <- [400, 409, 422, 500, 502, 503, 504] do
+      {:ok, transport} =
+        start_transport([
+          gitlab_project(),
+          gitlab_list([]),
+          gitlab_create(%{"message" => "unsafe to classify"}, status)
+        ])
+
+      assert {:error, :unknown_outcome} =
+               SourceControl.ensure_change_request(%{attrs | repo: gitlab_config(transport)},
+                 operation_id: "task-20:create-gl-#{status}",
+                 dedupe_key: "ABC-20:gl:#{status}"
+               )
+
+      assert Enum.map(FixtureTransport.requests(transport), & &1.method) == [:get, :get, :post]
+    end
+  end
+
+  test "malformed create payloads and mismatched immutable identities are unknown outcomes" do
+    github_attrs = %{
+      repo: nil,
+      head: "symphony/ABC-20A",
+      base: "main",
+      title: "ABC-20A",
+      body: "Accepted implementation",
+      draft: true
+    }
+
+    for {name, pull} <- [
+          missing_repo: github_pull(20, github_attrs) |> put_in(["head", "repo"], nil),
+          non_positive_id: github_pull(20, github_attrs) |> Map.put("id", 0),
+          mismatched_head_repo: github_pull(20, github_attrs) |> put_in(["head", "repo", "full_name"], "evil/widget")
+        ] do
+      {:ok, transport} = start_transport([github_list([]), github_create(pull)])
+
+      assert {:error, :unknown_outcome} =
+               SourceControl.ensure_change_request(%{github_attrs | repo: github_config(transport)},
+                 operation_id: "task-20A:#{name}",
+                 dedupe_key: "ABC-20A:#{name}"
+               )
+    end
+
+    gitlab_attrs = %{
+      repo: nil,
+      head: "symphony/ABC-20B",
+      base: "main",
+      title: "ABC-20B",
+      body: "Accepted implementation",
+      draft: true
+    }
+
+    for {name, merge_request} <- [
+          missing_project_id: gitlab_merge_request(20, gitlab_attrs) |> Map.delete("source_project_id"),
+          non_positive_iid: gitlab_merge_request(20, gitlab_attrs) |> Map.put("iid", 0),
+          mismatched_target_project: gitlab_merge_request(20, gitlab_attrs) |> Map.put("target_project_id", 99_999)
+        ] do
+      {:ok, transport} =
+        start_transport([
+          gitlab_project(),
+          gitlab_list([]),
+          gitlab_create(merge_request)
+        ])
+
+      assert {:error, :unknown_outcome} =
+               SourceControl.ensure_change_request(%{gitlab_attrs | repo: gitlab_config(transport)},
+                 operation_id: "task-20B:#{name}",
+                 dedupe_key: "ABC-20B:#{name}"
+               )
+    end
+  end
+
+  test "malformed provider list entries fail closed before create" do
+    github_attrs = %{
+      repo: nil,
+      head: "symphony/ABC-20C",
+      base: "main",
+      title: "ABC-20C",
+      body: "Accepted implementation",
+      draft: true
+    }
+
+    {:ok, github_transport} =
+      start_transport([
+        github_list([github_pull(20, github_attrs) |> Map.put("number", 0)])
+      ])
+
+    assert {:error, :provider_failure} =
+             SourceControl.ensure_change_request(%{github_attrs | repo: github_config(github_transport)},
+               operation_id: "task-20C:github",
+               dedupe_key: "ABC-20C:github"
+             )
+
+    assert Enum.map(FixtureTransport.requests(github_transport), & &1.method) == [:get]
+
+    gitlab_attrs = %{
+      repo: nil,
+      head: "symphony/ABC-20D",
+      base: "main",
+      title: "ABC-20D",
+      body: "Accepted implementation",
+      draft: true
+    }
+
+    {:ok, gitlab_transport} =
+      start_transport([
+        gitlab_project(),
+        gitlab_list([gitlab_merge_request(20, gitlab_attrs) |> Map.put("source_project_id", "424242")])
+      ])
+
+    assert {:error, :provider_failure} =
+             SourceControl.ensure_change_request(%{gitlab_attrs | repo: gitlab_config(gitlab_transport)},
+               operation_id: "task-20D:gitlab",
+               dedupe_key: "ABC-20D:gitlab"
+             )
+
+    assert Enum.map(FixtureTransport.requests(gitlab_transport), & &1.method) == [:get, :get]
   end
 
   test "safe reads retry rate limits without leaking provider response bodies" do
@@ -640,41 +829,53 @@ defmodule SymphonyElixir.SourceControlContractTest do
   end
 
   test "same dedupe key with changed intent fails instead of taking over the existing PR" do
-    {:ok, transport} =
-      FixtureTransport.start_link(fixture_path("github", "idempotency_conflict.json"))
-
     attrs = %{
-      repo: github_config(transport),
+      repo: nil,
       head: "symphony/ABC-21",
       base: "main",
       title: "ABC-21",
       body: "Original intent",
       draft: true
     }
+
+    {:ok, transport} =
+      start_transport([
+        github_list([]),
+        github_create(github_pull(21, attrs)),
+        github_list([github_pull(21, attrs, %{"body" => copied_marker_body()})])
+      ])
+
+    attrs = %{attrs | repo: github_config(transport)}
 
     operation = [operation_id: "task-21:create-cr", dedupe_key: "ABC-21:delivery"]
     assert {:ok, _created} = SourceControl.ensure_change_request(attrs, operation)
 
     changed = %{attrs | body: "Changed intent"}
 
-    assert {:error, :idempotency_conflict} =
+    assert {:error, :conflict} =
              SourceControl.ensure_change_request(changed, operation)
 
     assert Enum.count(FixtureTransport.requests(transport), &(&1.method == :post)) == 1
   end
 
-  test "one GitHub operation id cannot be reused with another dedupe key" do
-    {:ok, transport} =
-      FixtureTransport.start_link(fixture_path("github", "idempotency_conflict.json"))
-
+  test "one GitHub operation id cannot claim an existing provider identity with another dedupe key" do
     attrs = %{
-      repo: github_config(transport),
+      repo: nil,
       head: "symphony/ABC-21",
       base: "main",
       title: "ABC-21",
       body: "Original intent",
       draft: true
     }
+
+    {:ok, transport} =
+      start_transport([
+        github_list([]),
+        github_create(github_pull(21, attrs)),
+        github_list([github_pull(21, attrs)])
+      ])
+
+    attrs = %{attrs | repo: github_config(transport)}
 
     assert {:ok, _created} =
              SourceControl.ensure_change_request(attrs,
@@ -682,7 +883,7 @@ defmodule SymphonyElixir.SourceControlContractTest do
                dedupe_key: "ABC-21:delivery"
              )
 
-    assert {:error, :idempotency_conflict} =
+    assert {:error, :conflict} =
              SourceControl.ensure_change_request(attrs,
                operation_id: "task-21:create-cr",
                dedupe_key: "ABC-21:other-delivery"
@@ -694,18 +895,24 @@ defmodule SymphonyElixir.SourceControlContractTest do
     assert Enum.all?(Enum.filter(requests, &(&1.method == :get)), &is_nil(&1.query["base"]))
   end
 
-  test "a stable GitHub dedupe key reconciles across a new operation id" do
-    {:ok, transport} =
-      FixtureTransport.start_link(fixture_path("github", "idempotency_conflict.json"))
-
+  test "a stable GitHub dedupe key with a new operation id cannot reconcile create ownership" do
     attrs = %{
-      repo: github_config(transport),
+      repo: nil,
       head: "symphony/ABC-21",
       base: "main",
       title: "ABC-21",
       body: "Original intent",
       draft: true
     }
+
+    {:ok, transport} =
+      start_transport([
+        github_list([]),
+        github_create(github_pull(21, attrs)),
+        github_list([github_pull(21, attrs)])
+      ])
+
+    attrs = %{attrs | repo: github_config(transport)}
 
     assert {:ok, created} =
              SourceControl.ensure_change_request(attrs,
@@ -713,22 +920,18 @@ defmodule SymphonyElixir.SourceControlContractTest do
                dedupe_key: "ABC-21:delivery"
              )
 
-    assert {:ok, replayed} =
+    assert {:error, :conflict} =
              SourceControl.ensure_change_request(attrs,
                operation_id: "task-21:create-cr:recovery",
                dedupe_key: "ABC-21:delivery"
              )
 
-    assert replayed.external_id == created.external_id
-    assert replayed.disposition == :reconciled
+    assert created.disposition == :created
   end
 
-  test "GitHub marker lookup detects changed branch intent without head/base filtering" do
-    {:ok, transport} =
-      FixtureTransport.start_link(fixture_path("github", "idempotency_conflict.json"))
-
+  test "GitHub ignores copied create markers on a different immutable identity" do
     attrs = %{
-      repo: github_config(transport),
+      repo: nil,
       head: "symphony/ABC-21",
       base: "main",
       title: "ABC-21",
@@ -736,21 +939,32 @@ defmodule SymphonyElixir.SourceControlContractTest do
       draft: true
     }
 
+    replanned = %{attrs | head: "symphony/ABC-21-replanned"}
+
+    {:ok, transport} =
+      start_transport([
+        github_list([]),
+        github_create(github_pull(21, attrs)),
+        github_list([github_pull(21, attrs, %{"body" => copied_marker_body()})]),
+        github_create(github_pull(22, replanned))
+      ])
+
+    attrs = %{attrs | repo: github_config(transport)}
+    replanned = %{replanned | repo: github_config(transport)}
+
     operation = [operation_id: "task-21:create-cr", dedupe_key: "ABC-21:delivery"]
     assert {:ok, _created} = SourceControl.ensure_change_request(attrs, operation)
 
-    assert {:error, :idempotency_conflict} =
-             SourceControl.ensure_change_request(%{attrs | head: "symphony/ABC-21-replanned"}, operation)
+    assert {:ok, created} = SourceControl.ensure_change_request(replanned, operation)
+    assert created.number == 22
+    assert created.disposition == :created
 
-    assert Enum.count(FixtureTransport.requests(transport), &(&1.method == :post)) == 1
+    assert Enum.count(FixtureTransport.requests(transport), &(&1.method == :post)) == 2
   end
 
-  test "one GitLab operation id cannot be reused with another dedupe key" do
-    {:ok, transport} =
-      FixtureTransport.start_link(fixture_path("gitlab", "idempotency_conflict.json"))
-
+  test "one GitLab operation id cannot claim an existing provider identity with another dedupe key" do
     attrs = %{
-      repo: gitlab_config(transport),
+      repo: nil,
       head: "symphony/ABC-23",
       base: "main",
       title: "ABC-23",
@@ -758,13 +972,24 @@ defmodule SymphonyElixir.SourceControlContractTest do
       draft: true
     }
 
+    {:ok, transport} =
+      start_transport([
+        gitlab_project(),
+        gitlab_list([]),
+        gitlab_create(gitlab_merge_request(23, attrs)),
+        gitlab_project(),
+        gitlab_list([gitlab_merge_request(23, attrs)])
+      ])
+
+    attrs = %{attrs | repo: gitlab_config(transport)}
+
     assert {:ok, _created} =
              SourceControl.ensure_change_request(attrs,
                operation_id: "task-23:create-cr",
                dedupe_key: "ABC-23:delivery"
              )
 
-    assert {:error, :idempotency_conflict} =
+    assert {:error, :conflict} =
              SourceControl.ensure_change_request(attrs,
                operation_id: "task-23:create-cr",
                dedupe_key: "ABC-23:other-delivery"
@@ -774,7 +999,8 @@ defmodule SymphonyElixir.SourceControlContractTest do
     assert Enum.count(requests, &(&1.method == :post)) == 1
 
     assert Enum.all?(Enum.filter(requests, &(&1.method == :get)), fn request ->
-             is_nil(request.query["source_branch"]) and is_nil(request.query["target_branch"])
+             query = Map.get(request, :query, %{})
+             is_nil(query["source_branch"]) and is_nil(query["target_branch"])
            end)
   end
 
@@ -868,6 +1094,120 @@ defmodule SymphonyElixir.SourceControlContractTest do
              SourceControl.state(gitlab_config(transport), change_request(:gitlab, 12, false))
   end
 
+  defp start_transport(responses) do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-source-control-contract-#{System.unique_integer([:positive, :monotonic])}.json"
+      )
+
+    File.write!(path, Jason.encode!(responses))
+    on_exit(fn -> File.rm(path) end)
+    FixtureTransport.start_link(path)
+  end
+
+  defp github_list(pulls, headers \\ %{}) do
+    %{
+      "method" => "GET",
+      "path" => "/repos/acme/widget/pulls",
+      "status" => 200,
+      "headers" => headers,
+      "body" => pulls
+    }
+  end
+
+  defp github_next_page_header do
+    %{"link" => "<https://api.github.test/repos/acme/widget/pulls?page=2>; rel=\"next\""}
+  end
+
+  defp github_create(body, status \\ 201) do
+    %{
+      "method" => "POST",
+      "path" => "/repos/acme/widget/pulls",
+      "status" => status,
+      "headers" => %{},
+      "body" => body
+    }
+  end
+
+  defp github_pull(number, attrs, overrides \\ %{}) do
+    base = %{
+      "id" => number * 1_001,
+      "number" => number,
+      "html_url" => "https://github.test/acme/widget/pull/#{number}",
+      "title" => attrs.title,
+      "body" => attrs.body,
+      "draft" => attrs.draft,
+      "head" => %{
+        "repo" => %{"full_name" => "acme/widget"},
+        "ref" => attrs.head,
+        "sha" => String.duplicate(Integer.to_string(rem(number, 10)), 40)
+      },
+      "base" => %{
+        "repo" => %{"full_name" => "acme/widget"},
+        "ref" => attrs.base,
+        "sha" => "1111111111111111111111111111111111111111"
+      }
+    }
+
+    Map.merge(base, overrides)
+  end
+
+  defp gitlab_project do
+    %{
+      "method" => "GET",
+      "path" => "/projects/acme%2Fwidget",
+      "status" => 200,
+      "headers" => %{},
+      "body" => %{"id" => 424_242, "path_with_namespace" => "acme/widget"}
+    }
+  end
+
+  defp gitlab_list(merge_requests, headers \\ %{}) do
+    %{
+      "method" => "GET",
+      "path" => "/projects/acme%2Fwidget/merge_requests",
+      "status" => 200,
+      "headers" => headers,
+      "body" => merge_requests
+    }
+  end
+
+  defp gitlab_create(body, status \\ 201) do
+    %{
+      "method" => "POST",
+      "path" => "/projects/acme%2Fwidget/merge_requests",
+      "status" => status,
+      "headers" => %{},
+      "body" => body
+    }
+  end
+
+  defp gitlab_merge_request(number, attrs, overrides \\ %{}) do
+    base = %{
+      "id" => number * 1_001,
+      "iid" => number,
+      "web_url" => "https://gitlab.test/acme/widget/-/merge_requests/#{number}",
+      "title" => if(attrs.draft, do: "Draft: #{attrs.title}", else: attrs.title),
+      "description" => attrs.body,
+      "draft" => attrs.draft,
+      "source_project_id" => 424_242,
+      "target_project_id" => 424_242,
+      "source_branch" => attrs.head,
+      "target_branch" => attrs.base,
+      "sha" => String.duplicate(Integer.to_string(rem(number, 10)), 40)
+    }
+
+    Map.merge(base, overrides)
+  end
+
+  defp copied_marker_body do
+    """
+    Copied from a different run.
+    <!-- symphony:dedupe-sha256=#{String.duplicate("a", 64)} intent-sha256=#{String.duplicate("b", 64)} operation-sha256=#{String.duplicate("c", 64)} signature-sha256=#{String.duplicate("d", 64)} -->
+    """
+  end
+
   defp fixture_config do
     %{
       provider: :fixture,
@@ -887,7 +1227,8 @@ defmodule SymphonyElixir.SourceControlContractTest do
       settings: %{
         repository: "acme/widget",
         base_branch: "main",
-        api_base_url: "https://api.github.test"
+        api_base_url: "https://api.github.test",
+        bot_actor_id: "424242"
       },
       transport: {FixtureTransport, transport}
     }
@@ -901,7 +1242,8 @@ defmodule SymphonyElixir.SourceControlContractTest do
       settings: %{
         repository: "acme/widget",
         base_branch: "main",
-        api_base_url: "https://gitlab.test/api/v4"
+        api_base_url: "https://gitlab.test/api/v4",
+        bot_actor_id: "31337"
       },
       transport: {FixtureTransport, transport}
     }

@@ -122,7 +122,8 @@ defmodule SymphonyElixir.ConfigurationRestartTest do
           "credential_ref" => "00000000-0000-4000-8000-000000000023",
           "settings" => %{
             "repository" => "WangShayne/Symphony-works",
-            "base_branch" => "main"
+            "base_branch" => "main",
+            "bot_actor_id" => "424242"
           }
         }
       ])

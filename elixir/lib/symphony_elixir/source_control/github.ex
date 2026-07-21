@@ -36,12 +36,16 @@ defmodule SymphonyElixir.SourceControl.GitHub do
   @impl true
   def health_check(config) when is_map(config) do
     with {:ok, repository, base_branch} <- repository(config),
+         {:ok, bot_actor_id} <- bot_actor_id(config),
          {:ok, repo_response} <- get(config, "/repos/#{repository}"),
          {:ok, repo} <- expect(repo_response, 200),
          {:ok, branch_response} <- get(config, "/repos/#{repository}/branches/#{segment(base_branch)}"),
          {:ok, branch} <- expect(branch_response, 200),
          {:ok, rules_response} <- get(config, "/repos/#{repository}/rules/branches/#{segment(base_branch)}"),
          true <- rules_response.status in [200, 404],
+         {:ok, user_response} <- get(config, "/user"),
+         {:ok, user} <- expect(user_response, 200),
+         {:ok, credential_actor} <- credential_actor(user, bot_actor_id),
          commit_sha when is_binary(commit_sha) <- get_in(branch, ["commit", "sha"]),
          permissions = permissions(repo, repo_response.headers),
          :ok <- require_write_permissions(permissions) do
@@ -52,6 +56,7 @@ defmodule SymphonyElixir.SourceControl.GitHub do
          base_branch: base_branch,
          base_commit_sha: commit_sha,
          permissions: permissions,
+         credential_actor: credential_actor,
          status: :passed
        }}
     else
@@ -116,15 +121,13 @@ defmodule SymphonyElixir.SourceControl.GitHub do
          config when is_map(config) <- value(attrs, :repo),
          {:ok, repository} <- repository_name(config),
          {:ok, input} <- change_request_input(attrs),
-         marker <- change_request_marker(repository, operation_id, dedupe_key, input),
          {:ok, existing} <- list_change_requests(config, repository),
-         {:ok, decision} <- find_change_request(existing, input, marker) do
-      case decision do
-        {:found, pull} ->
-          normalize_change_request(pull, repository, input, :reconciled)
+         {:ok, decision} <- find_change_request(existing, repository, input) do
+      _ = {operation_id, dedupe_key}
 
+      case decision do
         :create ->
-          create_change_request(config, repository, input, marker)
+          create_change_request(config, repository, input)
       end
     else
       {:error, _reason} = error -> error
@@ -347,7 +350,7 @@ defmodule SymphonyElixir.SourceControl.GitHub do
     end
   end
 
-  defp create_change_request(config, repository, input, marker) do
+  defp create_change_request(config, repository, input) do
     request = %{
       method: :post,
       path: "/repos/#{repository}/pulls",
@@ -355,7 +358,7 @@ defmodule SymphonyElixir.SourceControl.GitHub do
         "title" => input.title,
         "head" => input.head,
         "base" => input.base,
-        "body" => AdapterSupport.append_marker(input.body, marker.exact),
+        "body" => input.body,
         "draft" => input.draft
       },
       retry: :never
@@ -363,26 +366,16 @@ defmodule SymphonyElixir.SourceControl.GitHub do
 
     case Transport.request(config, :github, request) do
       {:ok, %{status: 201, body: pull}} ->
-        normalize_change_request(pull, repository, input, :created)
+        normalize_created_change_request(pull, repository, input)
 
-      {:ok, %{status: status}} when status in [409, 422, 500, 502, 503, 504] ->
-        reconcile_change_request(config, repository, input, marker)
+      {:ok, %{status: status}} when status in [409, 422] or status in 500..599 ->
+        {:error, :unknown_outcome}
 
       {:ok, response} ->
         expect(response, 201)
 
       {:error, _reason} ->
-        reconcile_change_request(config, repository, input, marker)
-    end
-  end
-
-  defp reconcile_change_request(config, repository, input, marker) do
-    with {:ok, pulls} <- list_change_requests(config, repository),
-         {:ok, {:found, pull}} <- find_change_request(pulls, input, marker) do
-      normalize_change_request(pull, repository, input, :reconciled)
-    else
-      {:ok, :create} -> {:error, :unknown_outcome}
-      {:error, _reason} = error -> error
+        {:error, :unknown_outcome}
     end
   end
 
@@ -402,17 +395,6 @@ defmodule SymphonyElixir.SourceControl.GitHub do
     else
       {:error, :invalid_configuration}
     end
-  end
-
-  defp change_request_marker(repository, operation_id, dedupe_key, input) do
-    AdapterSupport.operation_marker(
-      :github,
-      repository,
-      :ensure_change_request,
-      operation_id,
-      dedupe_key,
-      [input.head, input.base, input.title, AdapterSupport.body_digest(input.body), input.draft]
-    )
   end
 
   defp list_change_requests(config, repository) do
@@ -460,32 +442,47 @@ defmodule SymphonyElixir.SourceControl.GitHub do
     end
   end
 
-  defp find_change_request(pulls, input, marker) do
-    case AdapterSupport.marker_decision(pulls, "body", marker) do
-      {:ok, {:found, pull}} ->
-        if pull_identity?(pull, input),
-          do: {:ok, {:found, pull}},
-          else: {:error, :idempotency_conflict}
+  defp find_change_request(pulls, repository, input) do
+    cond do
+      not Enum.all?(pulls, &pull_shape?(&1)) ->
+        {:error, :provider_failure}
 
-      {:ok, :create} ->
-        if Enum.any?(pulls, &pull_identity?(&1, input)),
-          do: {:error, :conflict},
-          else: {:ok, :create}
+      Enum.any?(pulls, &pull_identity?(&1, repository, input)) ->
+        {:error, :conflict}
 
-      {:error, _reason} = error ->
-        error
+      true ->
+        {:ok, :create}
     end
   end
 
-  defp pull_identity?(pull, input) do
-    get_in(pull, ["head", "ref"]) == input.head and get_in(pull, ["base", "ref"]) == input.base
+  defp pull_shape?(pull) do
+    positive_integer?(pull["id"]) and positive_integer?(pull["number"]) and
+      nonempty_string?(get_in(pull, ["head", "repo", "full_name"])) and
+      nonempty_string?(get_in(pull, ["head", "ref"])) and
+      nonempty_string?(get_in(pull, ["base", "repo", "full_name"])) and
+      nonempty_string?(get_in(pull, ["base", "ref"]))
+  end
+
+  defp pull_identity?(pull, repository, input) do
+    get_in(pull, ["head", "repo", "full_name"]) == repository and
+      get_in(pull, ["head", "ref"]) == input.head and
+      get_in(pull, ["base", "repo", "full_name"]) == repository and
+      get_in(pull, ["base", "ref"]) == input.base
+  end
+
+  defp normalize_created_change_request(pull, repository, input) do
+    case normalize_change_request(pull, repository, input, :created) do
+      {:ok, _change_request} = ok -> ok
+      {:error, _reason} -> {:error, :unknown_outcome}
+    end
   end
 
   defp normalize_change_request(pull, repository, input, disposition) do
     external_id = pull["id"]
     number = pull["number"]
 
-    if (is_integer(external_id) or is_binary(external_id)) and is_integer(number) do
+    if positive_integer?(external_id) and positive_integer?(number) and
+         pull_identity?(pull, repository, input) do
       {:ok,
        %ChangeRequest{
          provider: :github,
@@ -929,16 +926,18 @@ defmodule SymphonyElixir.SourceControl.GitHub do
     body = Keyword.get(opts, :body)
 
     with true <- nonempty_string?(body),
-         marker <- comment_marker(repository, change_request, operation_id, dedupe_key, body),
+         {:ok, bot_actor_id} <- bot_actor_id(config),
+         {:ok, marker} <- comment_marker(repository, change_request, operation_id, dedupe_key, body),
          {:ok, comments} <- list_comments(config, repository, change_request.number),
-         {:ok, decision} <- AdapterSupport.marker_decision(comments, "body", marker) do
+         {:ok, decision} <- AdapterSupport.marker_decision(comments, "body", marker, ["user", "id"], bot_actor_id) do
       github_comment_decision(
         decision,
         config,
         repository,
         change_request,
         body,
-        marker
+        marker,
+        bot_actor_id
       )
     else
       false -> {:error, :invalid_configuration}
@@ -947,25 +946,25 @@ defmodule SymphonyElixir.SourceControl.GitHub do
   end
 
   defp comment_marker(repository, change_request, operation_id, dedupe_key, body) do
-    AdapterSupport.operation_marker(
+    AdapterSupport.comment_marker(
       :github,
       repository,
-      :comment,
+      change_request.external_id,
       operation_id,
       dedupe_key,
-      [change_request.external_id, AdapterSupport.body_digest(body)]
+      body
     )
   end
 
-  defp github_comment_decision({:found, found}, _config, _repo, _cr, _body, _marker) do
+  defp github_comment_decision({:found, found}, _config, _repo, _cr, _body, _marker, _bot_actor_id) do
     {:ok, %{action: :already_applied, external_id: to_string(found["id"])}}
   end
 
-  defp github_comment_decision(:create, config, repository, cr, body, marker) do
-    create_comment(config, repository, cr, body, marker)
+  defp github_comment_decision(:create, config, repository, cr, body, marker, bot_actor_id) do
+    create_comment(config, repository, cr, body, marker, bot_actor_id)
   end
 
-  defp create_comment(config, repository, change_request, body, marker) do
+  defp create_comment(config, repository, change_request, body, marker, bot_actor_id) do
     path = "/repos/#{repository}/issues/#{change_request.number}/comments"
 
     request = %{
@@ -980,19 +979,20 @@ defmodule SymphonyElixir.SourceControl.GitHub do
         {:ok, %{action: :commented, external_id: to_string(comment["id"])}}
 
       {:ok, %{status: status}} when status in [409, 422, 500, 502, 503, 504] ->
-        reconcile_comment(config, repository, change_request.number, marker)
+        reconcile_comment(config, repository, change_request.number, marker, bot_actor_id)
 
       {:ok, response} ->
         expect(response, 201)
 
       {:error, _reason} ->
-        reconcile_comment(config, repository, change_request.number, marker)
+        reconcile_comment(config, repository, change_request.number, marker, bot_actor_id)
     end
   end
 
-  defp reconcile_comment(config, repository, number, marker) do
+  defp reconcile_comment(config, repository, number, marker, bot_actor_id) do
     with {:ok, comments} <- list_comments(config, repository, number),
-         {:ok, {:found, found}} <- AdapterSupport.marker_decision(comments, "body", marker) do
+         {:ok, {:found, found}} <-
+           AdapterSupport.marker_decision(comments, "body", marker, ["user", "id"], bot_actor_id) do
       {:ok, %{action: :already_applied, external_id: to_string(found["id"])}}
     else
       {:ok, :create} -> {:error, :unknown_outcome}
@@ -1057,6 +1057,33 @@ defmodule SymphonyElixir.SourceControl.GitHub do
       else: {:error, :invalid_configuration}
   end
 
+  defp bot_actor_id(config) do
+    settings = value(config, :settings) || %{}
+    actor_id = value(settings, :bot_actor_id)
+
+    if canonical_actor_id?(actor_id),
+      do: {:ok, String.trim(actor_id)},
+      else: {:error, :invalid_configuration}
+  end
+
+  defp credential_actor(user, bot_actor_id) do
+    actor_id = Map.get(user, "id")
+
+    cond do
+      not (is_integer(actor_id) and actor_id > 0) ->
+        {:error, :invalid_configuration}
+
+      Integer.to_string(actor_id) != bot_actor_id ->
+        {:error, :forbidden}
+
+      true ->
+        {:ok, %{id: bot_actor_id, matched?: true}}
+    end
+  end
+
+  defp canonical_actor_id?(value) when is_binary(value), do: Regex.match?(~r/\A[1-9][0-9]*\z/, value)
+  defp canonical_actor_id?(_value), do: false
+
   defp permissions(repo, headers) do
     repo_permissions = repo["permissions"] || %{}
     push = tri_state(repo_permissions["push"])
@@ -1099,6 +1126,9 @@ defmodule SymphonyElixir.SourceControl.GitHub do
 
   defp segment(value), do: URI.encode_www_form(value)
   defp nonempty_string?(value) when is_binary(value), do: String.trim(value) != ""
+  defp nonempty_string?(_value), do: false
+
+  defp positive_integer?(value), do: is_integer(value) and value > 0
 
   defp valid_sha?(sha) when is_binary(sha), do: Regex.match?(~r/\A[0-9a-fA-F]{40}\z/, sha)
 

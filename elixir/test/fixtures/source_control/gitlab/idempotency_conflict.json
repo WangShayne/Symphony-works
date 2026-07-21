@@ -35,6 +35,7 @@
         "title": "Draft: ABC-23",
         "description": "{{last_mutation_body}}",
         "draft": true,
+        "author": {"id": 31337},
         "source_branch": "symphony/ABC-23",
         "target_branch": "main"
       }

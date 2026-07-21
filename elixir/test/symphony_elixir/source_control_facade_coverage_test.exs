@@ -202,7 +202,8 @@ defmodule SymphonyElixir.SourceControlFacadeCoverageTest do
       settings: %{
         repository: "acme/widget",
         base_branch: "main",
-        api_base_url: "https://api.github.test"
+        api_base_url: "https://api.github.test",
+        bot_actor_id: "424242"
       },
       transport: transport
     }

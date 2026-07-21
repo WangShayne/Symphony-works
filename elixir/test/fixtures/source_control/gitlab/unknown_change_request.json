@@ -24,6 +24,7 @@
         "title": "Draft: ABC-19",
         "description": "{{last_mutation_body}}",
         "draft": true,
+        "author": {"id": 31337},
         "source_branch": "symphony/ABC-19",
         "target_branch": "main"
       }

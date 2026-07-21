@@ -18,6 +18,7 @@ defmodule SymphonyElixir.SourceControl.GitLab do
   @impl true
   def health_check(config) when is_map(config) do
     with {:ok, repository, base_branch} <- repository(config),
+         {:ok, bot_actor_id} <- bot_actor_id(config),
          project = segment(repository),
          {:ok, project_response} <- get(config, "/projects/#{project}"),
          {:ok, project_body} <- expect(project_response, 200),
@@ -27,6 +28,9 @@ defmodule SymphonyElixir.SourceControl.GitLab do
          {:ok, protected_response} <-
            get(config, "/projects/#{project}/protected_branches/#{segment(base_branch)}"),
          true <- protected_response.status in [200, 404],
+         {:ok, user_response} <- get(config, "/user"),
+         {:ok, user} <- expect(user_response, 200),
+         {:ok, credential_actor} <- credential_actor(user, bot_actor_id),
          commit_sha when is_binary(commit_sha) <- get_in(branch, ["commit", "id"]),
          permissions = permissions(project_body, branch),
          :ok <- require_write_permissions(permissions) do
@@ -37,6 +41,7 @@ defmodule SymphonyElixir.SourceControl.GitLab do
          base_branch: base_branch,
          base_commit_sha: commit_sha,
          permissions: permissions,
+         credential_actor: credential_actor,
          status: :passed
        }}
     else
@@ -99,19 +104,16 @@ defmodule SymphonyElixir.SourceControl.GitLab do
 
   @impl true
   def ensure_change_request(attrs, opts) when is_map(attrs) and is_list(opts) do
-    with {:ok, operation_id, dedupe_key} <- AdapterSupport.operation_identity(opts),
+    with {:ok, _operation_id, _dedupe_key} <- AdapterSupport.operation_identity(opts),
          config when is_map(config) <- value(attrs, :repo),
          {:ok, repository} <- repository_name(config),
          {:ok, input} <- change_request_input(attrs),
-         marker <- change_request_marker(repository, operation_id, dedupe_key, input),
+         {:ok, canonical_project_id} <- canonical_project_id(config, repository),
          {:ok, existing} <- list_change_requests(config, repository),
-         {:ok, decision} <- find_change_request(existing, input, marker) do
+         {:ok, decision} <- find_change_request(existing, input, canonical_project_id) do
       case decision do
-        {:found, merge_request} ->
-          normalize_change_request(merge_request, repository, input, :reconciled)
-
         :create ->
-          create_change_request(config, repository, input, marker)
+          create_change_request(config, repository, input, canonical_project_id)
       end
     else
       {:error, _reason} = error -> error
@@ -343,7 +345,7 @@ defmodule SymphonyElixir.SourceControl.GitLab do
     end
   end
 
-  defp create_change_request(config, repository, input, marker) do
+  defp create_change_request(config, repository, input, canonical_project_id) do
     title = if input.draft, do: draft_title(input.title), else: input.title
 
     request = %{
@@ -353,33 +355,30 @@ defmodule SymphonyElixir.SourceControl.GitLab do
         "source_branch" => input.head,
         "target_branch" => input.base,
         "title" => title,
-        "description" => AdapterSupport.append_marker(input.body, marker.exact)
+        "description" => input.body
       },
       retry: :never
     }
 
     case Transport.request(config, :gitlab, request) do
       {:ok, %{status: 201, body: merge_request}} ->
-        normalize_change_request(merge_request, repository, input, :created)
+        if merge_request_identity?(merge_request, input, canonical_project_id) == {:ok, true} do
+          case normalize_change_request(merge_request, repository, input, :created) do
+            {:ok, _change_request} = ok -> ok
+            {:error, _reason} -> {:error, :unknown_outcome}
+          end
+        else
+          {:error, :unknown_outcome}
+        end
 
-      {:ok, %{status: status}} when status in [400, 409, 500, 502, 503, 504] ->
-        reconcile_change_request(config, repository, input, marker)
+      {:ok, %{status: status}} when status in [400, 409, 422] or (status >= 500 and status <= 599) ->
+        {:error, :unknown_outcome}
 
       {:ok, response} ->
         expect(response, 201)
 
       {:error, _reason} ->
-        reconcile_change_request(config, repository, input, marker)
-    end
-  end
-
-  defp reconcile_change_request(config, repository, input, marker) do
-    with {:ok, merge_requests} <- list_change_requests(config, repository),
-         {:ok, {:found, merge_request}} <- find_change_request(merge_requests, input, marker) do
-      normalize_change_request(merge_request, repository, input, :reconciled)
-    else
-      {:ok, :create} -> {:error, :unknown_outcome}
-      {:error, _reason} = error -> error
+        {:error, :unknown_outcome}
     end
   end
 
@@ -399,17 +398,6 @@ defmodule SymphonyElixir.SourceControl.GitLab do
     else
       {:error, :invalid_configuration}
     end
-  end
-
-  defp change_request_marker(repository, operation_id, dedupe_key, input) do
-    AdapterSupport.operation_marker(
-      :gitlab,
-      repository,
-      :ensure_change_request,
-      operation_id,
-      dedupe_key,
-      [input.head, input.base, input.title, AdapterSupport.body_digest(input.body), input.draft]
-    )
   end
 
   defp list_change_requests(config, repository) do
@@ -456,32 +444,71 @@ defmodule SymphonyElixir.SourceControl.GitLab do
     end
   end
 
-  defp find_change_request(merge_requests, input, marker) do
-    case AdapterSupport.marker_decision(merge_requests, "description", marker) do
-      {:ok, {:found, merge_request}} ->
-        if merge_request_identity?(merge_request, input),
-          do: {:ok, {:found, merge_request}},
-          else: {:error, :idempotency_conflict}
+  defp find_change_request(merge_requests, input, canonical_project_id) do
+    Enum.reduce_while(merge_requests, {:ok, :create}, fn merge_request, _acc ->
+      case merge_request_identity?(merge_request, input, canonical_project_id) do
+        {:ok, true} -> {:halt, {:error, :conflict}}
+        {:ok, false} -> {:cont, {:ok, :create}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
 
-      {:ok, :create} ->
-        if Enum.any?(merge_requests, &merge_request_identity?(&1, input)),
-          do: {:error, :conflict},
-          else: {:ok, :create}
-
-      {:error, _reason} = error ->
-        error
+  defp merge_request_identity?(merge_request, input, canonical_project_id) do
+    with {:ok, source_project_id} <- positive_integer_id(merge_request["source_project_id"]),
+         {:ok, target_project_id} <- positive_integer_id(merge_request["target_project_id"]),
+         source_branch when is_binary(source_branch) <- merge_request["source_branch"],
+         target_branch when is_binary(target_branch) <- merge_request["target_branch"] do
+      {:ok,
+       source_branch == input.head and target_branch == input.base and
+         source_project_id == canonical_project_id and target_project_id == canonical_project_id}
+    else
+      _invalid -> {:error, :provider_failure}
     end
   end
 
-  defp merge_request_identity?(merge_request, input) do
-    merge_request["source_branch"] == input.head and merge_request["target_branch"] == input.base
+  defp positive_integer_id(value) when is_integer(value) and value > 0, do: {:ok, value}
+  defp positive_integer_id(_value), do: {:error, :provider_failure}
+
+  defp configured_project_id(nil), do: {:ok, nil}
+
+  defp configured_project_id(value) when is_integer(value) do
+    if value > 0, do: {:ok, value}, else: {:error, :invalid_configuration}
+  end
+
+  defp configured_project_id(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {project_id, ""} when project_id > 0 -> {:ok, project_id}
+      _invalid -> {:error, :invalid_configuration}
+    end
+  end
+
+  defp configured_project_id(_value), do: {:error, :invalid_configuration}
+
+  defp canonical_project_id(config, repository) do
+    settings = value(config, :settings) || %{}
+    configured = value(settings, :project_id) || value(settings, :canonical_project_id) || value(settings, :repository_id)
+
+    request = %{method: :get, path: "/projects/#{segment(repository)}", retry: :safe}
+
+    with {:ok, configured_project_id} <- configured_project_id(configured),
+         {:ok, response} <- Transport.request(config, :gitlab, request),
+         {:ok, project} when is_map(project) <- expect(response, 200),
+         {:ok, project_id} <- positive_integer_id(project["id"]),
+         true <- is_nil(configured_project_id) or configured_project_id == project_id do
+      {:ok, project_id}
+    else
+      false -> {:error, :invalid_configuration}
+      {:error, _reason} = error -> error
+      _invalid -> {:error, :provider_failure}
+    end
   end
 
   defp normalize_change_request(merge_request, repository, input, disposition) do
     external_id = merge_request["id"]
     number = merge_request["iid"]
 
-    if (is_integer(external_id) or is_binary(external_id)) and is_integer(number) do
+    if is_integer(external_id) and external_id > 0 and is_integer(number) and number > 0 do
       {:ok,
        %ChangeRequest{
          provider: :gitlab,
@@ -746,16 +773,18 @@ defmodule SymphonyElixir.SourceControl.GitLab do
     body = Keyword.get(opts, :body)
 
     with true <- nonempty_string?(body),
-         marker <- comment_marker(repository, change_request, operation_id, dedupe_key, body),
+         {:ok, bot_actor_id} <- bot_actor_id(config),
+         {:ok, marker} <- comment_marker(repository, change_request, operation_id, dedupe_key, body),
          {:ok, notes} <- list_notes(config, repository, change_request.number),
-         {:ok, decision} <- AdapterSupport.marker_decision(notes, "body", marker) do
+         {:ok, decision} <- AdapterSupport.marker_decision(notes, "body", marker, ["author", "id"], bot_actor_id) do
       gitlab_comment_decision(
         decision,
         config,
         repository,
         change_request,
         body,
-        marker
+        marker,
+        bot_actor_id
       )
     else
       false -> {:error, :invalid_configuration}
@@ -774,15 +803,15 @@ defmodule SymphonyElixir.SourceControl.GitLab do
     )
   end
 
-  defp gitlab_comment_decision({:found, found}, _config, _repo, _cr, _body, _marker) do
+  defp gitlab_comment_decision({:found, found}, _config, _repo, _cr, _body, _marker, _bot_actor_id) do
     {:ok, %{action: :already_applied, external_id: to_string(found["id"])}}
   end
 
-  defp gitlab_comment_decision(:create, config, repository, cr, body, marker) do
-    create_comment(config, repository, cr, body, marker)
+  defp gitlab_comment_decision(:create, config, repository, cr, body, marker, bot_actor_id) do
+    create_comment(config, repository, cr, body, marker, bot_actor_id)
   end
 
-  defp create_comment(config, repository, change_request, body, marker) do
+  defp create_comment(config, repository, change_request, body, marker, bot_actor_id) do
     path = "/projects/#{segment(repository)}/merge_requests/#{change_request.number}/notes"
 
     request = %{
@@ -797,19 +826,20 @@ defmodule SymphonyElixir.SourceControl.GitLab do
         {:ok, %{action: :commented, external_id: to_string(note["id"])}}
 
       {:ok, %{status: status}} when status in [400, 409, 500, 502, 503, 504] ->
-        reconcile_note(config, repository, change_request.number, marker)
+        reconcile_note(config, repository, change_request.number, marker, bot_actor_id)
 
       {:ok, response} ->
         expect(response, 201)
 
       {:error, _reason} ->
-        reconcile_note(config, repository, change_request.number, marker)
+        reconcile_note(config, repository, change_request.number, marker, bot_actor_id)
     end
   end
 
-  defp reconcile_note(config, repository, number, marker) do
+  defp reconcile_note(config, repository, number, marker, bot_actor_id) do
     with {:ok, notes} <- list_notes(config, repository, number),
-         {:ok, {:found, found}} <- AdapterSupport.marker_decision(notes, "body", marker) do
+         {:ok, {:found, found}} <-
+           AdapterSupport.marker_decision(notes, "body", marker, ["author", "id"], bot_actor_id) do
       {:ok, %{action: :already_applied, external_id: to_string(found["id"])}}
     else
       {:ok, :create} -> {:error, :unknown_outcome}
@@ -873,6 +903,33 @@ defmodule SymphonyElixir.SourceControl.GitLab do
       do: {:ok, repository},
       else: {:error, :invalid_configuration}
   end
+
+  defp bot_actor_id(config) do
+    settings = value(config, :settings) || %{}
+    actor_id = value(settings, :bot_actor_id)
+
+    if canonical_actor_id?(actor_id),
+      do: {:ok, String.trim(actor_id)},
+      else: {:error, :invalid_configuration}
+  end
+
+  defp credential_actor(user, bot_actor_id) do
+    actor_id = Map.get(user, "id")
+
+    cond do
+      not (is_integer(actor_id) and actor_id > 0) ->
+        {:error, :invalid_configuration}
+
+      Integer.to_string(actor_id) != bot_actor_id ->
+        {:error, :forbidden}
+
+      true ->
+        {:ok, %{id: bot_actor_id, matched?: true}}
+    end
+  end
+
+  defp canonical_actor_id?(value) when is_binary(value), do: Regex.match?(~r/\A[1-9][0-9]*\z/, value)
+  defp canonical_actor_id?(_value), do: false
 
   defp permissions(project, branch) do
     access_level =

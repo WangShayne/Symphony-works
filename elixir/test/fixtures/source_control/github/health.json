@@ -28,5 +28,12 @@
     "body": [
       {"type": "pull_request", "ruleset_source_type": "Repository"}
     ]
+  },
+  {
+    "method": "GET",
+    "path": "/user",
+    "status": 200,
+    "headers": {},
+    "body": {"id": 424242, "login": "symphony-bot"}
   }
 ]

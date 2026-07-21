@@ -35,6 +35,7 @@
         "title": "ABC-21",
         "body": "{{last_mutation_body}}",
         "draft": true,
+        "user": {"id": 424242},
         "head": {"ref": "symphony/ABC-21"},
         "base": {"ref": "main"}
       }

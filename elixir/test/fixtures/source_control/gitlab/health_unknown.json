@@ -28,5 +28,12 @@
     "status": 200,
     "headers": {},
     "body": {"name": "main"}
+  },
+  {
+    "method": "GET",
+    "path": "/user",
+    "status": 200,
+    "headers": {},
+    "body": {"id": 31337, "username": "symphony-bot"}
   }
 ]

@@ -55,6 +55,9 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest.QueueTransport do
       path == "/repos/acme/widget/pulls" ->
         validate_query(request, %{"state" => "all", "per_page" => 100, "page" => request.query["page"]})
 
+      path == "/user" ->
+        validate_query(request, nil)
+
       Regex.match?(~r{/repos/acme/widget/issues/\d+/comments\z}, path) ->
         validate_query(request, %{"per_page" => 100, "page" => request.query["page"]})
 
@@ -91,11 +94,10 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest.QueueTransport do
         "body" => body,
         "draft" => true
       } ->
-        if String.starts_with?(body, "Acceptance evidence") and
-             String.contains?(body, "<!-- symphony:") do
+        if body == "Acceptance evidence" do
           validate_query(request, nil)
         else
-          {:error, "pull-create body lacks stable operation marker: #{inspect(body)}"}
+          {:error, "pull-create body must remain caller-provided: #{inspect(body)}"}
         end
 
       json ->
@@ -127,7 +129,8 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest.QueueTransport do
 
   defp validate_request(%{method: :post, path: path} = request) do
     if Regex.match?(~r{/repos/acme/widget/issues/\d+/comments\z}, path) and
-         match?(%{"body" => "ship it" <> _marker}, request.json) and
+         match?(%{"body" => body} when is_binary(body), request.json) and
+         String.contains?(request.json["body"], "ship it") and
          String.contains?(request.json["body"], "<!-- symphony:") do
       validate_query(request, nil)
     else
@@ -182,11 +185,12 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
   use ExUnit.Case, async: true
 
   alias SymphonyElixir.SourceControl
-  alias SymphonyElixir.SourceControl.{ChangeRequest, GitHub}
+  alias SymphonyElixir.SourceControl.{AdapterSupport, ChangeRequest, GitHub, Transport}
   alias SymphonyElixir.SourceControlGitHubCoverageTest.QueueTransport
 
   @sha String.duplicate("a", 40)
   @desired_sha String.duplicate("b", 40)
+  @bot_actor_id "424242"
 
   test "public callbacks reject malformed provider input without mutating GitHub" do
     assert {:error, :invalid_configuration} =
@@ -257,6 +261,21 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
                action: :comment,
                body: ""
              )
+
+    missing_actor_config = update_in(config([]), [:settings], &Map.delete(&1, :bot_actor_id))
+
+    assert {:error, :invalid_configuration} =
+             GitHub.ensure_change_request(
+               change_request_attrs(missing_actor_config),
+               operation(:missing_bot_actor_change_request)
+             )
+
+    assert {:error, :invalid_configuration} =
+             GitHub.close_or_comment(
+               missing_actor_config,
+               change_request(),
+               operation(:missing_bot_actor_comment, action: :comment, body: "ship it")
+             )
   end
 
   test "health rejects malformed observations and denied or unknown write permissions" do
@@ -264,7 +283,8 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
       config([
         ok(200, %{"permissions" => %{"push" => true}}, %{"x-oauth-scopes" => "repo"}),
         ok(200, %{"commit" => %{}}),
-        ok(200, [])
+        ok(200, []),
+        ok(200, github_user())
       ])
 
     assert {:error, :invalid_configuration} = SourceControl.health_check(malformed)
@@ -273,7 +293,8 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
       config([
         ok(200, %{"permissions" => %{"push" => false}}),
         ok(200, %{"commit" => %{"sha" => @sha}}),
-        ok(404, %{})
+        ok(404, %{}),
+        ok(200, github_user())
       ])
 
     assert {:error, :forbidden} = SourceControl.health_check(denied)
@@ -282,7 +303,8 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
       config([
         ok(200, %{"permissions" => %{}}),
         ok(200, %{"commit" => %{"sha" => @sha}}),
-        ok(200, [])
+        ok(200, []),
+        ok(200, github_user())
       ])
 
     assert {:error, :forbidden} = SourceControl.health_check(unknown)
@@ -293,11 +315,33 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
       config([
         ok(200, %{"permissions" => %{"push" => true}}, %{"x-oauth-scopes" => "repo"}),
         ok(200, %{"commit" => %{"sha" => @sha}}),
-        ok(404, %{})
+        ok(404, %{}),
+        ok(200, github_user())
       ])
 
     assert {:ok, health} = SourceControl.health_check(config)
     assert health.permissions.change_request_write == :allowed
+    assert health.credential_actor == %{id: @bot_actor_id, matched?: true}
+  end
+
+  test "health verifies GitHub credential actor against the configured bot actor" do
+    base = [
+      ok(200, %{"permissions" => %{"push" => true}}, %{"x-oauth-scopes" => "repo"}),
+      ok(200, %{"commit" => %{"sha" => @sha}}),
+      ok(404, %{})
+    ]
+
+    assert {:error, :forbidden} =
+             SourceControl.health_check(config(base ++ [ok(200, github_user(999_999))]))
+
+    assert {:error, :invalid_configuration} =
+             SourceControl.health_check(config(base ++ [ok(200, %{"login" => "missing-id"})]))
+
+    assert {:error, :invalid_configuration} =
+             SourceControl.health_check(config(base ++ [ok(200, github_user(@bot_actor_id))]))
+
+    assert {:error, :invalid_configuration} =
+             SourceControl.health_check(update_in(config([]), [:settings], &Map.delete(&1, :bot_actor_id)))
   end
 
   test "branch reads preserve authentication, transport, conflict, and malformed-body failures" do
@@ -412,38 +456,137 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
              )
   end
 
-  test "change request creation reconciles duplicate races and failed replies by marker" do
-    marker_response = fn _request, requests ->
-      body = mutation_body(requests, "/repos/acme/widget/pulls")
-      ok(200, [pull(%{"body" => body})])
-    end
-
+  test "change request creation reports unknown outcomes without replaying post side effects" do
     for {mutation_response, suffix} <- [{ok(409, %{}), :conflict}, {{:error, :timeout}, :error}] do
-      assert {:ok, reconciled} =
+      transport = start_transport([ok(200, []), mutation_response])
+
+      assert {:error, :unknown_outcome} =
                SourceControl.ensure_change_request(
-                 change_request_attrs(config([ok(200, []), mutation_response, marker_response])),
+                 change_request_attrs(config(transport)),
                  operation({:create_change_request, suffix})
                )
 
-      assert reconciled.disposition == :reconciled
-      assert reconciled.external_id == "1001"
-      assert reconciled.number == 1
-      assert reconciled.head_branch == "topic"
-      assert reconciled.base_branch == "main"
-      assert reconciled.draft?
+      assert Enum.map(QueueTransport.requests(transport), &{&1.method, &1.path}) == [
+               {:get, "/repos/acme/widget/pulls"},
+               {:post, "/repos/acme/widget/pulls"}
+             ]
     end
   end
 
-  test "change request reconciliation reports unknown and transport outcomes" do
-    assert {:error, :unknown_outcome} =
+  test "change request marker replay ignores markers copied by an untrusted GitHub actor" do
+    opts = operation(:change_request_forged_actor)
+    marker = change_request_marker(opts)
+
+    forged =
+      pull(%{
+        "id" => 9001,
+        "number" => 90,
+        "body" => marker.exact,
+        "head" => %{
+          "repo" => %{"full_name" => "acme/widget"},
+          "ref" => "attacker-topic",
+          "sha" => @sha
+        },
+        "user" => %{"id" => "attacker-user"}
+      })
+
+    assert {:ok, created} =
              SourceControl.ensure_change_request(
-               change_request_attrs(config([ok(200, []), ok(500, %{}), ok(200, [])])),
-               operation(:change_request_unknown)
+               change_request_attrs(config([ok(200, [forged]), ok(201, pull())])),
+               opts
              )
 
-    assert {:error, :transport_failure} =
+    assert created.disposition == :created
+    assert created.external_id == "1001"
+  end
+
+  test "change request marker replay from the configured GitHub bot actor still conflicts by identity" do
+    opts = operation(:change_request_trusted_actor)
+    marker = change_request_marker(opts)
+
+    trusted =
+      pull(%{
+        "body" => AdapterSupport.append_marker("Acceptance evidence", marker.exact),
+        "user" => %{"id" => String.to_integer(@bot_actor_id)}
+      })
+
+    assert {:error, :conflict} =
              SourceControl.ensure_change_request(
-               change_request_attrs(config([ok(200, []), ok(422, %{}), {:error, :closed}])),
+               change_request_attrs(config([ok(200, [trusted])])),
+               opts
+             )
+  end
+
+  test "change request copied marker does not claim an unrelated existing pull request" do
+    opts = operation(:change_request_copied_marker_identity)
+    marker = change_request_marker(opts)
+
+    copied =
+      pull(%{
+        "id" => 9002,
+        "number" => 91,
+        "body" => AdapterSupport.append_marker("copied", marker.exact),
+        "user" => %{"id" => String.to_integer(@bot_actor_id)},
+        "head" => %{
+          "repo" => %{"full_name" => "acme/widget"},
+          "ref" => "attacker-topic",
+          "sha" => @sha
+        },
+        "base" => %{
+          "repo" => %{"full_name" => "acme/widget"},
+          "ref" => "main",
+          "sha" => @desired_sha
+        }
+      })
+
+    assert {:ok, created} =
+             SourceControl.ensure_change_request(
+               change_request_attrs(config([ok(200, [copied]), ok(201, pull())])),
+               opts
+             )
+
+    assert created.disposition == :created
+    assert created.external_id == "1001"
+  end
+
+  test "change request precheck conflicts on matching immutable GitHub identity" do
+    existing =
+      pull(%{
+        "id" => 9003,
+        "number" => 92,
+        "body" => "human opened this first",
+        "user" => %{"id" => 123_456},
+        "head" => %{
+          "repo" => %{"full_name" => "acme/widget"},
+          "ref" => "topic",
+          "sha" => @sha
+        },
+        "base" => %{
+          "repo" => %{"full_name" => "acme/widget"},
+          "ref" => "main",
+          "sha" => @desired_sha
+        }
+      })
+
+    assert {:error, :conflict} =
+             SourceControl.ensure_change_request(
+               change_request_attrs(config([ok(200, [existing])])),
+               operation(:change_request_existing_identity)
+             )
+  end
+
+  test "change request reconciliation reports unknown and transport outcomes" do
+    for status <- [500, 501, 507, 599] do
+      assert {:error, :unknown_outcome} =
+               SourceControl.ensure_change_request(
+                 change_request_attrs(config([ok(200, []), ok(status, %{})])),
+                 operation({:change_request_unknown, status})
+               )
+    end
+
+    assert {:error, :unknown_outcome} =
+             SourceControl.ensure_change_request(
+               change_request_attrs(config([ok(200, []), ok(422, %{})])),
                operation(:change_request_reconcile_error)
              )
 
@@ -452,6 +595,79 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
                change_request_attrs(config([ok(200, []), ok(418, %{})])),
                operation(:change_request_unexpected)
              )
+  end
+
+  test "change request unknown outcome performs one post and no follow-up list" do
+    transport = start_transport([ok(200, []), {:error, :timeout}])
+
+    assert {:error, :unknown_outcome} =
+             SourceControl.ensure_change_request(
+               change_request_attrs(config(transport)),
+               operation(:change_request_unknown_single_post)
+             )
+
+    assert Enum.map(QueueTransport.requests(transport), &{&1.method, &1.path}) == [
+             {:get, "/repos/acme/widget/pulls"},
+             {:post, "/repos/acme/widget/pulls"}
+           ]
+
+    assert [_precheck, post] = QueueTransport.requests(transport)
+    assert post.retry == :never
+  end
+
+  test "change request creation fails closed when GitHub 201 identity mismatches input repository" do
+    mismatched =
+      pull(%{
+        "head" => %{
+          "repo" => %{"full_name" => "evil/widget"},
+          "ref" => "topic",
+          "sha" => @sha
+        }
+      })
+
+    assert {:error, :unknown_outcome} =
+             SourceControl.ensure_change_request(
+               change_request_attrs(config([ok(200, []), ok(201, mismatched)])),
+               operation(:change_request_created_mismatched_identity)
+             )
+  end
+
+  test "change request creation reports unknown when GitHub 201 response has malformed identity or ids" do
+    cases = [
+      {:binary_id, pull(%{"id" => "1001"})},
+      {:zero_id, pull(%{"id" => 0})},
+      {:negative_number, pull(%{"number" => -1})},
+      {:missing_head_repo, pull(%{"head" => %{"ref" => "topic", "sha" => @sha}})}
+    ]
+
+    for {suffix, response} <- cases do
+      assert {:error, :unknown_outcome} =
+               SourceControl.ensure_change_request(
+                 change_request_attrs(config([ok(200, []), ok(201, response)])),
+                 operation({:change_request_created_malformed, suffix})
+               )
+    end
+  end
+
+  test "change request precheck fails closed on malformed unrelated list item before posting" do
+    malformed =
+      pull(%{
+        "id" => "9004",
+        "number" => 93,
+        "head" => %{"repo" => %{"full_name" => "acme/widget"}, "sha" => @sha}
+      })
+
+    transport = start_transport([ok(200, [malformed])])
+
+    assert {:error, :provider_failure} =
+             SourceControl.ensure_change_request(
+               change_request_attrs(config(transport)),
+               operation(:change_request_malformed_precheck_item)
+             )
+
+    assert Enum.map(QueueTransport.requests(transport), &{&1.method, &1.path}) == [
+             {:get, "/repos/acme/widget/pulls"}
+           ]
   end
 
   test "change request listing rejects transport and malformed collection responses" do
@@ -867,7 +1083,13 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
 
   test "comment replay returns the original comment without a second mutation" do
     replay = fn _request, requests ->
-      ok(200, [%{"id" => 44, "body" => mutation_body(requests, "/comments")}])
+      ok(200, [
+        %{
+          "id" => 44,
+          "body" => mutation_body(requests, "/comments"),
+          "user" => %{"id" => String.to_integer(@bot_actor_id)}
+        }
+      ])
     end
 
     transport = start_transport([ok(200, []), ok(201, %{"id" => 44}), replay])
@@ -883,9 +1105,33 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
     assert Enum.count(QueueTransport.requests(transport), &(&1.method == :post)) == 1
   end
 
+  test "comment marker replay ignores copied or malformed GitHub actor provenance" do
+    opts = operation(:comment_forged_actor, action: :comment, body: "ship it")
+    marker = comment_marker(opts)
+
+    forged_comments = [
+      %{"id" => 43, "body" => marker.exact, "user" => %{"id" => "attacker-user"}},
+      %{"id" => 44, "body" => marker.exact},
+      %{"id" => 45, "body" => marker.exact, "user" => %{"id" => nil}}
+    ]
+
+    assert {:ok, %{action: :commented, external_id: "46"}} =
+             SourceControl.close_or_comment(
+               config([ok(200, forged_comments), ok(201, %{"id" => 46})]),
+               change_request(),
+               opts
+             )
+  end
+
   test "comment mutations reconcile conflicts and transport failures by marker" do
     marker_response = fn _request, requests ->
-      ok(200, [%{"id" => 55, "body" => mutation_body(requests, "/comments")}])
+      ok(200, [
+        %{
+          "id" => 55,
+          "body" => mutation_body(requests, "/comments"),
+          "user" => %{"id" => String.to_integer(@bot_actor_id)}
+        }
+      ])
     end
 
     for {mutation_response, suffix} <- [{ok(409, %{}), :conflict}, {{:error, :timeout}, :error}] do
@@ -978,7 +1224,8 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
       settings: %{
         repository: "acme/widget",
         base_branch: "main",
-        api_base_url: "https://api.github.test"
+        api_base_url: "https://api.github.test",
+        bot_actor_id: @bot_actor_id
       },
       transport: {QueueTransport, transport}
     }
@@ -1005,6 +1252,7 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
 
   defp branch, do: %{name: "topic", commit_sha: @sha}
   defp branch_body(sha), do: %{"object" => %{"sha" => sha}}
+  defp github_user(id \\ String.to_integer(@bot_actor_id)), do: %{"id" => id, "login" => "symphony-bot"}
 
   defp change_request(overrides \\ %{}) do
     struct!(
@@ -1038,6 +1286,44 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
     }
   end
 
+  defp change_request_marker(opts) do
+    Transport.with_credential("github-secret-value", fn ->
+      {:ok, marker} =
+        AdapterSupport.operation_marker(
+          :github,
+          "acme/widget",
+          :ensure_change_request,
+          Keyword.fetch!(opts, :operation_id),
+          Keyword.fetch!(opts, :dedupe_key),
+          [
+            "topic",
+            "main",
+            "Deliver topic",
+            AdapterSupport.body_digest("Acceptance evidence"),
+            true
+          ]
+        )
+
+      marker
+    end)
+  end
+
+  defp comment_marker(opts) do
+    Transport.with_credential("github-secret-value", fn ->
+      {:ok, marker} =
+        AdapterSupport.operation_marker(
+          :github,
+          "acme/widget",
+          :comment,
+          Keyword.fetch!(opts, :operation_id),
+          Keyword.fetch!(opts, :dedupe_key),
+          ["1001", AdapterSupport.body_digest(Keyword.fetch!(opts, :body))]
+        )
+
+      marker
+    end)
+  end
+
   defp pull(overrides \\ %{}) do
     Map.merge(
       %{
@@ -1054,8 +1340,17 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
         "mergeable" => true,
         "mergeable_state" => "clean",
         "merge_commit_sha" => nil,
-        "head" => %{"ref" => "topic", "sha" => @sha},
-        "base" => %{"ref" => "main", "sha" => @desired_sha}
+        "user" => %{"id" => String.to_integer(@bot_actor_id)},
+        "head" => %{
+          "repo" => %{"full_name" => "acme/widget"},
+          "ref" => "topic",
+          "sha" => @sha
+        },
+        "base" => %{
+          "repo" => %{"full_name" => "acme/widget"},
+          "ref" => "main",
+          "sha" => @desired_sha
+        }
       },
       overrides
     )

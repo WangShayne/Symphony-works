@@ -410,6 +410,7 @@ defmodule SymphonyElixir.Configuration.Document do
     |> validate_integration_active(integration, prefix)
     |> validate_integration_credential(integration, provider, prefix)
     |> validate_integration_provider_settings(kind, provider, settings, prefix)
+    |> validate_bot_actor_id(kind, provider, settings, prefix)
     |> reject_unknown_fields(integration, @integration_fields, prefix)
   end
 
@@ -509,12 +510,36 @@ defmodule SymphonyElixir.Configuration.Document do
     |> validate_webhook_secret_reference(settings, prefix)
   end
 
-  defp validate_integration_provider_settings(errors, "source_control", provider, settings, prefix)
-       when provider in ["fixture", "github", "gitlab"] do
+  defp validate_integration_provider_settings(errors, "source_control", "fixture", settings, prefix) do
     require_setting_paths(errors, settings, prefix, [["repository"], ["base_branch"]])
   end
 
+  defp validate_integration_provider_settings(errors, "source_control", provider, settings, prefix)
+       when provider in ["github", "gitlab"] do
+    require_setting_paths(errors, settings, prefix, [["repository"], ["base_branch"], ["bot_actor_id"]])
+  end
+
   defp validate_integration_provider_settings(errors, _kind, _provider, _settings, _prefix), do: errors
+
+  defp validate_bot_actor_id(errors, "source_control", provider, settings, prefix)
+       when provider in ["github", "gitlab"] and is_map(settings) do
+    case Map.get(settings, "bot_actor_id") do
+      nil ->
+        errors
+
+      value when is_binary(value) ->
+        if Regex.match?(~r/\A[1-9][0-9]*\z/, value) do
+          errors
+        else
+          [%{path: prefix ++ ["settings", "bot_actor_id"], message: "must be a canonical positive decimal actor id"} | errors]
+        end
+
+      _invalid ->
+        [%{path: prefix ++ ["settings", "bot_actor_id"], message: "must be a canonical positive decimal actor id"} | errors]
+    end
+  end
+
+  defp validate_bot_actor_id(errors, _kind, _provider, _settings, _prefix), do: errors
 
   defp require_setting_paths(errors, settings, prefix, paths) when is_map(settings) do
     require_paths(errors, settings, prefix ++ ["settings"], paths)

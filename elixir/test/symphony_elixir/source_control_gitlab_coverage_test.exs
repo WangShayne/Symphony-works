@@ -53,6 +53,7 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
   alias SymphonyElixir.SourceControl.AdapterSupport
   alias SymphonyElixir.SourceControl.ChangeRequest
   alias SymphonyElixir.SourceControl.GitLab
+  alias SymphonyElixir.SourceControl.Transport
   alias SymphonyElixir.SourceControlGitLabCoverageTest.ScriptTransport
 
   @sha String.duplicate("1", 40)
@@ -60,6 +61,7 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
   @other_sha String.duplicate("3", 40)
   @operation_id "00000000-0000-0000-0000-000000000008"
   @dedupe_key "gitlab-coverage"
+  @bot_actor_id "31337"
 
   test "public mutations reject invalid provider input before transport dispatch" do
     {:ok, transport} = ScriptTransport.start_link([])
@@ -98,6 +100,21 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
                Keyword.put(opts, :action, :close)
              )
 
+    missing_actor_config = update_in(config, [:settings], &Map.delete(&1, :bot_actor_id))
+
+    assert {:error, :invalid_configuration} =
+             GitLab.ensure_change_request(
+               change_request_attrs(missing_actor_config),
+               operation_opts()
+             )
+
+    assert {:error, :invalid_configuration} =
+             GitLab.close_or_comment(
+               missing_actor_config,
+               change_request(),
+               Keyword.merge(opts, action: :comment, body: "Review complete")
+             )
+
     assert [] = ScriptTransport.requests(transport)
   end
 
@@ -106,7 +123,8 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
       ScriptTransport.start_link([
         get("/projects/acme%2Fwidget", 200, project()),
         get("/projects/acme%2Fwidget/repository/branches/main", 200, branch(@sha)),
-        get("/projects/acme%2Fwidget/protected_branches/main", 201, %{})
+        get("/projects/acme%2Fwidget/protected_branches/main", 201, %{}),
+        get("/user", 200, gitlab_user())
       ])
 
     assert {:error, :invalid_configuration} = SourceControl.health_check(config(health_transport))
@@ -118,6 +136,65 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
 
     assert {:error, :invalid_configuration} =
              SourceControl.resolve_baseline(config(baseline_transport), "main")
+  end
+
+  test "health verifies GitLab credential actor against the configured bot actor" do
+    project_path = "/projects/acme%2Fwidget"
+    branch_path = project_path <> "/repository/branches/main"
+    protected_path = project_path <> "/protected_branches/main"
+
+    matched =
+      ScriptTransport.start_link([
+        get(project_path, 200, project()),
+        get(branch_path, 200, branch(@sha)),
+        get(protected_path, 200, %{}),
+        get("/user", 200, gitlab_user())
+      ])
+
+    assert {:ok, matched_transport} = matched
+    assert {:ok, health} = SourceControl.health_check(config(matched_transport))
+    assert health.credential_actor == %{id: @bot_actor_id, matched?: true}
+    assert [] = ScriptTransport.remaining(matched_transport)
+
+    {:ok, mismatch} =
+      ScriptTransport.start_link([
+        get(project_path, 200, project()),
+        get(branch_path, 200, branch(@sha)),
+        get(protected_path, 200, %{}),
+        get("/user", 200, gitlab_user(999_999))
+      ])
+
+    assert {:error, :forbidden} = SourceControl.health_check(config(mismatch))
+    assert [] = ScriptTransport.remaining(mismatch)
+
+    {:ok, string_actor} =
+      ScriptTransport.start_link([
+        get(project_path, 200, project()),
+        get(branch_path, 200, branch(@sha)),
+        get(protected_path, 200, %{}),
+        get("/user", 200, gitlab_user(@bot_actor_id))
+      ])
+
+    assert {:error, :invalid_configuration} = SourceControl.health_check(config(string_actor))
+    assert [] = ScriptTransport.remaining(string_actor)
+
+    {:ok, malformed} =
+      ScriptTransport.start_link([
+        get(project_path, 200, project()),
+        get(branch_path, 200, branch(@sha)),
+        get(protected_path, 200, %{}),
+        get("/user", 200, %{"username" => "missing-id"})
+      ])
+
+    assert {:error, :invalid_configuration} = SourceControl.health_check(config(malformed))
+    assert [] = ScriptTransport.remaining(malformed)
+
+    {:ok, unused} = ScriptTransport.start_link([])
+
+    assert {:error, :invalid_configuration} =
+             SourceControl.health_check(update_in(config(unused), [:settings], &Map.delete(&1, :bot_actor_id)))
+
+    assert [] = ScriptTransport.requests(unused)
   end
 
   test "branch lookup propagates provider and transport failures" do
@@ -254,81 +331,119 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
     end
   end
 
-  test "merge request replay finds the exact dual-key marker without branch filters" do
+  test "merge request creation performs canonical project lookup and stores the raw description" do
+    project_path = "/projects/acme%2Fwidget"
     path = "/projects/acme%2Fwidget/merge_requests"
-
-    replay_response = fn _request, requests ->
-      description =
-        requests
-        |> Enum.find(&(&1.method == :post and &1.path == path))
-        |> get_in([:json, "description"])
-
-      ok(200, [merge_request(%{"description" => description})])
-    end
 
     {:ok, transport} =
       ScriptTransport.start_link([
+        get(project_path, 200, %{"id" => 101}),
         get(path, 200, []),
-        post(path, 201, merge_request()),
-        {:get, path, replay_response}
+        post(path, 201, merge_request())
       ])
 
-    attrs = change_request_attrs(config(transport))
+    config =
+      transport
+      |> config()
+      |> update_in([:settings], &Map.delete(&1, :project_id))
 
     assert {:ok, %{disposition: :created, number: 17}} =
-             SourceControl.ensure_change_request(attrs, operation_opts())
+             SourceControl.ensure_change_request(
+               change_request_attrs(config),
+               operation_opts()
+             )
 
-    assert {:ok, %{disposition: :reconciled, number: 17}} =
-             SourceControl.ensure_change_request(attrs, operation_opts())
-
-    assert [] = ScriptTransport.remaining(transport)
+    [project, list, create] = ScriptTransport.requests(transport)
+    assert project.method == :get
+    assert project.path == project_path
+    assert list.query == %{"scope" => "all", "state" => "all", "per_page" => 100, "page" => 1}
+    assert create.method == :post
+    assert create.retry == :never
+    assert create.json["description"] == "Coverage body"
+    refute create.json["description"] =~ "<!-- symphony:"
   end
 
-  test "merge request marker lookup follows GitLab pagination" do
+  test "merge request identity precheck follows all-state pagination before reporting conflict" do
     path = "/projects/acme%2Fwidget/merge_requests"
-    marker = change_request_marker()
 
     {:ok, transport} =
       ScriptTransport.start_link([
+        canonical_project(),
         get(path, 200, [], %{"x-next-page" => "2"}),
-        get(path, 200, [merge_request(%{"description" => marker.exact})])
+        get(path, 200, [merge_request()])
       ])
 
-    assert {:ok, %{disposition: :reconciled}} =
+    assert {:error, :conflict} =
              SourceControl.ensure_change_request(
                change_request_attrs(config(transport)),
                operation_opts()
              )
 
-    assert [%{query: %{"page" => 1}}, %{query: %{"page" => 2}}] =
-             Enum.map(ScriptTransport.requests(transport), &Map.take(&1, [:query]))
+    assert [
+             %{query: %{"scope" => "all", "state" => "all", "per_page" => 100, "page" => 1}},
+             %{query: %{"scope" => "all", "state" => "all", "per_page" => 100, "page" => 2}}
+           ] =
+             transport
+             |> ScriptTransport.requests()
+             |> Enum.filter(&(&1.path == path))
+             |> Enum.map(&Map.take(&1, [:query]))
   end
 
-  test "ambiguous merge request creation reconciles before reporting an unknown outcome" do
+  test "merge request copied marker is not trusted and same immutable identity is a conflict" do
     path = "/projects/acme%2Fwidget/merge_requests"
-    attrs_for = &change_request_attrs(config(&1))
+    copied_marker = "<!-- symphony:dedupe-sha256=copied intent-sha256=copied -->"
 
-    {:ok, absent_after_conflict} =
+    copied =
+      merge_request(%{
+        "description" => copied_marker,
+        "author" => %{"id" => String.to_integer(@bot_actor_id)}
+      })
+
+    {:ok, transport} =
       ScriptTransport.start_link([
-        get(path, 200, []),
-        post(path, 409, %{}),
-        get(path, 200, [])
+        canonical_project(),
+        get(path, 200, [copied])
       ])
 
-    assert {:error, :unknown_outcome} =
+    assert {:error, :conflict} =
              SourceControl.ensure_change_request(
-               attrs_for.(absent_after_conflict),
+               change_request_attrs(config(transport)),
                operation_opts()
              )
 
+    assert [] = ScriptTransport.remaining(transport)
+  end
+
+  test "ambiguous merge request creation reports unknown without another list or post" do
+    path = "/projects/acme%2Fwidget/merge_requests"
+    attrs_for = &change_request_attrs(config(&1))
+
+    unknown_status_transports =
+      for status <- [400, 409, 422, 500, 501, 507, 599] do
+        {:ok, transport} =
+          ScriptTransport.start_link([
+            canonical_project(),
+            get(path, 200, []),
+            post(path, status, %{})
+          ])
+
+        assert {:error, :unknown_outcome} =
+                 SourceControl.ensure_change_request(
+                   attrs_for.(transport),
+                   operation_opts()
+                 )
+
+        transport
+      end
+
     {:ok, failed_reconciliation} =
       ScriptTransport.start_link([
+        canonical_project(),
         get(path, 200, []),
-        {:post, path, {:error, :timeout}},
-        {:get, path, {:error, :timeout}}
+        {:post, path, {:error, :timeout}}
       ])
 
-    assert {:error, :transport_failure} =
+    assert {:error, :unknown_outcome} =
              SourceControl.ensure_change_request(
                attrs_for.(failed_reconciliation),
                operation_opts()
@@ -336,18 +451,79 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
 
     {:ok, rejected_create} =
       ScriptTransport.start_link([
+        canonical_project(),
         get(path, 200, []),
         post(path, 401, %{})
       ])
 
     assert {:error, :unauthorized} =
              SourceControl.ensure_change_request(attrs_for.(rejected_create), operation_opts())
+
+    for transport <- unknown_status_transports ++ [failed_reconciliation, rejected_create] do
+      requests = ScriptTransport.requests(transport)
+      assert Enum.count(requests, &(&1.method == :post)) == 1
+      assert Enum.count(requests, &(&1.method == :get and &1.path == path)) == 1
+    end
+  end
+
+  test "merge request creation returns unknown when the 201 response identity or ids are malformed" do
+    path = "/projects/acme%2Fwidget/merge_requests"
+
+    for response <- [
+          merge_request(%{"target_project_id" => 202}),
+          merge_request(%{"source_branch" => "other-topic"}),
+          Map.delete(merge_request(), "iid"),
+          merge_request(%{"id" => "501"}),
+          merge_request(%{"iid" => "17"}),
+          merge_request(%{"id" => 0}),
+          merge_request(%{"source_project_id" => "101"}),
+          merge_request(%{"target_project_id" => 0})
+        ] do
+      {:ok, transport} =
+        ScriptTransport.start_link([
+          canonical_project(),
+          get(path, 200, []),
+          post(path, 201, response)
+        ])
+
+      assert {:error, :unknown_outcome} =
+               SourceControl.ensure_change_request(
+                 change_request_attrs(config(transport)),
+                 operation_opts()
+               )
+
+      assert [] = ScriptTransport.remaining(transport)
+    end
+  end
+
+  test "merge request creation rejects config project mismatch before listing or posting" do
+    path = "/projects/acme%2Fwidget/merge_requests"
+
+    for configured <- [0, "0", "abc", 202, "202"] do
+      {:ok, transport} =
+        ScriptTransport.start_link([
+          canonical_project()
+        ])
+
+      bad_config =
+        transport
+        |> config()
+        |> put_in([:settings, :project_id], configured)
+
+      assert {:error, :invalid_configuration} =
+               SourceControl.ensure_change_request(
+                 change_request_attrs(bad_config),
+                 operation_opts()
+               )
+
+      refute Enum.any?(ScriptTransport.requests(transport), &(&1.path == path))
+    end
   end
 
   test "merge request listing fails closed on malformed, rejected, and excessive pagination" do
     path = "/projects/acme%2Fwidget/merge_requests"
 
-    {:ok, rejected} = ScriptTransport.start_link([get(path, 401, %{})])
+    {:ok, rejected} = ScriptTransport.start_link([canonical_project(), get(path, 401, %{})])
 
     assert {:error, :unauthorized} =
              SourceControl.ensure_change_request(
@@ -355,7 +531,7 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
                operation_opts()
              )
 
-    {:ok, malformed} = ScriptTransport.start_link([get(path, 200, %{})])
+    {:ok, malformed} = ScriptTransport.start_link([canonical_project(), get(path, 200, %{})])
 
     assert {:error, :provider_failure} =
              SourceControl.ensure_change_request(
@@ -363,10 +539,28 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
                operation_opts()
              )
 
+    malformed_unrelated =
+      merge_request(%{
+        "source_branch" => "other-topic",
+        "source_project_id" => "101"
+      })
+
+    {:ok, malformed_unrelated_list} =
+      ScriptTransport.start_link([canonical_project(), get(path, 200, [malformed_unrelated])])
+
+    assert {:error, :provider_failure} =
+             SourceControl.ensure_change_request(
+               change_request_attrs(config(malformed_unrelated_list)),
+               operation_opts()
+             )
+
+    assert Enum.count(ScriptTransport.requests(malformed_unrelated_list), &(&1.method == :post)) == 0
+
     pages =
-      Enum.map(1..20, fn page ->
-        get(path, 200, [], %{"x-next-page" => Integer.to_string(page + 1)})
-      end)
+      [canonical_project()] ++
+        Enum.map(1..20, fn page ->
+          get(path, 200, [], %{"x-next-page" => Integer.to_string(page + 1)})
+        end)
 
     {:ok, excessive} = ScriptTransport.start_link(pages)
 
@@ -376,7 +570,7 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
                operation_opts()
              )
 
-    assert 20 = length(ScriptTransport.requests(excessive))
+    assert 20 = Enum.count(ScriptTransport.requests(excessive), &(&1.path == path))
   end
 
   test "state maps every required pipeline outcome without conflating mergeability" do
@@ -602,7 +796,8 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
         ScriptTransport.start_link([
           get(project_path, 200, project_body),
           get(branch_path, 200, branch_body),
-          get(protected_path, 200, %{})
+          get(protected_path, 200, %{}),
+          get("/user", 200, gitlab_user())
         ])
 
       assert {:error, :forbidden} = SourceControl.health_check(config(transport))
@@ -627,7 +822,13 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
         |> Enum.find(&(&1.method == :post and &1.path == path))
         |> get_in([:json, "body"])
 
-      ok(200, [%{"id" => 902, "body" => marker_body}])
+      ok(200, [
+        %{
+          "id" => 902,
+          "body" => marker_body,
+          "author" => %{"id" => String.to_integer(@bot_actor_id)}
+        }
+      ])
     end
 
     {:ok, transport} =
@@ -662,7 +863,13 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
     {:ok, transport} =
       ScriptTransport.start_link([
         get(path, 200, [], %{"x-next-page" => "2"}),
-        get(path, 200, [%{"id" => 903, "body" => marker.exact}])
+        get(path, 200, [
+          %{
+            "id" => 903,
+            "body" => AdapterSupport.append_marker(body, marker.exact),
+            "author" => %{"id" => String.to_integer(@bot_actor_id)}
+          }
+        ])
       ])
 
     assert {:ok, %{action: :already_applied, external_id: "903"}} =
@@ -676,6 +883,33 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
              Enum.map(ScriptTransport.requests(transport), &Map.take(&1, [:query]))
   end
 
+  test "comment marker replay ignores copied or malformed GitLab actor provenance" do
+    body = "Review complete"
+    path = "/projects/acme%2Fwidget/merge_requests/17/notes"
+    marker = comment_marker(body)
+
+    forged_notes = [
+      %{"id" => 903, "body" => marker.exact, "author" => %{"id" => "attacker-user"}},
+      %{"id" => 904, "body" => marker.exact},
+      %{"id" => 905, "body" => marker.exact, "author" => %{"id" => nil}}
+    ]
+
+    {:ok, transport} =
+      ScriptTransport.start_link([
+        get(path, 200, forged_notes),
+        post(path, 201, %{"id" => 906, "body" => body})
+      ])
+
+    assert {:ok, %{action: :commented, external_id: "906"}} =
+             SourceControl.close_or_comment(
+               config(transport),
+               change_request(),
+               comment_opts(body)
+             )
+
+    assert [] = ScriptTransport.remaining(transport)
+  end
+
   test "ambiguous comment creation reconciles before retry" do
     body = "Review complete"
     path = "/projects/acme%2Fwidget/merge_requests/17/notes"
@@ -685,7 +919,13 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
       ScriptTransport.start_link([
         get(path, 200, []),
         post(path, 409, %{}),
-        get(path, 200, [%{"id" => 904, "body" => marker.exact}])
+        get(path, 200, [
+          %{
+            "id" => 904,
+            "body" => AdapterSupport.append_marker(body, marker.exact),
+            "author" => %{"id" => String.to_integer(@bot_actor_id)}
+          }
+        ])
       ])
 
     assert {:ok, %{action: :already_applied, external_id: "904"}} =
@@ -796,7 +1036,9 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
         repository: "acme/widget",
         base_branch: "main",
         api_base_url: "https://gitlab.test/api/v4",
-        max_read_attempts: 1
+        max_read_attempts: 1,
+        project_id: 101,
+        bot_actor_id: @bot_actor_id
       },
       transport: {ScriptTransport, transport}
     }
@@ -838,23 +1080,6 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
     }
   end
 
-  defp change_request_marker do
-    AdapterSupport.operation_marker(
-      :gitlab,
-      "acme/widget",
-      :ensure_change_request,
-      @operation_id,
-      @dedupe_key,
-      [
-        "topic",
-        "main",
-        "Improve coverage",
-        AdapterSupport.body_digest("Coverage body"),
-        true
-      ]
-    )
-  end
-
   defp comment_opts(body) do
     operation_opts()
     |> Keyword.put(:action, :comment)
@@ -862,14 +1087,19 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
   end
 
   defp comment_marker(body) do
-    AdapterSupport.operation_marker(
-      :gitlab,
-      "acme/widget",
-      :comment,
-      @operation_id,
-      @dedupe_key,
-      ["501", AdapterSupport.body_digest(body)]
-    )
+    Transport.with_credential("gitlab-secret-value", fn ->
+      {:ok, marker} =
+        AdapterSupport.operation_marker(
+          :gitlab,
+          "acme/widget",
+          :comment,
+          @operation_id,
+          @dedupe_key,
+          ["501", AdapterSupport.body_digest(body)]
+        )
+
+      marker
+    end)
   end
 
   defp merge_request(overrides \\ %{}) do
@@ -883,7 +1113,10 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
         "draft" => true,
         "source_branch" => "topic",
         "target_branch" => "main",
-        "sha" => @sha
+        "source_project_id" => 101,
+        "target_project_id" => 101,
+        "sha" => @sha,
+        "author" => %{"id" => String.to_integer(@bot_actor_id)}
       },
       overrides
     )
@@ -945,6 +1178,10 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
   end
 
   defp branch(sha), do: %{"name" => "topic", "can_push" => true, "commit" => %{"id" => sha}}
+  defp gitlab_user(id \\ String.to_integer(@bot_actor_id)), do: %{"id" => id, "username" => "symphony-bot"}
+
+  defp canonical_project(overrides \\ %{}),
+    do: get("/projects/acme%2Fwidget", 200, Map.merge(%{"id" => 101}, overrides))
 
   defp get(path, status, body, headers \\ %{}), do: {:get, path, ok(status, body, headers)}
   defp post(path, status, body, headers \\ %{}), do: {:post, path, ok(status, body, headers)}

@@ -7,13 +7,15 @@ defmodule SymphonyElixir.ExecCommand do
   @control_reader_script ~S|if IFS= read -r line < "$1"; then printf '%s\n' "$line"; else exit 1; fi|
   @default_stop_timeout_ms 2_500
   @control_reader_start_timeout_ms 5_000
+  @control_parent_name "symphony-exec-control"
+  @control_private_dir_prefix "run-"
   @signal_numbers %{sighup: 1, sigint: 2, sigquit: 3, sigkill: 9, sigterm: 15}
 
   defmodule StatusControl do
     @moduledoc false
 
-    @enforce_keys [:ref, :reader, :reader_os_pid, :path, :secret_path, :proofs]
-    defstruct [:ref, :reader, :reader_os_pid, :path, :secret_path, :proofs]
+    @enforce_keys [:ref, :reader, :reader_os_pid, :path, :secret_path, :proofs, :control_dir, :control_root]
+    defstruct [:ref, :reader, :reader_os_pid, :path, :secret_path, :proofs, :control_dir, :control_root]
 
     @type t :: %__MODULE__{
             ref: reference(),
@@ -21,7 +23,9 @@ defmodule SymphonyElixir.ExecCommand do
             reader_os_pid: pos_integer(),
             path: Path.t(),
             secret_path: Path.t(),
-            proofs: tuple()
+            proofs: tuple(),
+            control_dir: Path.t(),
+            control_root: Path.t()
           }
   end
 
@@ -46,7 +50,7 @@ defmodule SymphonyElixir.ExecCommand do
 
   defp start_guarded_command(command, start_reader) when is_list(command) and is_function(start_reader, 4) do
     case make_control_files() do
-      {:ok, %{path: control_path, secret_path: secret_path, proofs: proofs}} ->
+      {:ok, %{path: control_path, secret_path: secret_path, proofs: proofs, control_dir: control_dir, control_root: control_root}} ->
         ref = make_ref()
         parent = self()
 
@@ -58,14 +62,15 @@ defmodule SymphonyElixir.ExecCommand do
               reader_os_pid: reader_os_pid,
               path: control_path,
               secret_path: secret_path,
-              proofs: proofs
+              proofs: proofs,
+              control_dir: control_dir,
+              control_root: control_root
             }
 
             {:ok, {guarded_command(command, control_path, secret_path), status_control}}
 
           {:error, reason} ->
-            File.rm(control_path)
-            File.rm(secret_path)
+            cleanup_control_files(control_root, control_dir, control_path, secret_path)
             {:error, reason}
         end
 
@@ -77,11 +82,11 @@ defmodule SymphonyElixir.ExecCommand do
   @spec cleanup_status_control(StatusControl.t() | nil) :: :ok
   def cleanup_status_control(nil), do: :ok
 
-  def cleanup_status_control(%StatusControl{reader: reader, path: path, secret_path: secret_path}) do
-    stop_control_reader(reader)
-
-    File.rm(path)
-    File.rm(secret_path)
+  def cleanup_status_control(%StatusControl{
+        reader: reader,
+        ref: ref
+      }) do
+    stop_control_reader(reader, ref)
     :ok
   end
 
@@ -97,11 +102,21 @@ defmodule SymphonyElixir.ExecCommand do
   if Mix.env() == :test do
     @doc false
     @spec make_control_fifo_for_test() :: {:ok, Path.t()} | {:error, term()}
-    def make_control_fifo_for_test, do: make_control_fifo()
+    def make_control_fifo_for_test do
+      case make_control_fifo() do
+        {:ok, control_path, _control_root} -> {:ok, control_path}
+        {:error, _reason} = error -> error
+      end
+    end
 
     @doc false
     @spec make_control_fifo_for_test(Path.t()) :: {:ok, Path.t()} | {:error, term()}
-    def make_control_fifo_for_test(control_dir), do: make_control_fifo(control_dir)
+    def make_control_fifo_for_test(control_dir) do
+      case make_control_fifo(control_dir) do
+        {:ok, control_path, _control_root} -> {:ok, control_path}
+        {:error, _reason} = error -> error
+      end
+    end
 
     @doc false
     @spec read_control_line_for_test(Path.t()) :: {:ok, binary()} | {:error, term()}
@@ -144,7 +159,7 @@ defmodule SymphonyElixir.ExecCommand do
 
     @doc false
     @spec stop_control_reader_for_test(pid(), non_neg_integer()) :: :ok
-    def stop_control_reader_for_test(reader, timeout_ms), do: stop_control_reader(reader, timeout_ms)
+    def stop_control_reader_for_test(reader, timeout_ms), do: stop_control_reader(reader, make_ref(), timeout_ms)
 
     @doc false
     @spec write_control_secret_for_test(Path.t(), iodata()) :: {:ok, Path.t()} | {:error, term()}
@@ -423,24 +438,25 @@ defmodule SymphonyElixir.ExecCommand do
   end
 
   defp make_control_fifo do
-    System.tmp_dir!()
-    |> Path.join("symphony-exec-control")
+    default_control_parent()
     |> make_control_fifo()
   end
 
-  defp make_control_fifo(control_dir) do
-    control_name = "status-#{System.unique_integer([:positive, :monotonic])}-#{Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)}"
-    control_path = Path.join(control_dir, control_name)
+  defp default_control_parent do
+    Path.join(System.tmp_dir!(), @control_parent_name)
+  end
 
-    with :ok <- File.mkdir_p(control_dir),
-         {"", 0} <- System.cmd("mkfifo", [control_path], stderr_to_stdout: true) do
-      {:ok, control_path}
-    else
-      {:error, reason} ->
-        {:error, reason}
+  defp make_control_fifo(control_parent) do
+    with {:ok, control_root} <- ensure_control_parent(control_parent),
+         {:ok, control_dir} <- make_private_control_dir(control_root) do
+      case make_control_fifo_in_dir(control_dir) do
+        {:ok, control_path} ->
+          {:ok, control_path, control_root}
 
-      {output, status} when is_binary(output) and is_integer(status) ->
-        {:error, {:mkfifo_failed, status, output}}
+        {:error, reason} ->
+          File.rm_rf(control_dir)
+          {:error, reason}
+      end
     end
   end
 
@@ -448,35 +464,238 @@ defmodule SymphonyElixir.ExecCommand do
     proofs = control_proofs()
     secret = proofs |> Tuple.to_list() |> Enum.intersperse("\n") |> then(&[&1, "\n"])
 
-    with {:ok, control_path} <- make_control_fifo(),
-         {:ok, secret_path} <- write_control_secret(control_path, secret) do
-      {:ok, %{path: control_path, secret_path: secret_path, proofs: proofs}}
+    with {:ok, control_path, control_root} <- make_control_fifo(),
+         {:ok, secret_path} <- write_control_secret(control_root, control_path, secret) do
+      {:ok,
+       %{
+         path: control_path,
+         secret_path: secret_path,
+         proofs: proofs,
+         control_dir: Path.dirname(control_path),
+         control_root: control_root
+       }}
     else
       {:error, reason} -> {:error, reason}
     end
   end
 
   defp write_control_secret(control_path, secret) when is_binary(control_path) do
-    secret_path = control_path <> ".secret"
+    control_path
+    |> control_root_from_path()
+    |> write_control_secret(control_path, secret)
+  end
 
-    with {:ok, io} <- File.open(secret_path, [:write, :binary, :exclusive]),
+  defp write_control_secret(control_root, control_path, secret) when is_binary(control_root) and is_binary(control_path) do
+    secret_path = control_path <> ".secret"
+    control_dir = Path.dirname(control_path)
+
+    with :ok <- create_private_control_secret(secret_path),
+         {:ok, io} <- File.open(secret_path, [:write, :binary]),
          :ok <- protect_write_and_close_control_secret(io, secret_path, secret) do
       {:ok, secret_path}
     else
       {:error, reason} ->
-        File.rm(secret_path)
-        File.rm(control_path)
+        cleanup_control_files(control_root, control_dir, control_path, secret_path)
         {:error, reason}
     end
   end
 
   defp protect_write_and_close_control_secret(io, secret_path, secret) do
-    case File.chmod(secret_path, 0o600) do
+    case validate_owned_path(secret_path, :regular, 0o600, :unsafe_control_secret) do
       :ok -> IO.binwrite(io, secret)
       {:error, _reason} = error -> error
     end
   after
     File.close(io)
+  end
+
+  defp ensure_control_parent(control_parent) when is_binary(control_parent) do
+    case File.lstat(control_parent) do
+      {:ok, %{type: :symlink}} ->
+        {:error, :unsafe_control_parent}
+
+      {:ok, %{type: :directory}} ->
+        with :ok <- validate_owner(control_parent, :unsafe_control_parent),
+             :ok <- File.chmod(control_parent, 0o700),
+             :ok <- validate_owned_path(control_parent, :directory, 0o700, :unsafe_control_parent),
+             {:ok, control_root} <- directory_realpath(control_parent) do
+          {:ok, control_root}
+        end
+
+      {:ok, _stat} ->
+        {:error, :unsafe_control_parent}
+
+      {:error, :enoent} ->
+        with :ok <- mkdir_private(control_parent),
+             :ok <- validate_owned_path(control_parent, :directory, 0o700, :unsafe_control_parent),
+             {:ok, control_root} <- directory_realpath(control_parent) do
+          {:ok, control_root}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp make_private_control_dir(control_parent), do: make_private_control_dir(control_parent, 16)
+
+  defp make_private_control_dir(_control_parent, 0), do: {:error, :control_dir_collision}
+
+  defp make_private_control_dir(control_parent, attempts) do
+    control_dir =
+      Path.join(
+        control_parent,
+        @control_private_dir_prefix <>
+          Integer.to_string(System.unique_integer([:positive, :monotonic])) <>
+          "-" <> Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
+      )
+
+    case mkdir_private(control_dir) do
+      :ok ->
+        with :ok <- validate_owned_path(control_dir, :directory, 0o700, :unsafe_control_dir) do
+          {:ok, control_dir}
+        end
+
+      {:error, {:mkdir_failed, _status, _output}} ->
+        if File.exists?(control_dir) do
+          make_private_control_dir(control_parent, attempts - 1)
+        else
+          {:error, :unsafe_control_dir}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp make_control_fifo_in_dir(control_dir) do
+    control_path = Path.join(control_dir, "status")
+
+    case System.cmd("/bin/sh", ["-c", "umask 077; mkfifo \"$1\"", "sh", control_path], stderr_to_stdout: true) do
+      {"", 0} ->
+        with :ok <- validate_owned_path(control_path, :other, 0o600, :unsafe_control_fifo) do
+          {:ok, control_path}
+        end
+
+      {output, status} when is_binary(output) and is_integer(status) ->
+        {:error, {:mkfifo_failed, status, output}}
+    end
+  end
+
+  defp create_private_control_secret(secret_path) do
+    case System.cmd("/bin/sh", ["-c", "umask 177; set -C; : > \"$1\"", "sh", secret_path], stderr_to_stdout: true) do
+      {"", 0} -> :ok
+      {output, status} when is_binary(output) and is_integer(status) -> {:error, {:secret_write_failed, status, output}}
+    end
+  end
+
+  defp mkdir_private(path) do
+    case System.cmd("/bin/sh", ["-c", "umask 077; mkdir \"$1\"", "sh", path], stderr_to_stdout: true) do
+      {"", 0} -> :ok
+      {output, status} when is_binary(output) and is_integer(status) -> {:error, {:mkdir_failed, status, output}}
+    end
+  end
+
+  defp validate_owned_path(path, expected_type, expected_mode, error_reason) do
+    with {:ok, lstat} <- File.lstat(path),
+         :ok <- reject_symlink(lstat, error_reason),
+         {:ok, stat} <- File.stat(path),
+         :ok <- validate_type(stat, expected_type, error_reason),
+         :ok <- validate_owner(stat, error_reason),
+         :ok <- validate_mode(stat, expected_mode, error_reason) do
+      :ok
+    end
+  end
+
+  defp validate_owner(path, error_reason) when is_binary(path) do
+    with {:ok, stat} <- File.stat(path) do
+      validate_owner(stat, error_reason)
+    end
+  end
+
+  defp validate_owner(%File.Stat{uid: uid}, error_reason) do
+    case current_uid() do
+      {:ok, ^uid} -> :ok
+      {:ok, _other_uid} -> {:error, error_reason}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp validate_mode(%File.Stat{mode: mode}, expected_mode, error_reason) do
+    if Bitwise.band(mode, 0o777) == expected_mode,
+      do: :ok,
+      else: {:error, error_reason}
+  end
+
+  defp validate_type(%File.Stat{type: expected_type}, expected_type, _error_reason), do: :ok
+  defp validate_type(%File.Stat{}, _expected_type, error_reason), do: {:error, error_reason}
+
+  defp reject_symlink(%File.Stat{type: :symlink}, error_reason), do: {:error, error_reason}
+  defp reject_symlink(%File.Stat{}, _error_reason), do: :ok
+
+  defp current_uid do
+    case System.cmd("id", ["-u"], stderr_to_stdout: true) do
+      {uid, 0} ->
+        uid
+        |> String.trim()
+        |> Integer.parse()
+        |> case do
+          {uid, ""} -> {:ok, uid}
+          _invalid -> {:error, :invalid_uid}
+        end
+
+      {output, status} ->
+        {:error, {:id_failed, status, output}}
+    end
+  end
+
+  defp cleanup_control_files(control_root, control_dir, control_path, secret_path) do
+    if private_control_dir?(control_root, control_dir, control_path, secret_path) do
+      File.rm_rf(control_dir)
+    end
+
+    :ok
+  end
+
+  defp private_control_dir?(control_root, control_dir, control_path, secret_path)
+       when is_binary(control_root) and is_binary(control_dir) and is_binary(control_path) and is_binary(secret_path) do
+    Path.basename(control_root) == @control_parent_name and
+      String.starts_with?(Path.basename(control_dir), @control_private_dir_prefix) and
+      control_dir_bound_to_control_root?(control_root, control_dir) and
+      validate_owned_path(control_root, :directory, 0o700, :unsafe_control_parent) == :ok and
+      validate_owned_path(control_dir, :directory, 0o700, :unsafe_control_dir) == :ok and
+      Path.dirname(control_path) == control_dir and
+      Path.basename(control_path) == "status" and
+      secret_path == control_path <> ".secret"
+  end
+
+  defp private_control_dir?(_control_root, _control_dir, _control_path, _secret_path), do: false
+
+  defp control_dir_bound_to_control_root?(control_root, control_dir) do
+    with {:ok, expected_parent} <- directory_realpath(control_root),
+         {:ok, actual_parent} <- directory_realpath(Path.dirname(control_dir)) do
+      expected_parent == actual_parent
+    else
+      _reason -> false
+    end
+  end
+
+  defp directory_realpath(path) do
+    case System.cmd("/bin/sh", ["-c", "cd \"$1\" && pwd -P", "sh", path], stderr_to_stdout: true) do
+      {output, 0} -> {:ok, String.trim_trailing(output, "\n")}
+      {_output, _status} -> {:error, :realpath_failed}
+    end
+  end
+
+  defp control_root_from_path(control_path) do
+    control_path
+    |> Path.dirname()
+    |> Path.dirname()
+    |> directory_realpath()
+    |> case do
+      {:ok, control_root} -> control_root
+      {:error, _reason} -> ""
+    end
   end
 
   defp control_proofs do
@@ -564,22 +783,46 @@ defmodule SymphonyElixir.ExecCommand do
 
   defp start_control_reader(parent, ref, control_path, proofs, exec_runner, timeout_ms) do
     starter = self()
+    control_dir = Path.dirname(control_path)
+    control_root = control_root_from_path(control_path)
+    secret_path = control_path <> ".secret"
 
     reader =
       spawn(fn ->
-        Process.flag(:trap_exit, true)
+        try do
+          Process.flag(:trap_exit, true)
+          parent_ref = Process.monitor(parent)
 
-        case exec_runner.(
-               ["/bin/sh", "-c", @control_reader_script, "--", control_path],
-               [{:stdout, self()}, {:stderr, self()}, {:group, 0}, :kill_group, {:kill_timeout, 1}]
-             ) do
-          {:ok, exec_pid, os_pid} ->
-            exec_ref = Process.monitor(exec_pid)
-            send(starter, {@control_reader_message, :started, self(), os_pid})
-            collect_control_status(parent, ref, exec_pid, exec_ref, os_pid, proofs, "", "")
+          case exec_runner.(
+                 ["/bin/sh", "-c", @control_reader_script, "--", control_path],
+                 [{:stdout, self()}, {:stderr, self()}, {:group, 0}, :kill_group, {:kill_timeout, 1}]
+               ) do
+            {:ok, exec_pid, os_pid} ->
+              exec_ref = Process.monitor(exec_pid)
+              send(starter, {@control_reader_message, :started, self(), os_pid})
 
-          {:error, reason} ->
-            send(starter, {@control_reader_message, :start_failed, self(), reason})
+              collect_control_status(
+                parent,
+                ref,
+                exec_pid,
+                exec_ref,
+                os_pid,
+                proofs,
+                "",
+                "",
+                parent_ref,
+                control_root,
+                control_dir,
+                control_path,
+                secret_path
+              )
+
+            {:error, reason} ->
+              Process.demonitor(parent_ref, [:flush])
+              send(starter, {@control_reader_message, :start_failed, self(), reason})
+          end
+        after
+          cleanup_control_files(control_root, control_dir, control_path, secret_path)
         end
       end)
 
@@ -597,6 +840,24 @@ defmodule SymphonyElixir.ExecCommand do
   end
 
   defp collect_control_status(parent, ref, exec_pid, exec_ref, os_pid, proofs, stdout, stderr) do
+    collect_control_status(parent, ref, exec_pid, exec_ref, os_pid, proofs, stdout, stderr, nil, "", "", "", "")
+  end
+
+  defp collect_control_status(
+         parent,
+         ref,
+         exec_pid,
+         exec_ref,
+         os_pid,
+         proofs,
+         stdout,
+         stderr,
+         parent_ref,
+         control_root,
+         control_dir,
+         control_path,
+         secret_path
+       ) do
     receive do
       {:stdout, ^os_pid, data} ->
         stdout = stdout <> IO.iodata_to_binary(data)
@@ -607,7 +868,21 @@ defmodule SymphonyElixir.ExecCommand do
             Process.demonitor(exec_ref, [:flush])
 
           [_pending] ->
-            collect_control_status(parent, ref, exec_pid, exec_ref, os_pid, proofs, stdout, stderr)
+            collect_control_status(
+              parent,
+              ref,
+              exec_pid,
+              exec_ref,
+              os_pid,
+              proofs,
+              stdout,
+              stderr,
+              parent_ref,
+              control_root,
+              control_dir,
+              control_path,
+              secret_path
+            )
         end
 
       {:stderr, ^os_pid, data} ->
@@ -619,7 +894,12 @@ defmodule SymphonyElixir.ExecCommand do
           os_pid,
           proofs,
           stdout,
-          stderr <> IO.iodata_to_binary(data)
+          stderr <> IO.iodata_to_binary(data),
+          parent_ref,
+          control_root,
+          control_dir,
+          control_path,
+          secret_path
         )
 
       {:EXIT, ^exec_pid, {:exit_status, status}} ->
@@ -633,27 +913,33 @@ defmodule SymphonyElixir.ExecCommand do
       {:DOWN, ^exec_ref, :process, ^exec_pid, reason} ->
         send(parent, {@control_message, ref, {:error, {:control_read_failed, reason, stderr}}})
 
-      {@control_reader_message, :stop, from, stop_ref} ->
+      {:DOWN, ^parent_ref, :process, ^parent, _reason} when is_reference(parent_ref) ->
         stop_control_reader_exec(exec_pid, exec_ref)
+        Process.demonitor(parent_ref, [:flush])
+
+      {@control_reader_message, :stop, ^ref, from, stop_ref} ->
+        stop_control_reader_exec(exec_pid, exec_ref)
+        if is_reference(parent_ref), do: Process.demonitor(parent_ref, [:flush])
+        cleanup_control_files(control_root, control_dir, control_path, secret_path)
         send(from, {@control_reader_message, :stopped, stop_ref})
     end
   end
 
-  defp stop_control_reader(reader) when is_pid(reader) do
-    stop_control_reader(reader, @default_stop_timeout_ms + 500)
+  defp stop_control_reader(reader, ref) when is_pid(reader) and is_reference(ref) do
+    stop_control_reader(reader, ref, @default_stop_timeout_ms + 500)
   end
 
-  defp stop_control_reader(reader, timeout_ms) when is_pid(reader) and is_integer(timeout_ms) do
+  defp stop_control_reader(reader, ref, timeout_ms) when is_pid(reader) and is_reference(ref) and is_integer(timeout_ms) do
     if Process.alive?(reader) do
       stop_ref = make_ref()
       monitor_ref = Process.monitor(reader)
-      send(reader, {@control_reader_message, :stop, self(), stop_ref})
+      send(reader, {@control_reader_message, :stop, ref, self(), stop_ref})
 
       receive do
         {@control_reader_message, :stopped, ^stop_ref} -> :ok
         {:DOWN, ^monitor_ref, :process, ^reader, _reason} -> :ok
       after
-        timeout_ms -> Process.exit(reader, :kill)
+        timeout_ms -> :ok
       end
 
       Process.demonitor(monitor_ref, [:flush])

@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.SourceControlFakeCoverageTest do
   use ExUnit.Case, async: true
 
-  alias SymphonyElixir.SourceControl.{AdapterSupport, ChangeRequest, Fake}
+  alias SymphonyElixir.SourceControl.{AdapterSupport, ChangeRequest, Fake, Transport}
 
   @sha_a String.duplicate("a", 40)
   @sha_b String.duplicate("b", 40)
@@ -18,66 +18,151 @@ defmodule SymphonyElixir.SourceControlFakeCoverageTest do
   end
 
   test "adapter support distinguishes marker replay, ambiguity, and identity conflicts" do
-    first =
-      AdapterSupport.operation_marker(
-        :github,
-        "coverage/markers",
-        :ensure_change_request,
-        "operation-1",
-        "delivery-1",
-        ["head", "main", "intent"]
-      )
-
-    replay =
-      AdapterSupport.operation_marker(
-        :github,
-        "coverage/markers",
-        :ensure_change_request,
-        "operation-2",
-        "delivery-1",
-        ["head", "main", "intent"]
-      )
-
-    changed_intent =
-      AdapterSupport.operation_marker(
-        :github,
-        "coverage/markers",
-        :ensure_change_request,
-        "operation-3",
-        "delivery-1",
-        ["head", "main", "changed"]
-      )
-
-    reused_operation =
-      AdapterSupport.operation_marker(
-        :github,
-        "coverage/markers",
-        :ensure_change_request,
-        "operation-1",
-        "delivery-2",
-        ["head", "main", "intent"]
-      )
+    first = marker("operation-1", "delivery-1", ["head", "main", "intent"])
+    replay = marker("operation-2", "delivery-1", ["head", "main", "intent"])
+    changed_intent = marker("operation-3", "delivery-1", ["head", "main", "changed"])
+    reused_operation = marker("operation-1", "delivery-2", ["head", "main", "intent"])
 
     item = %{"body" => AdapterSupport.append_marker("body", first.exact), "id" => 1}
 
-    assert {:ok, {:found, ^item}} = AdapterSupport.marker_decision([item], "body", first)
-    assert {:ok, {:found, ^item}} = AdapterSupport.marker_decision([item], "body", replay)
+    assert {:ok, {:found, ^item}} = marker_decision([item], first)
+    assert {:ok, {:found, ^item}} = marker_decision([item], replay)
 
-    assert {:error, :idempotency_conflict} =
-             AdapterSupport.marker_decision([item], "body", changed_intent)
+    assert {:error, :idempotency_conflict} = marker_decision([item], changed_intent)
 
-    assert {:error, :idempotency_conflict} =
-             AdapterSupport.marker_decision([item], "body", reused_operation)
+    assert {:error, :idempotency_conflict} = marker_decision([item], reused_operation)
 
     assert {:error, :ambiguous_external_state} =
-             AdapterSupport.marker_decision([item, %{item | "id" => 2}], "body", first)
+             marker_decision([item, %{item | "id" => 2}], first)
 
-    assert {:ok, :create} = AdapterSupport.marker_decision([], "body", first)
+    assert {:ok, :create} = marker_decision([], first)
 
     digest = AdapterSupport.body_digest("body")
     assert byte_size(digest) == 64
     assert digest == AdapterSupport.body_digest("body")
     refute digest == AdapterSupport.body_digest("changed body")
+  end
+
+  test "adapter support only matches canonical marker lines" do
+    marker = marker("operation-1", "delivery-1", ["head", "main", "intent"])
+
+    canonical = %{"body" => "#{marker.exact}\r\n\nbody", "id" => 1}
+
+    copied = [
+      %{"body" => "body\n\n#{marker.exact}", "id" => 8},
+      %{"body" => "#{marker.exact}\nbody without blank separator", "id" => 9},
+      %{"body" => "> #{marker.exact}", "id" => 2},
+      %{"body" => "prefix #{marker.exact}", "id" => 3},
+      %{"body" => "#{marker.exact} suffix", "id" => 4},
+      %{"body" => "<p>#{marker.exact}</p>", "id" => 5},
+      %{"body" => "```\n#{marker.exact}\n```", "id" => 10},
+      %{"body" => "<div>\n#{marker.exact}\n</div>", "id" => 11}
+    ]
+
+    assert {:ok, {:found, ^canonical}} = marker_decision([canonical | copied], marker)
+
+    assert {:ok, :create} = marker_decision(copied, marker)
+
+    changed_intent = marker("operation-2", "delivery-1", ["head", "main", "changed"])
+
+    embedded_conflict = %{"body" => "prefix #{changed_intent.exact}", "id" => 6}
+    assert {:ok, :create} = marker_decision([embedded_conflict], marker)
+
+    legal_conflict = %{"body" => AdapterSupport.append_marker("body", changed_intent.exact), "id" => 7}
+
+    assert {:error, :idempotency_conflict} = marker_decision([legal_conflict], marker)
+  end
+
+  test "adapter support prefixes comments with a parent-bound marker before fenced bodies" do
+    marker =
+      Transport.with_credential("marker-secret", fn ->
+        {:ok, marker} =
+          AdapterSupport.comment_marker(
+            :github,
+            "coverage/markers",
+            "parent-1",
+            "operation-1",
+            "delivery-1",
+            "```text\nunclosed fence"
+          )
+
+        marker
+      end)
+
+    body = AdapterSupport.append_marker("```text\nunclosed fence", marker.exact)
+
+    assert body == marker.exact <> "\n\n```text\nunclosed fence"
+    assert {:ok, {:found, %{"id" => 1}}} = marker_decision([%{"body" => body, "id" => 1}], marker)
+
+    copied_inside_fence = %{
+      "body" => "```text\n#{marker.exact}\nunclosed fence",
+      "id" => 2
+    }
+
+    assert {:ok, :create} = marker_decision([copied_inside_fence], marker)
+  end
+
+  test "adapter support comment markers bind signatures to the parent external id" do
+    parent_marker =
+      comment_marker("parent-1", "operation-1", "delivery-1", "same body")
+
+    other_parent_marker =
+      comment_marker("parent-2", "operation-1", "delivery-1", "same body")
+
+    assert parent_marker.exact != other_parent_marker.exact
+
+    existing = %{"body" => AdapterSupport.append_marker("same body", other_parent_marker.exact), "id" => 1}
+
+    assert {:error, :idempotency_conflict} = marker_decision([existing], parent_marker)
+  end
+
+  test "adapter support ignores unsigned and incorrectly signed marker lines" do
+    marker = marker("operation-1", "delivery-1", ["head", "main", "intent"])
+    unsigned = Regex.replace(~r/ signature-sha256=[0-9a-f]+\s/, marker.exact, " ")
+
+    bad_signature =
+      Regex.replace(
+        ~r/signature-sha256=[0-9a-f]+/,
+        marker.exact,
+        "signature-sha256=#{String.duplicate("0", 64)}"
+      )
+
+    wrong_key_marker =
+      Transport.with_credential("wrong-key", fn ->
+        {:ok, marker} =
+          AdapterSupport.operation_marker(
+            :github,
+            "coverage/markers",
+            :ensure_change_request,
+            "operation-1",
+            "delivery-1",
+            ["head", "main", "intent"]
+          )
+
+        marker
+      end)
+
+    items = [
+      %{"body" => AdapterSupport.append_marker("body", unsigned), "id" => 1},
+      %{"body" => AdapterSupport.append_marker("body", bad_signature), "id" => 2},
+      %{"body" => AdapterSupport.append_marker("body", wrong_key_marker.exact), "id" => 3}
+    ]
+
+    assert {:ok, :create} = marker_decision(items, marker)
+  end
+
+  test "adapter support fails closed when marker signing has no runtime credential" do
+    Process.delete({Transport, :credential})
+
+    assert {:error, :invalid_configuration} =
+             AdapterSupport.operation_marker(
+               :github,
+               "coverage/markers",
+               :ensure_change_request,
+               "operation-1",
+               "delivery-1",
+               ["head", "main", "intent"]
+             )
   end
 
   test "health reports unavailable scenarios and rejects normalized write permissions" do
@@ -383,6 +468,44 @@ defmodule SymphonyElixir.SourceControlFakeCoverageTest do
   defp operation(suffix, extra) when is_list(extra) do
     [operation_id: "coverage-operation-#{suffix}", dedupe_key: "coverage-dedupe-#{suffix}"] ++
       extra
+  end
+
+  defp marker(operation_id, dedupe_key, intent_parts) do
+    Transport.with_credential("marker-secret", fn ->
+      {:ok, marker} =
+        AdapterSupport.operation_marker(
+          :github,
+          "coverage/markers",
+          :ensure_change_request,
+          operation_id,
+          dedupe_key,
+          intent_parts
+        )
+
+      marker
+    end)
+  end
+
+  defp comment_marker(parent_external_id, operation_id, dedupe_key, body) do
+    Transport.with_credential("marker-secret", fn ->
+      {:ok, marker} =
+        AdapterSupport.comment_marker(
+          :github,
+          "coverage/markers",
+          parent_external_id,
+          operation_id,
+          dedupe_key,
+          body
+        )
+
+      marker
+    end)
+  end
+
+  defp marker_decision(items, marker) do
+    Transport.with_credential("marker-secret", fn ->
+      AdapterSupport.marker_decision(items, "body", marker)
+    end)
   end
 
   defp run_concurrently(functions) do

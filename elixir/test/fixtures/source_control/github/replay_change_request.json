@@ -49,6 +49,7 @@
         "title": "ABC-18",
         "body": "{{last_mutation_body}}",
         "draft": true,
+        "user": {"id": 424242},
         "head": {"ref": "symphony/ABC-18"},
         "base": {"ref": "main"}
       }

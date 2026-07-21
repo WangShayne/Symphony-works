@@ -11,8 +11,8 @@
       "html_url": "https://github.test/acme/widget/pull/14",
       "title": "ABC-14",
       "draft": true,
-      "head": {"ref": "symphony/ABC-14"},
-      "base": {"ref": "main"}
+      "head": {"repo": {"full_name": "acme/widget"}, "ref": "symphony/ABC-14"},
+      "base": {"repo": {"full_name": "acme/widget"}, "ref": "main"}
     }
   },
   {
@@ -41,8 +41,8 @@
       "html_url": "https://github.test/acme/widget/pull/14",
       "title": "ABC-14",
       "draft": false,
-      "head": {"ref": "symphony/ABC-14"},
-      "base": {"ref": "main"}
+      "head": {"repo": {"full_name": "acme/widget"}, "ref": "symphony/ABC-14"},
+      "base": {"repo": {"full_name": "acme/widget"}, "ref": "main"}
     }
   }
 ]

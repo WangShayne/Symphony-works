@@ -32,5 +32,12 @@
       "push_access_levels": [{"access_level": 40}],
       "merge_access_levels": [{"access_level": 40}]
     }
+  },
+  {
+    "method": "GET",
+    "path": "/user",
+    "status": 200,
+    "headers": {},
+    "body": {"id": 31337, "username": "symphony-bot"}
   }
 ]

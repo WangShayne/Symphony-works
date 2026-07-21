@@ -117,7 +117,8 @@ defmodule SymphonyElixir.Configuration.DocumentTest do
         "credential_ref" => credential_ref,
         "settings" => %{
           "repository" => "WangShayne/Symphony-works",
-          "base_branch" => "main"
+          "base_branch" => "main",
+          "bot_actor_id" => "31337"
         }
       }
     ]
@@ -149,6 +150,17 @@ defmodule SymphonyElixir.Configuration.DocumentTest do
           "settings" => %{}
         },
         %{
+          "id" => "delivery-leading-zero-actor",
+          "kind" => "source_control",
+          "provider" => "gitlab",
+          "credential_ref" => credential_ref,
+          "settings" => %{
+            "repository" => "WangShayne/Symphony-works",
+            "base_branch" => "main",
+            "bot_actor_id" => "031337"
+          }
+        },
+        %{
           "id" => "tracker-missing-webhook-secret",
           "kind" => "tracker",
           "provider" => "github",
@@ -174,12 +186,19 @@ defmodule SymphonyElixir.Configuration.DocumentTest do
     assert %{path: ["integrations", "0", "credential_ref"], message: "must be an opaque secret reference"} in errors
     assert %{path: ["integrations", "1", "settings", "repository"], message: "is required"} in errors
     assert %{path: ["integrations", "1", "settings", "base_branch"], message: "is required"} in errors
+    assert %{path: ["integrations", "1", "settings", "bot_actor_id"], message: "is required"} in errors
     assert %{path: ["integrations", "0", "api_token"], message: "is not supported"} in errors
-    assert %{path: ["integrations", "2", "settings", "webhook_secret_ref"], message: "is required"} in errors
-    assert %{path: ["integrations", "2", "settings", "bot_actor_id"], message: "is required"} in errors
 
     assert %{
-             path: ["integrations", "3", "settings", "webhook_secret_ref"],
+             path: ["integrations", "2", "settings", "bot_actor_id"],
+             message: "must be a canonical positive decimal actor id"
+           } in errors
+
+    assert %{path: ["integrations", "3", "settings", "webhook_secret_ref"], message: "is required"} in errors
+    assert %{path: ["integrations", "3", "settings", "bot_actor_id"], message: "is required"} in errors
+
+    assert %{
+             path: ["integrations", "4", "settings", "webhook_secret_ref"],
              message: "must be an opaque secret reference"
            } in errors
   end

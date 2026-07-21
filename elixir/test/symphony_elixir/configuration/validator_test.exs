@@ -385,7 +385,11 @@ defmodule SymphonyElixir.Configuration.ValidatorTest do
           "kind" => "source_control",
           "provider" => "gitlab",
           "credential_ref" => source_control_reference.id,
-          "settings" => %{"repository" => "WangShayne/Symphony-works", "base_branch" => "main"}
+          "settings" => %{
+            "repository" => "WangShayne/Symphony-works",
+            "base_branch" => "main",
+            "bot_actor_id" => "31337"
+          }
         }
       ])
 

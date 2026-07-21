@@ -1,6 +1,14 @@
 defmodule SymphonyElixir.SourceControlTransportCoverageTest do
   use ExUnit.Case, async: false
 
+  import SymphonyElixir.ProcessTestSupport,
+    only: [
+      eventually_value: 1,
+      monitored_process: 1,
+      read_pid: 1,
+      refute_os_process_alive: 1
+    ]
+
   alias SymphonyElixir.SourceControl.Transport
   alias SymphonyElixir.SourceControl.Transport.{Git, HTTP}
 
@@ -1170,19 +1178,6 @@ defmodule SymphonyElixir.SourceControlTransportCoverageTest do
   defp restore_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
   defp restore_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
 
-  defp monitored_process(pid) do
-    case Process.info(pid, :monitors) do
-      {:monitors, monitors} ->
-        Enum.find_value(monitors, fn
-          {:process, monitored_pid} -> monitored_pid
-          _other -> nil
-        end)
-
-      nil ->
-        nil
-    end
-  end
-
   defp transport_config(responses, options \\ []) do
     {:ok, agent} = Agent.start_link(fn -> responses end)
 
@@ -1380,53 +1375,5 @@ defmodule SymphonyElixir.SourceControlTransportCoverageTest do
       end
     end)
     |> Map.new()
-  end
-
-  defp read_pid(path) do
-    case File.read(path) do
-      {:ok, pid} ->
-        pid
-        |> String.trim()
-        |> Integer.parse()
-        |> case do
-          {pid, ""} -> pid
-          _invalid -> nil
-        end
-
-      {:error, _reason} ->
-        nil
-    end
-  end
-
-  defp refute_os_process_alive(pid) when is_integer(pid) do
-    assert eventually_value(fn ->
-             if not os_process_alive?(pid), do: true
-           end),
-           "expected OS process #{pid} to stop"
-  end
-
-  defp eventually_value(fun, attempts \\ 200)
-  defp eventually_value(_fun, 0), do: nil
-
-  defp eventually_value(fun, attempts) do
-    case fun.() do
-      nil ->
-        Process.sleep(20)
-        eventually_value(fun, attempts - 1)
-
-      false ->
-        Process.sleep(20)
-        eventually_value(fun, attempts - 1)
-
-      value ->
-        value
-    end
-  end
-
-  defp os_process_alive?(pid) do
-    case System.cmd("kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true) do
-      {_output, 0} -> true
-      {_output, _status} -> false
-    end
   end
 end

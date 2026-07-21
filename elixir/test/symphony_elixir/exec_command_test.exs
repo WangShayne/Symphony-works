@@ -1,6 +1,9 @@
 defmodule SymphonyElixir.ExecCommandTest do
   use ExUnit.Case, async: false
 
+  import SymphonyElixir.ProcessTestSupport,
+    only: [eventually_value: 1, os_process_alive?: 1, refute_os_process_alive: 1]
+
   alias SymphonyElixir.ExecCommand
 
   test "run preserves argv, output streams, and normal exit status without descendant residue" do
@@ -863,38 +866,6 @@ defmodule SymphonyElixir.ExecCommandTest do
     refute File.exists?(control.path)
     refute File.exists?(control.secret_path)
     refute_os_process_alive(control.reader_os_pid)
-  end
-
-  defp refute_os_process_alive(pid) when is_integer(pid) do
-    assert eventually_value(fn ->
-             if not os_process_alive?(pid), do: true
-           end),
-           "expected OS process #{pid} to stop"
-  end
-
-  defp eventually_value(fun, attempts \\ 200)
-  defp eventually_value(_fun, 0), do: nil
-
-  defp eventually_value(fun, attempts) do
-    case fun.() do
-      nil ->
-        Process.sleep(20)
-        eventually_value(fun, attempts - 1)
-
-      false ->
-        Process.sleep(20)
-        eventually_value(fun, attempts - 1)
-
-      value ->
-        value
-    end
-  end
-
-  defp os_process_alive?(pid) do
-    case System.cmd("kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true) do
-      {_output, 0} -> true
-      {_output, _status} -> false
-    end
   end
 
   defp control_entries(control_dir) do

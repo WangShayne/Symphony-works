@@ -145,7 +145,6 @@ defmodule SymphonyElixir.Audit do
   defp normalize_name(value) when is_binary(value), do: value
   defp normalize_name(_value), do: "invalid"
 
-  defp normalize_optional_string(nil), do: nil
   defp normalize_optional_string(value), do: normalize_name(value)
 
   defp redact_name(value), do: value |> normalize_name() |> Redactor.redact()

@@ -322,6 +322,22 @@ defmodule SymphonyElixir.AuditTest do
     refute with_dedupe.valid?
   end
 
+  test "unsupported plan revision terms are rejected without persistence" do
+    assert {:error, %Ecto.Changeset{} = changeset} =
+             Audit.record(
+               :task_created,
+               %{
+                 target: %{type: "task", id: "task-invalid-plan-revision-term"},
+                 plan_revision: false,
+                 correlation_id: "correlation-invalid-plan-revision-term"
+               },
+               %{type: "service", id: "orchestrator"}
+             )
+
+    assert {"is invalid", _metadata} = Keyword.fetch!(changeset.errors, :plan_revision)
+    assert Audit.list(correlation_id: "correlation-invalid-plan-revision-term") == []
+  end
+
   test "redaction remains closed when a secret overlaps the redaction marker" do
     {:ok, _reference} = SecretStore.put("short-audit-token", "R", actor: "admin-1")
 

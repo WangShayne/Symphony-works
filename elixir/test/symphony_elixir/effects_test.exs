@@ -919,19 +919,41 @@ defmodule SymphonyElixir.EffectsTest do
       spawn(fn ->
         Effects.execute(attrs, BlockingAdapter,
           owner_id: owner_id,
-          lease_ttl_ms: 60
+          lease_ttl_ms: 600
         )
       end)
 
     assert_receive {:adapter_started, adapter_process}
+    initial_lease_expires_at = Effects.get!(operation_id).lease_expires_at
+    adapter_monitor = Process.monitor(adapter_process)
     caller_monitor = Process.monitor(caller)
     Process.exit(caller, :kill)
     assert_receive {:DOWN, ^caller_monitor, :process, ^caller, :killed}
 
-    Process.sleep(180)
+    assert eventually(fn ->
+             DateTime.compare(
+               Effects.get!(operation_id).lease_expires_at,
+               initial_lease_expires_at
+             ) == :gt
+           end)
+
+    first_renewed_lease_expires_at = Effects.get!(operation_id).lease_expires_at
+
+    assert eventually(fn ->
+             DateTime.compare(
+               Effects.get!(operation_id).lease_expires_at,
+               first_renewed_lease_expires_at
+             ) == :gt
+           end)
+
+    assert eventually(
+             fn -> DateTime.compare(DateTime.utc_now(), initial_lease_expires_at) == :gt end,
+             100
+           )
+
+    assert Process.alive?(adapter_process)
     recovery = Effects.recover_orphans(owner_id: owner_id, now: DateTime.utc_now(), limit: 10)
 
-    adapter_monitor = Process.monitor(adapter_process)
     send(adapter_process, :finish)
     assert_receive {:DOWN, ^adapter_monitor, :process, ^adapter_process, :normal}
 

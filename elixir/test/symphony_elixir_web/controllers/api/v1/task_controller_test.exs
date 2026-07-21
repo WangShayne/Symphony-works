@@ -79,12 +79,35 @@ defmodule SymphonyElixirWeb.Api.V1.TaskControllerTest do
         assert data["configuration_revision_id"] == active.id
         assert data["status"] == "queued"
         assert data["effect"]["status"] == "succeeded"
-        assert [%{"id" => "unit-api", "status" => "pending"}] = data["units"]
+
+        assert [
+                 %{
+                   "id" => "unit-api",
+                   "status" => "pending",
+                   "model_reference_id" => "model-backend-primary"
+                 }
+               ] = data["units"]
+
+        shown =
+          conn
+          |> api_conn(operator)
+          |> get("/api/v1/tasks/#{task_id}")
+          |> json_response(200)
+
+        assert [
+                 %{
+                   "id" => "unit-api",
+                   "model_reference_id" => "model-backend-primary"
+                 }
+               ] = shown["data"]["units"]
 
         assert {:ok, snapshot} = Coordination.snapshot(task_id)
         assert snapshot.configuration_revision == active.id
         assert snapshot.effect_status == :succeeded
-        assert [%{id: "unit-api", status: :pending}] = snapshot.units
+
+        assert [%{id: "unit-api", status: :pending, model_reference_id: "model-backend-primary"}] =
+                 snapshot.units
+
         assert Configuration.pinned_for_task!(task_id).revision_id == active.id
 
         assert Effects.get!(operation_id).status == :succeeded

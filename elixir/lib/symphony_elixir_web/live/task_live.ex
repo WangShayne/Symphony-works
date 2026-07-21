@@ -189,15 +189,36 @@ defmodule SymphonyElixirWeb.TaskLive do
                       <th>{if @locale == "zh-CN", do: "单元", else: "Unit"}</th>
                       <th>{if @locale == "zh-CN", do: "类型", else: "Type"}</th>
                       <th>{if @locale == "zh-CN", do: "执行档案", else: "Profile"}</th>
+                      <th>{if @locale == "zh-CN", do: "模型", else: "Model"}</th>
                       <th>{if @locale == "zh-CN", do: "状态", else: "Status"}</th>
                     </tr>
                   </thead>
                   <tbody>
                     <tr :for={unit <- @task.units} data-unit-id={unit.id}>
-                      <td class="mono">{unit.id}</td>
-                      <td>{unit.task_type || "-"}</td>
-                      <td class="mono">{unit.execution_profile || "-"}</td>
-                      <td><span class={status_class(unit.status)}>{status_label(unit.status, @locale)}</span></td>
+                      <td
+                        class="mono"
+                        data-label={if @locale == "zh-CN", do: "单元", else: "Unit"}
+                      >
+                        {unit.id}
+                      </td>
+                      <td data-label={if @locale == "zh-CN", do: "类型", else: "Type"}>
+                        {unit.task_type || "-"}
+                      </td>
+                      <td
+                        class="mono"
+                        data-label={if @locale == "zh-CN", do: "执行档案", else: "Profile"}
+                      >
+                        {unit.execution_profile || "-"}
+                      </td>
+                      <td
+                        class="mono"
+                        data-label={if @locale == "zh-CN", do: "模型", else: "Model"}
+                      >
+                        {unit.model_reference_id || "-"}
+                      </td>
+                      <td data-label={if @locale == "zh-CN", do: "状态", else: "Status"}>
+                        <span class={status_class(unit.status)}>{status_label(unit.status, @locale)}</span>
+                      </td>
                     </tr>
                   </tbody>
                 </table>

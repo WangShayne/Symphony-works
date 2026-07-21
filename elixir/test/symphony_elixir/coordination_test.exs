@@ -203,6 +203,42 @@ defmodule SymphonyElixir.CoordinationTest do
     assert {:error, :invalid_task_id} = Coordination.start_task(attrs)
   end
 
+  test "snapshots expose model reference authority from unit planning only" do
+    {:ok, task} = Coordination.start_task(task_attrs("unit-model-reference"))
+
+    assert {:ok, 2} =
+             Coordination.append(task.id, 1, [
+               %{
+                 type: :unit_planned,
+                 data: %{
+                   unit_id: "backend-1",
+                   task_type: "backend",
+                   execution_profile_id: "profile-default",
+                   model_reference_id: "model-primary",
+                   dependencies: []
+                 }
+               }
+             ])
+
+    assert {:ok, planned} = Coordination.snapshot(task.id)
+    assert [%{id: "backend-1", model_reference_id: "model-primary"}] = planned.units
+
+    assert {:ok, 3} =
+             Coordination.append(task.id, 2, [
+               %{
+                 type: :unit_progress,
+                 data: %{
+                   unit_id: "backend-1",
+                   percent: 40,
+                   model_reference_id: "model-from-progress"
+                 }
+               }
+             ])
+
+    assert {:ok, progressed} = Coordination.snapshot(task.id)
+    assert [%{model_reference_id: "model-primary", data: %{"percent" => 40}}] = progressed.units
+  end
+
   test "rejects invalid unit dependency payloads before append persistence" do
     {:ok, task} = Coordination.start_task(task_attrs("invalid-unit-dependencies"))
 

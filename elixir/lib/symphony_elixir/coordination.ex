@@ -457,6 +457,7 @@ defmodule SymphonyElixir.Coordination do
       status: status_atom(unit.status),
       task_type: unit.task_type,
       execution_profile: unit.execution_profile,
+      model_reference_id: Map.get(unit.data || %{}, "model_reference_id"),
       dependencies: get_in(unit.dependencies || %{}, ["items"]) || [],
       data: unit.data || %{},
       created_at: unit.created_at,

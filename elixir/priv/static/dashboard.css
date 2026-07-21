@@ -519,7 +519,7 @@ pre,
 
 .unit-table {
   width: 100%;
-  min-width: 34rem;
+  min-width: 40rem;
   border-collapse: collapse;
   table-layout: fixed;
 }
@@ -1191,6 +1191,55 @@ pre,
 
   .task-state-strip > div:nth-child(-n + 2) {
     border-bottom: 1px solid var(--line);
+  }
+
+  .unit-table-wrap {
+    overflow-x: visible;
+  }
+
+  .unit-table {
+    min-width: 0;
+  }
+
+  .unit-table,
+  .unit-table thead,
+  .unit-table tbody,
+  .unit-table tr,
+  .unit-table th,
+  .unit-table td {
+    display: block;
+  }
+
+  .unit-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  .unit-table tr {
+    display: grid;
+    gap: 0.45rem;
+    padding: 0.72rem 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .unit-table td {
+    display: grid;
+    grid-template-columns: minmax(4.8rem, 32%) minmax(0, 1fr);
+    gap: 0.65rem;
+    align-items: start;
+    padding: 0;
+    border-bottom: 0;
+  }
+
+  .unit-table td::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-size: 0.72rem;
+    font-weight: 800;
   }
 
   .metric-grid {

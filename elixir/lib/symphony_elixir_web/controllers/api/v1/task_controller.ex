@@ -112,6 +112,7 @@ defmodule SymphonyElixirWeb.Api.V1.TaskController do
       status: atom_string(unit.status),
       task_type: unit.task_type,
       execution_profile_id: unit.execution_profile,
+      model_reference_id: unit.model_reference_id,
       dependencies: unit.dependencies
     }
   end

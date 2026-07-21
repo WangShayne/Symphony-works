@@ -40,6 +40,10 @@ defmodule SymphonyElixirWeb.TaskLiveTest do
     assert detail_html =~ "Effect succeeded"
     assert detail_html =~ "unit-live"
     assert detail_html =~ "backend"
+    assert detail_html =~ "Profile"
+    assert detail_html =~ "Model"
+    assert detail_html =~ "backend-default"
+    assert detail_html =~ "model-backend-primary"
     assert has_element?(detail, "[data-task-id='#{task_id}']")
     assert has_element?(detail, "[data-effect-status='succeeded']")
 
@@ -100,6 +104,10 @@ defmodule SymphonyElixirWeb.TaskLiveTest do
     assert zh_html =~ "排队中"
     assert zh_html =~ "外部操作已记录"
     assert zh_html =~ "执行单元"
+    assert zh_html =~ "执行档案"
+    assert zh_html =~ "模型"
+    assert zh_html =~ "backend-default"
+    assert zh_html =~ "model-backend-primary"
 
     for {{status, label}, index} <- Enum.with_index(chinese_task_statuses()) do
       send(

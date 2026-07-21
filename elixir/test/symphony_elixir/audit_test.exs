@@ -20,6 +20,7 @@ defmodule SymphonyElixir.AuditTest do
     system_prompt = "system prompt must not persist"
     developer_instructions = "developer instructions must not persist"
     chat_messages = "chat messages must not persist"
+    private_key = "-----BEGIN PRIVATE KEY-----audit-event-----END PRIVATE KEY-----"
     {:ok, reference} = SecretStore.put("audit-test-token", plaintext, actor: "admin-1")
     test_pid = self()
 
@@ -41,11 +42,17 @@ defmodule SymphonyElixir.AuditTest do
               outcome: :succeeded,
               correlation_id: "correlation-1",
               token: plaintext,
+              reference: reference.id,
+              private_key: private_key,
               prompt: prompt,
               systemPrompt: system_prompt,
               developerInstructions: developer_instructions,
               chatMessages: chat_messages,
-              summary: %{changed: ["models"], note: "Bearer #{plaintext}"}
+              summary: %{
+                changed: ["models"],
+                note: "Bearer #{plaintext}",
+                reference_note: "ref #{reference.id}"
+              }
             },
             %{type: "administrator", id: "admin-1"}
           )
@@ -63,18 +70,25 @@ defmodule SymphonyElixir.AuditTest do
     assert event.outcome == "succeeded"
     assert event.correlation_id == "correlation-1"
     assert event.payload["token"] == "[REDACTED]"
+    assert event.payload["reference"] == "[REDACTED]"
+    assert event.payload["private_key"] == "[REDACTED]"
     assert event.payload["prompt"] == "[PROMPT REDACTED]"
     assert event.payload["prompt_truncated"] == true
     assert event.payload["systemPrompt"] == "[PROMPT REDACTED]"
     assert event.payload["developerInstructions"] == "[PROMPT REDACTED]"
     assert event.payload["chatMessages"] == "[PROMPT REDACTED]"
     assert event.payload["summary"]["note"] == "Bearer [REDACTED]"
+    assert event.payload["summary"]["reference_note"] == "ref [REDACTED]"
     refute inspect(event) =~ plaintext
+    refute inspect(event) =~ reference.id
+    refute inspect(event) =~ private_key
     refute inspect(event) =~ prompt
     refute inspect(event) =~ system_prompt
     refute inspect(event) =~ developer_instructions
     refute inspect(event) =~ chat_messages
     refute log =~ plaintext
+    refute log =~ reference.id
+    refute log =~ private_key
     refute log =~ prompt
 
     assert [listed] = Audit.list(task_id: "task-1")
@@ -89,10 +103,39 @@ defmodule SymphonyElixir.AuditTest do
              )
 
     refute inspect(rows) =~ plaintext
+    refute inspect(rows) =~ reference.id
+    refute inspect(rows) =~ private_key
     refute inspect(rows) =~ prompt
     refute inspect(rows) =~ system_prompt
     refute inspect(rows) =~ developer_instructions
     refute inspect(rows) =~ chat_messages
+  end
+
+  test "redactor removes registered secret references and expanded sensitive keys" do
+    plaintext = "audit-reference-secret-#{System.unique_integer([:positive])}"
+    private_key = "-----BEGIN PRIVATE KEY-----audit-redactor-----END PRIVATE KEY-----"
+    {:ok, reference} = SecretStore.put("audit-reference-token", plaintext, actor: "admin-1")
+
+    redacted =
+      Redactor.redact(%{
+        "summary" => %{
+          "reference" => reference.id,
+          "nested" => ["Bearer #{reference.id}", "Bearer #{plaintext}"],
+          "private_key" => private_key,
+          "clientSecret" => "client-secret-value"
+        }
+      })
+
+    assert redacted["summary"]["reference"] == "[REDACTED]"
+    assert redacted["summary"]["nested"] == ["Bearer [REDACTED]", "Bearer [REDACTED]"]
+    assert redacted["summary"]["private_key"] == "[REDACTED]"
+    assert redacted["summary"]["clientSecret"] == "[REDACTED]"
+
+    serialized = inspect(redacted, limit: :infinity, printable_limit: :infinity)
+    refute serialized =~ reference.id
+    refute serialized =~ plaintext
+    refute serialized =~ private_key
+    refute serialized =~ "client-secret-value"
   end
 
   test "database triggers reject updates and deletes of audit events" do

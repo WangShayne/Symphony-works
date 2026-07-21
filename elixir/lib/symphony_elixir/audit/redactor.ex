@@ -10,7 +10,7 @@ defmodule SymphonyElixir.Audit.Redactor do
   @redaction_unavailable "[REDACTION UNAVAILABLE]"
   @unsupported "[UNSUPPORTED VALUE]"
   @max_binary_bytes 2_048
-  @sensitive_key ~r/(authorization|cookie|credential|password|secret|token|api[_-]?key)/i
+  @sensitive_key ~r/(authorization|cookie|credential|password|secret|token|api[_-]?key|private[_-]?key|client[_-]?secret|signing[_-]?key)/i
 
   @prompt_key ~r/(?i:(^|[_-])(prompt|instructions?|messages?)([_-]|$))|[a-z0-9](Prompt|Instructions?|Messages?)([A-Z]|$)/
 
@@ -102,10 +102,12 @@ defmodule SymphonyElixir.Audit.Redactor do
     end)
   end
 
-  defp redact_with_reference(current, reference) do
+  defp redact_with_reference(current, %SecretStore.Reference{id: id} = reference) do
     quietly(fn ->
       CredentialBroker.with_secret(reference, :audit_redaction, fn plaintext ->
-        replace_plaintext(current, plaintext)
+        current
+        |> replace_plaintext(id)
+        |> replace_plaintext(plaintext)
       end)
     end)
   end

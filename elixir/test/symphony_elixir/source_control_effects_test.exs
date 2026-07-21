@@ -378,6 +378,76 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
              )
   end
 
+  test "change request follow-up actions reject descriptors outside the pinned integration" do
+    capture_source_control()
+
+    assert {:ok, github_reference} =
+             SecretStore.put("cr-provider-github", "github-cr-token", actor: "test")
+
+    assert {:ok, gitlab_reference} =
+             SecretStore.put("cr-provider-gitlab", "gitlab-cr-token", actor: "test")
+
+    github =
+      source_control_integration("github", SecretStore.export_reference(github_reference), %{
+        "repository" => "acme/provider-fence",
+        "base_branch" => "main"
+      })
+
+    gitlab =
+      source_control_integration("gitlab", SecretStore.export_reference(gitlab_reference), %{
+        "repository" => "acme/provider-fence",
+        "base_branch" => "main"
+      })
+
+    valid_change_request = %{
+      "provider" => "github",
+      "external_id" => "change-1",
+      "number" => 1,
+      "url" => "https://example.test/acme/provider-fence/change/1",
+      "repository" => "acme/provider-fence",
+      "head_branch" => "task/provider-fence",
+      "base_branch" => "main",
+      "title" => "Provider fence",
+      "draft" => true,
+      "disposition" => "created"
+    }
+
+    scenarios = [
+      {"github-config-gitlab-cr", github, Map.put(valid_change_request, "provider", "gitlab")},
+      {"gitlab-config-github-cr", gitlab, valid_change_request},
+      {"repository-mismatch", github, Map.put(valid_change_request, "repository", "acme/other")},
+      {"base-branch-mismatch", github, Map.put(valid_change_request, "base_branch", "develop")}
+    ]
+
+    for {suffix, config, change_request} <- scenarios,
+        {action, intent} <- [
+          {"set_draft", %{"config" => config, "change_request" => change_request, "draft" => false}},
+          {"close_or_comment",
+           %{
+             "config" => config,
+             "change_request" => change_request,
+             "action" => "comment",
+             "body" => "Provider fence"
+           }}
+        ] do
+      task_id = "source-control-cr-fence-#{suffix}-#{action}"
+      pin_integrations(task_id, [config])
+
+      assert {:error, :invalid_configuration} =
+               SourceControl.execute_effect(%{
+                 operation_id: OperationId.generate(),
+                 task_id: task_id,
+                 plan_revision: 1,
+                 unit_id: "integration",
+                 action: action,
+                 intent: intent
+               })
+
+      refute_receive {:source_control_config, ^action, _config}, 0
+      refute_receive {:source_control_invocation, _attrs}, 0
+    end
+  end
+
   test "effect preparation validates and canonicalizes the persisted boundary" do
     valid = fixture_effect(OperationId.generate(), "canonical")
 
@@ -388,7 +458,7 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
       |> put_in([:intent, :metadata], [:one, :two])
 
     assert {:ok, prepared} = EffectAdapter.prepare(atom_input)
-    assert prepared.intent["metadata"] == ["one", "two"]
+    refute Map.has_key?(prepared.intent, "metadata")
     assert prepared.provider == "fixture"
     assert prepared.target == "acme/canonical"
 
@@ -659,17 +729,17 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
       "draft" => true
     }
 
-    for {provider, disposition} <- [{"github", "created"}, {"gitlab", "updated"}] do
+    for disposition <- ["created", "updated"] do
       change_request =
         base_change_request
-        |> Map.put("provider", provider)
+        |> Map.put("provider", "fixture")
         |> Map.put("disposition", disposition)
 
       assert {:ok, %Record{status: :succeeded}} =
                execute_fixture_effect(
                  "set_draft",
                  %{"config" => config, "change_request" => change_request, "draft" => false},
-                 "rehydrate-#{provider}"
+                 "rehydrate-#{disposition}"
                )
     end
 
@@ -699,6 +769,19 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
       base_change_request
       |> Map.put("provider", "fixture")
       |> Map.put("disposition", "reconciled")
+
+    config_without_base_branch = update_in(config, ["settings"], &Map.delete(&1, "base_branch"))
+
+    assert {:ok, %Record{status: :succeeded}} =
+             execute_fixture_effect(
+               "set_draft",
+               %{
+                 "config" => config_without_base_branch,
+                 "change_request" => Map.put(valid_change_request, "base_branch", "release"),
+                 "draft" => false
+               },
+               "rehydrate-without-base-branch"
+             )
 
     assert {:error, :invalid_configuration} =
              execute_fixture_effect(

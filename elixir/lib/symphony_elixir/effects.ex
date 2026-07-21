@@ -132,6 +132,9 @@ defmodule SymphonyElixir.Effects do
       Redactor.contains_registered_secret?(normalized.target) ->
         {:error, :sensitive_target}
 
+      contains_registered_secret_identity?(normalized, [:task_id, :unit_id, :action, :provider]) ->
+        {:error, :sensitive_effect_identity}
+
       true ->
         {:ok, Map.put(normalized, :dedupe_hash, OperationId.dedupe_hash(normalized))}
     end
@@ -145,6 +148,14 @@ defmodule SymphonyElixir.Effects do
     else
       {:error, :invalid_effect}
     end
+  end
+
+  defp contains_registered_secret_identity?(normalized, fields) do
+    Enum.any?(fields, fn field ->
+      normalized
+      |> Map.fetch!(field)
+      |> Redactor.contains_registered_secret?()
+    end)
   end
 
   defp persist_record(attrs, changeset) do

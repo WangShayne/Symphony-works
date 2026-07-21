@@ -28,12 +28,19 @@ defmodule SymphonyElixir.SourceControl.EffectAdapter do
     set_draft
     close_or_comment
   )
+  @intent_keys %{
+    "ensure_remote_branch" => ~w(config branch),
+    "push_branch" => ~w(config branch commit_sha expected_remote_sha),
+    "ensure_change_request" => ~w(attrs),
+    "set_draft" => ~w(config change_request draft),
+    "close_or_comment" => ~w(config change_request action body)
+  }
   @providers ~w(fixture github gitlab)
 
   @spec prepare(map()) :: {:ok, map()} | {:error, :invalid_effect}
   def prepare(attrs) when is_map(attrs) do
     with {:ok, action} <- normalize_action(value(attrs, :action)),
-         {:ok, intent} <- normalize_intent(value(attrs, :intent)),
+         {:ok, intent} <- normalize_intent(action, value(attrs, :intent)),
          {:ok, config} <- config_for(action, intent),
          {:ok, provider} <- provider(config),
          {:ok, target} <- repository(config) do
@@ -79,9 +86,10 @@ defmodule SymphonyElixir.SourceControl.EffectAdapter do
 
   defp invocation(%Record{action: action, intent: intent} = record) do
     with {:ok, action} <- normalize_action(action),
-         {:ok, intent} <- normalize_intent(intent),
+         {:ok, intent} <- normalize_intent(action, intent),
          {:ok, intent_config} <- config_for(action, intent),
          {:ok, runtime} <- pinned_runtime(record, intent_config),
+         :ok <- validate_change_request_identity(action, intent, runtime.config),
          {:ok, intent} <- put_invocation_config(action, intent, runtime.config) do
       {:ok,
        %{
@@ -298,13 +306,44 @@ defmodule SymphonyElixir.SourceControl.EffectAdapter do
   defp normalize_action(action) when action in @supported_actions, do: {:ok, action}
   defp normalize_action(_action), do: {:error, :invalid_effect}
 
-  defp normalize_intent(intent) when is_map(intent) do
-    {:ok, json_value(intent)}
+  defp normalize_intent(action, intent) when is_map(intent) do
+    {:ok, intent |> json_value() |> Map.take(Map.fetch!(@intent_keys, action))}
   rescue
     _exception -> {:error, :invalid_effect}
   end
 
-  defp normalize_intent(_intent), do: {:error, :invalid_effect}
+  defp normalize_intent(_action, _intent), do: {:error, :invalid_effect}
+
+  defp validate_change_request_identity(action, intent, config)
+       when action in ["set_draft", "close_or_comment"] do
+    with {:ok, change_request} <- change_request(value(intent, :change_request)),
+         {:ok, provider} <- provider(config),
+         {:ok, repository} <- repository(config),
+         :ok <- exact_match(Atom.to_string(change_request.provider), provider),
+         :ok <- exact_match(change_request.repository, repository),
+         :ok <- validate_base_branch(change_request, config) do
+      :ok
+    else
+      _invalid -> {:error, :invalid_configuration}
+    end
+  end
+
+  defp validate_change_request_identity(_action, _intent, _config), do: :ok
+
+  defp validate_base_branch(%ChangeRequest{base_branch: base_branch}, config) do
+    base =
+      config
+      |> value(:settings)
+      |> value(:base_branch)
+
+    case base do
+      expected when is_binary(expected) and expected != "" -> exact_match(base_branch, expected)
+      _missing -> :ok
+    end
+  end
+
+  defp exact_match(value, expected) when is_binary(value) and value == expected, do: :ok
+  defp exact_match(_value, _expected), do: {:error, :invalid_configuration}
 
   defp json_value(%struct{} = value) when is_atom(struct),
     do: value |> Map.from_struct() |> json_value()

@@ -192,6 +192,30 @@ defmodule SymphonyElixir.EffectsTest do
     def reconcile(_record), do: {:unknown, :not_observed}
   end
 
+  defmodule SecretResultAdapter do
+    @moduledoc false
+
+    @spec execute(Effects.Record.t()) :: {:ok, map()}
+    def execute(_record) do
+      [{:plaintext, plaintext}] = :ets.lookup(:symphony_effects_test_adapter_state, :plaintext)
+      [{:reference_id, reference_id}] = :ets.lookup(:symphony_effects_test_adapter_state, :reference_id)
+      [{:private_key, private_key}] = :ets.lookup(:symphony_effects_test_adapter_state, :private_key)
+
+      {:ok,
+       %{
+         "metadata" => %{
+           "reference" => reference_id,
+           "registered_value" => plaintext,
+           "private_key" => private_key,
+           "nested" => [%{"privateKey" => private_key}]
+         }
+       }}
+    end
+
+    @spec reconcile(Effects.Record.t()) :: {:ok, :not_applied}
+    def reconcile(_record), do: {:ok, :not_applied}
+  end
+
   defmodule FailingAdapter do
     @moduledoc false
 
@@ -1155,6 +1179,94 @@ defmodule SymphonyElixir.EffectsTest do
 
     refute inspect(rows) =~ plaintext
     refute inspect(rows) =~ prompt
+  end
+
+  test "effect intent, results, rows, and logs never expose references or sensitive keys" do
+    plaintext = "effect-reference-secret-#{System.unique_integer([:positive])}"
+    private_key = "-----BEGIN PRIVATE KEY-----effect-row-----END PRIVATE KEY-----"
+    {:ok, reference} = SecretStore.put("effect-reference-token", plaintext, actor: "admin-1")
+    true = :ets.insert(@adapter_state, {:plaintext, plaintext})
+    true = :ets.insert(@adapter_state, {:reference_id, reference.id})
+    true = :ets.insert(@adapter_state, {:private_key, private_key})
+    operation_id = OperationId.generate()
+
+    attrs =
+      operation_id
+      |> effect_attrs()
+      |> put_in(
+        [:intent],
+        %{
+          "metadata" => %{
+            "reference" => reference.id,
+            "registered_value" => plaintext,
+            "private_key" => private_key,
+            "nested" => [%{"privateKey" => private_key}]
+          }
+        }
+      )
+
+    log =
+      capture_log(fn ->
+        assert {:ok, %Effects.Record{status: :succeeded}} = Effects.execute(attrs, SecretResultAdapter)
+      end)
+
+    persisted = [Effects.get!(operation_id), Effects.list(task_id: "task-1")]
+    serialized = inspect(persisted, limit: :infinity, printable_limit: :infinity)
+
+    refute serialized =~ reference.id
+    refute serialized =~ plaintext
+    refute serialized =~ private_key
+    refute log =~ reference.id
+    refute log =~ plaintext
+    refute log =~ private_key
+
+    assert {:ok, %{rows: rows}} =
+             SQL.query(
+               Repo,
+               """
+               select unit_id, action, provider, target, intent, result, error
+               from effect_records
+               where operation_id = ?
+               """,
+               [operation_id]
+             )
+
+    row = inspect(rows, limit: :infinity, printable_limit: :infinity)
+    refute row =~ reference.id
+    refute row =~ plaintext
+    refute row =~ private_key
+  end
+
+  test "registered secret references in effect identity fields fail before persistence" do
+    plaintext = "effect-identity-secret-#{System.unique_integer([:positive])}"
+    {:ok, reference} = SecretStore.put("effect-identity-token", plaintext, actor: "admin-1")
+
+    scenarios = [
+      {:task_id, "task-#{reference.id}", :sensitive_effect_identity},
+      {:unit_id, "unit-#{reference.id}", :sensitive_effect_identity},
+      {:action, "action-#{reference.id}", :sensitive_effect_identity},
+      {:provider, "provider-#{reference.id}", :sensitive_effect_identity},
+      {:target, "target-#{reference.id}", :sensitive_target}
+    ]
+
+    Enum.each(scenarios, fn {field, value, expected_error} ->
+      operation_id = OperationId.generate()
+      attrs = operation_id |> effect_attrs() |> Map.put(field, value)
+
+      log =
+        capture_log(fn ->
+          assert {:error, ^expected_error} = Effects.execute(attrs, PersistedIntentAdapter)
+        end)
+
+      assert_raise Ecto.NoResultsError, fn -> Effects.get!(operation_id) end
+      refute log =~ reference.id
+      refute log =~ plaintext
+    end)
+
+    assert Effects.list(task_id: "task-1") == []
+    assert {:ok, %{rows: rows}} = SQL.query(Repo, "select * from effect_records", [])
+    refute inspect(rows) =~ reference.id
+    refute inspect(rows) =~ plaintext
   end
 
   test "registered secret plaintext and references are rejected as mutation targets before insert" do

@@ -45,4 +45,38 @@ defmodule SymphonyElixir.Coordination.UnitProjectionTest do
     assert unit.data["worker_id"] == "worker-7"
     assert unit.data["percent"] == 25
   end
+
+  test "keeps default unit dependencies when planning event omits them" do
+    {:ok, task} =
+      Coordination.start_task(%{
+        idempotency_key: "unit-projection:missing-dependencies",
+        external_id: "TASK-MISSING-DEPS",
+        config_revision_id: Ecto.UUID.generate(),
+        baseline: "0123456789abcdef"
+      })
+
+    assert {:ok, 2} =
+             Coordination.append(task.id, 1, [
+               %{
+                 type: :unit_planned,
+                 data: %{
+                   unit_id: "docs-1",
+                   task_type: "documentation",
+                   execution_profile: "docs-default"
+                 }
+               }
+             ])
+
+    assert {:ok, snapshot} = Coordination.snapshot(task.id)
+
+    assert [
+             %{
+               id: "docs-1",
+               task_type: "documentation",
+               execution_profile: "docs-default",
+               dependencies: [],
+               data: %{}
+             }
+           ] = snapshot.units
+  end
 end

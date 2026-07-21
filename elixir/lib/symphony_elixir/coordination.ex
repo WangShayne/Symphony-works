@@ -543,7 +543,7 @@ defmodule SymphonyElixir.Coordination do
     redacted = Redactor.redact(value)
 
     case first_difference(value, redacted, []) do
-      nil -> reject_registered_secret(value, [])
+      nil -> :ok
       path -> {:error, {:sensitive_data, path}}
     end
   end
@@ -580,34 +580,6 @@ defmodule SymphonyElixir.Coordination do
 
   defp first_difference(value, value, _path), do: nil
   defp first_difference(_original, _redacted, path), do: Enum.reverse(path)
-
-  defp reject_registered_secret(value, path) when is_map(value) do
-    Enum.reduce_while(value, :ok, fn {key, child}, :ok ->
-      case reject_registered_secret(child, [key | path]) do
-        :ok -> {:cont, :ok}
-        error -> {:halt, error}
-      end
-    end)
-  end
-
-  defp reject_registered_secret(value, path) when is_list(value) do
-    Enum.reduce_while(Enum.with_index(value), :ok, fn {child, index}, :ok ->
-      case reject_registered_secret(child, [index | path]) do
-        :ok -> {:cont, :ok}
-        error -> {:halt, error}
-      end
-    end)
-  end
-
-  defp reject_registered_secret(value, path) when is_binary(value) do
-    if Redactor.contains_registered_secret?(value) do
-      {:error, {:sensitive_data, Enum.reverse(path)}}
-    else
-      :ok
-    end
-  end
-
-  defp reject_registered_secret(_value, _path), do: :ok
 
   defp canonical_task_id(value) when is_binary(value) do
     case Ecto.UUID.cast(value) do

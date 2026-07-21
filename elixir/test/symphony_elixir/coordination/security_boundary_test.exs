@@ -55,6 +55,20 @@ defmodule SymphonyElixir.Coordination.SecurityBoundaryTest do
                Coordination.start_task(Map.put(task_attrs(suffix), :metadata, value))
     end
 
+    assert {:error, {:sensitive_data, ["metadata", "outer", "reference"]}} =
+             Coordination.start_task(
+               Map.put(task_attrs("nested-reference-map"), :metadata, %{
+                 "outer" => %{"reference" => reference.id}
+               })
+             )
+
+    assert {:error, {:sensitive_data, ["metadata", 0, "reference"]}} =
+             Coordination.start_task(
+               Map.put(task_attrs("nested-reference-list"), :metadata, [
+                 %{"reference" => reference.id}
+               ])
+             )
+
     {:ok, task} = Coordination.start_task(task_attrs("safe-task"))
 
     for {key, suffix} <- [
@@ -77,6 +91,28 @@ defmodule SymphonyElixir.Coordination.SecurityBoundaryTest do
                  type: :effect_unknown,
                  actor: %{kind: :service, id: plaintext},
                  data: %{operation_id: "op-registered"}
+               }
+             ])
+
+    assert {:error, {:sensitive_data, ["metadata", "outer", "reference"]}} =
+             Coordination.append(task.id, 1, [
+               %{
+                 type: :effect_unknown,
+                 data: %{
+                   operation_id: "op-nested-reference-map",
+                   metadata: %{"outer" => %{"reference" => reference.id}}
+                 }
+               }
+             ])
+
+    assert {:error, {:sensitive_data, ["metadata", 0, "reference"]}} =
+             Coordination.append(task.id, 1, [
+               %{
+                 type: :effect_unknown,
+                 data: %{
+                   operation_id: "op-nested-reference-list",
+                   metadata: [%{"reference" => reference.id}]
+                 }
                }
              ])
 

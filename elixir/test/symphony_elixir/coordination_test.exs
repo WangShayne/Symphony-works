@@ -203,6 +203,46 @@ defmodule SymphonyElixir.CoordinationTest do
     assert {:error, :invalid_task_id} = Coordination.start_task(attrs)
   end
 
+  test "rejects invalid unit dependency payloads before append persistence" do
+    {:ok, task} = Coordination.start_task(task_attrs("invalid-unit-dependencies"))
+
+    assert {:error, :invalid_event_data} =
+             Coordination.append(task.id, 1, [
+               %{type: :planning_started, data: "not-an-event-map"}
+             ])
+
+    assert {:error, :invalid_event_data} =
+             Coordination.append(task.id, 1, [
+               %{
+                 type: :unit_planned,
+                 data: %{
+                   unit_id: "backend-1",
+                   task_type: "backend",
+                   execution_profile: "backend-default",
+                   dependencies: "frontend-1"
+                 }
+               }
+             ])
+
+    assert {:ok, %{version: 1, units: []}} = Coordination.snapshot(task.id)
+  end
+
+  test "reports unknown binary unit event identifiers without creating atoms" do
+    {:ok, task} = Coordination.start_task(task_attrs("unknown-unit-binary-event"))
+    event_type = "unit_never_existing_#{task.id}"
+
+    assert {:error, {:forbidden_event_fields, ^event_type, ["stream_version"]}} =
+             Coordination.append(task.id, 1, [
+               %{
+                 "type" => event_type,
+                 "stream_version" => 2,
+                 "data" => %{"unit_id" => "backend-1"}
+               }
+             ])
+
+    assert {:ok, %{version: 1, units: []}} = Coordination.snapshot(task.id)
+  end
+
   defp task_attrs(suffix) do
     %{
       idempotency_key: "github:WangShayne/Symphony-works:#{suffix}",

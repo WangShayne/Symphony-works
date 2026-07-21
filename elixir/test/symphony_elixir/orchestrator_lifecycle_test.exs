@@ -1,10 +1,22 @@
 defmodule SymphonyElixir.OrchestratorLifecycleTest do
   use SymphonyElixir.DataCase, async: false
 
-  alias SymphonyElixir.{AgentRuntimeSupervisor, Configuration, Coordination, Effects, OrchestratorLifecycle, Repo}
+  alias SymphonyElixir.{
+    AgentRuntimeSupervisor,
+    Configuration,
+    Coordination,
+    Effects,
+    Orchestrator,
+    OrchestratorLifecycle,
+    Repo,
+    TestSupport,
+    Workflow
+  }
+
   alias SymphonyElixir.Configuration.{Document, Revision}
   alias SymphonyElixir.Coordination.Lease
   alias SymphonyElixir.Effects.OperationId
+  alias SymphonyElixir.Tracker.Issue
 
   @active_name SymphonyElixir.TestActiveOrchestratorLifecycle
   @competing_name SymphonyElixir.TestCompetingOrchestratorLifecycle
@@ -92,9 +104,13 @@ defmodule SymphonyElixir.OrchestratorLifecycleTest do
   test "default startup options acquire and release lifecycle authority" do
     on_exit(fn -> stop_named_process(OrchestratorLifecycle) end)
 
+    assert OrchestratorLifecycle.runtime_lease() == nil
     assert {:ok, lifecycle} = OrchestratorLifecycle.start_link()
     assert Process.whereis(OrchestratorLifecycle) == lifecycle
+    assert %{name: "orchestrator", holder_id: holder_id} = OrchestratorLifecycle.runtime_lease()
+    assert is_binary(holder_id)
     assert :ok = GenServer.stop(lifecycle)
+    assert OrchestratorLifecycle.runtime_lease() == nil
   end
 
   test "invalid lifecycle options fail before acquiring authority" do
@@ -417,6 +433,172 @@ defmodule SymphonyElixir.OrchestratorLifecycleTest do
     assert_receive {:DOWN, ^orchestrator_monitor, :process, ^orchestrator, _reason}, 1_000
     refute Process.whereis(@orchestrator_name)
     assert :ok = release_lease_with_retry(takeover_lease)
+  end
+
+  @tag :stale_dispatch
+  test "stale orchestrator cannot dispatch after its lease expires and another owner takes over" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-stale-dispatch-#{System.unique_integer([:positive])}"
+      )
+
+    workflow_file = Path.join(test_root, "WORKFLOW.md")
+    hook_marker = Path.join(test_root, "before-run-started")
+    hook_fifo = Path.join(test_root, "before-run-blocker")
+    previous_workflow_file = Application.get_env(:symphony_elixir, :workflow_file_path)
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    Repo.delete_all(Lease)
+
+    issue = %Issue{
+      id: "issue-stale-dispatch",
+      identifier: "MT-STALE",
+      title: "Must not dispatch from a stale orchestrator",
+      description: "Lease owner A expired before polling",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-STALE",
+      labels: [],
+      dispatchable: true
+    }
+
+    on_exit(fn ->
+      resume_named_process(@active_name)
+      stop_named_process(@runtime_name)
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      restore_app_env(:workflow_file_path, previous_workflow_file)
+      File.rm_rf(test_root)
+      Repo.delete_all(Lease)
+    end)
+
+    File.mkdir_p!(test_root)
+    Workflow.set_workflow_file_path(workflow_file)
+
+    TestSupport.write_workflow_file!(workflow_file,
+      tracker_kind: "memory",
+      workspace_root: test_root,
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      hook_before_run: "mkfifo \"#{hook_fifo}\"; : > \"#{hook_marker}\"; read _ < \"#{hook_fifo}\"",
+      hook_timeout_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    assert {:ok, runtime} =
+             AgentRuntimeSupervisor.start_link(
+               name: @runtime_name,
+               lifecycle_enabled: true,
+               lifecycle_name: @active_name,
+               task_supervisor_name: @task_supervisor_name,
+               orchestrator_name: @orchestrator_name,
+               owner_id: "stale-dispatch-owner-a",
+               lease_ttl_ms: 200,
+               heartbeat_interval_ms: 50
+             )
+
+    Process.unlink(runtime)
+    lifecycle = Process.whereis(@active_name)
+    orchestrator = Process.whereis(@orchestrator_name)
+    assert is_pid(lifecycle)
+    assert is_pid(orchestrator)
+    assert wait_until(fn -> startup_poll_idle?(@orchestrator_name) end)
+    assert [] = Task.Supervisor.children(@task_supervisor_name)
+    initial_token = active_lease!().token
+
+    :erlang.suspend_process(lifecycle)
+    Process.sleep(260)
+
+    assert {:ok, takeover_lease} =
+             Coordination.acquire_lease("stale-dispatch-owner-b", ttl_ms: 30_000)
+
+    takeover_token = takeover_lease.token
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    send(orchestrator, :run_poll_cycle)
+    Process.sleep(100)
+
+    assert [] = Task.Supervisor.children(@task_supervisor_name)
+    refute File.exists?(hook_marker)
+    assert %{running: [], retrying: [], blocked: []} = Orchestrator.snapshot(@orchestrator_name, 1_000)
+
+    retry_token = make_ref()
+
+    :sys.replace_state(orchestrator, fn state ->
+      %{
+        state
+        | retry_attempts: %{
+            issue.id => %{
+              attempt: 1,
+              timer_ref: nil,
+              retry_token: retry_token,
+              due_at_ms: System.monotonic_time(:millisecond),
+              identifier: issue.identifier,
+              issue_url: issue.url,
+              error: "stale retry must not dispatch",
+              worker_host: nil,
+              workspace_path: nil
+            }
+          }
+      }
+    end)
+
+    send(orchestrator, {:retry_issue, issue.id, retry_token})
+    Process.sleep(100)
+
+    assert [] = Task.Supervisor.children(@task_supervisor_name)
+    assert %{retry_token: ^retry_token} = :sys.get_state(orchestrator).retry_attempts[issue.id]
+
+    running_ref = make_ref()
+    running_issue = %{issue | id: "issue-stale-running", identifier: "MT-RUNNING"}
+    blocked_issue = %{issue | id: "issue-stale-blocked", identifier: "MT-BLOCKED"}
+    running_entry = running_entry(running_issue, running_ref)
+    blocked_entry = blocked_entry(blocked_issue)
+
+    :sys.replace_state(orchestrator, fn state ->
+      %{
+        state
+        | running: %{running_issue.id => running_entry},
+          blocked: %{blocked_issue.id => blocked_entry},
+          claimed: MapSet.new([running_issue.id, blocked_issue.id])
+      }
+    end)
+
+    send(orchestrator, :run_poll_cycle)
+    Process.sleep(100)
+
+    state_after_stale_reconcile = :sys.get_state(orchestrator)
+    assert Map.fetch!(state_after_stale_reconcile.running, running_issue.id) == running_entry
+    assert Map.fetch!(state_after_stale_reconcile.blocked, blocked_issue.id) == blocked_entry
+    assert MapSet.equal?(state_after_stale_reconcile.claimed, MapSet.new([running_issue.id, blocked_issue.id]))
+
+    send(orchestrator, {:DOWN, running_ref, :process, self(), :normal})
+    Process.sleep(100)
+
+    state_after_stale_down = :sys.get_state(orchestrator)
+    assert Map.fetch!(state_after_stale_down.running, running_issue.id) == running_entry
+    assert state_after_stale_down.completed == MapSet.new()
+    assert state_after_stale_down.retry_attempts == state_after_stale_reconcile.retry_attempts
+
+    assert %{holder_id: "stale-dispatch-owner-b", token: ^takeover_token} = active_lease!()
+    assert :ok = Coordination.release_lease(takeover_lease)
+
+    assert {:ok, same_owner_lease} =
+             Coordination.acquire_lease("stale-dispatch-owner-a", ttl_ms: 30_000)
+
+    refute same_owner_lease.token == initial_token
+    same_owner_token = same_owner_lease.token
+
+    :sys.replace_state(orchestrator, fn state ->
+      %{state | running: %{}, blocked: %{}, claimed: MapSet.new(), retry_attempts: %{}}
+    end)
+
+    send(orchestrator, :run_poll_cycle)
+    Process.sleep(100)
+
+    assert [] = Task.Supervisor.children(@task_supervisor_name)
+    assert %{running: [], retrying: [], blocked: []} = Orchestrator.snapshot(@orchestrator_name, 1_000)
+    assert %{holder_id: "stale-dispatch-owner-a", token: ^same_owner_token} = active_lease!()
+    assert :ok = Coordination.release_lease(same_owner_lease)
   end
 
   test "unresolved startup recovery prevents the orchestrator sibling from starting" do
@@ -747,6 +929,80 @@ defmodule SymphonyElixir.OrchestratorLifecycleTest do
         catch
           :exit, _reason -> :ok
         end
+    end
+  end
+
+  defp resume_named_process(name) do
+    case Process.whereis(name) do
+      nil -> :ok
+      pid -> :erlang.resume_process(pid)
+    end
+  catch
+    :error, :badarg -> :ok
+  end
+
+  defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
+  defp restore_app_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
+
+  defp running_entry(issue, ref) do
+    %{
+      pid: self(),
+      ref: ref,
+      identifier: issue.identifier,
+      issue: issue,
+      worker_host: nil,
+      workspace_path: nil,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_app_server_pid: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      turn_count: 0,
+      retry_attempt: 0,
+      started_at: DateTime.utc_now()
+    }
+  end
+
+  defp blocked_entry(issue) do
+    %{
+      issue_id: issue.id,
+      identifier: issue.identifier,
+      issue: issue,
+      worker_host: nil,
+      workspace_path: nil,
+      session_id: nil,
+      error: "stale block must not release",
+      blocked_at: DateTime.utc_now(),
+      last_codex_message: nil,
+      last_codex_event: nil,
+      last_codex_timestamp: nil
+    }
+  end
+
+  defp startup_poll_idle?(orchestrator_name) do
+    case Orchestrator.snapshot(orchestrator_name, 100) do
+      %{polling: %{checking?: false}} -> true
+      _other -> nil
+    end
+  end
+
+  defp wait_until(fun, attempts \\ 50)
+  defp wait_until(_fun, 0), do: false
+
+  defp wait_until(fun, attempts) do
+    case fun.() do
+      true ->
+        true
+
+      _other ->
+        Process.sleep(10)
+        wait_until(fun, attempts - 1)
     end
   end
 

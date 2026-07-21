@@ -7,7 +7,16 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{
+    AgentRunner,
+    Config,
+    Coordination,
+    OrchestratorLifecycle,
+    StatusDashboard,
+    Tracker,
+    Workspace
+  }
+
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -33,7 +42,10 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :lifecycle_name,
+      :authority_lease,
       task_supervisor: SymphonyElixir.TaskSupervisor,
+      authority_required: false,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
@@ -65,6 +77,9 @@ defmodule SymphonyElixir.Orchestrator do
           tick_timer_ref: nil,
           tick_token: nil,
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
+          lifecycle_name: Keyword.get(opts, :lifecycle_name, OrchestratorLifecycle),
+          authority_required: Keyword.get(opts, :authority_required, false),
+          authority_lease: Keyword.get(opts, :authority_lease),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
         }
@@ -117,6 +132,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
+    state = refresh_authority_lease(state)
     state = maybe_dispatch(state)
     state = schedule_tick(state, state.poll_interval_ms)
     state = %{state | poll_check_in_progress: false}
@@ -129,20 +145,23 @@ defmodule SymphonyElixir.Orchestrator do
         {:DOWN, ref, :process, _pid, reason},
         %{running: running} = state
       ) do
-    case find_issue_id_for_ref(running, ref) do
+    with :ok <- ensure_scheduling_authority(state),
+         issue_id when is_binary(issue_id) <- find_issue_id_for_ref(running, ref) do
+      {running_entry, state} = pop_running_entry(state, issue_id)
+      state = record_session_completion_totals(state, running_entry)
+      session_id = running_entry_session_id(running_entry)
+
+      state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
+
+      Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
+
+      notify_dashboard()
+      {:noreply, state}
+    else
       nil ->
         {:noreply, state}
 
-      issue_id ->
-        {running_entry, state} = pop_running_entry(state, issue_id)
-        state = record_session_completion_totals(state, running_entry)
-        session_id = running_entry_session_id(running_entry)
-
-        state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
-
-        Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
-
-        notify_dashboard()
+      {:error, _reason} ->
         {:noreply, state}
     end
   end
@@ -154,13 +173,19 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       running_entry ->
-        updated_running_entry =
-          running_entry
-          |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
-          |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+        case ensure_scheduling_authority(state) do
+          :ok ->
+            updated_running_entry =
+              running_entry
+              |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
+              |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
 
-        notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+            notify_dashboard()
+            {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+
+          {:error, _reason} ->
+            {:noreply, state}
+        end
     end
   end
 
@@ -173,15 +198,21 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       running_entry ->
-        {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
+        case ensure_scheduling_authority(state) do
+          :ok ->
+            {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
 
-        state =
-          state
-          |> apply_codex_token_delta(token_delta)
-          |> apply_codex_rate_limits(update)
+            state =
+              state
+              |> apply_codex_token_delta(token_delta)
+              |> apply_codex_rate_limits(update)
 
-        notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+            notify_dashboard()
+            {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+
+          {:error, _reason} ->
+            {:noreply, state}
+        end
     end
   end
 
@@ -189,9 +220,15 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
     result =
-      case pop_retry_attempt_state(state, issue_id, retry_token) do
-        {:ok, attempt, metadata, state} -> handle_retry_issue(state, issue_id, attempt, metadata)
-        :missing -> {:noreply, state}
+      case ensure_scheduling_authority(state) do
+        :ok ->
+          case pop_retry_attempt_state(state, issue_id, retry_token) do
+            {:ok, attempt, metadata, state} -> handle_retry_issue(state, issue_id, attempt, metadata)
+            :missing -> {:noreply, state}
+          end
+
+        {:error, _reason} ->
+          {:noreply, state}
       end
 
     notify_dashboard()
@@ -254,11 +291,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state) do
-    state =
-      state
-      |> reconcile_running_issues()
-      |> reconcile_blocked_issues()
+    case ensure_scheduling_authority(state) do
+      :ok ->
+        state =
+          state
+          |> reconcile_running_issues()
+          |> reconcile_blocked_issues()
 
+        do_maybe_dispatch(state)
+
+      {:error, _reason} ->
+        state
+    end
+  end
+
+  defp do_maybe_dispatch(%State{} = state) do
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
          true <- available_slots(state) > 0 do
@@ -939,44 +986,49 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
-    case Task.Supervisor.start_child(state.task_supervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
-         end) do
-      {:ok, pid} ->
-        ref = Process.monitor(pid)
+    with :ok <- ensure_scheduling_authority(state),
+         {:ok, pid} <-
+           Task.Supervisor.start_child(state.task_supervisor, fn ->
+             AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           end) do
+      ref = Process.monitor(pid)
 
-        Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
+      Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
 
-        running =
-          Map.put(state.running, issue.id, %{
-            pid: pid,
-            ref: ref,
-            identifier: issue.identifier,
-            issue: issue,
-            worker_host: worker_host,
-            workspace_path: nil,
-            session_id: nil,
-            last_codex_message: nil,
-            last_codex_timestamp: nil,
-            last_codex_event: nil,
-            codex_app_server_pid: nil,
-            codex_input_tokens: 0,
-            codex_output_tokens: 0,
-            codex_total_tokens: 0,
-            codex_last_reported_input_tokens: 0,
-            codex_last_reported_output_tokens: 0,
-            codex_last_reported_total_tokens: 0,
-            turn_count: 0,
-            retry_attempt: normalize_retry_attempt(attempt),
-            started_at: DateTime.utc_now()
-          })
+      running =
+        Map.put(state.running, issue.id, %{
+          pid: pid,
+          ref: ref,
+          identifier: issue.identifier,
+          issue: issue,
+          worker_host: worker_host,
+          workspace_path: nil,
+          session_id: nil,
+          last_codex_message: nil,
+          last_codex_timestamp: nil,
+          last_codex_event: nil,
+          codex_app_server_pid: nil,
+          codex_input_tokens: 0,
+          codex_output_tokens: 0,
+          codex_total_tokens: 0,
+          codex_last_reported_input_tokens: 0,
+          codex_last_reported_output_tokens: 0,
+          codex_last_reported_total_tokens: 0,
+          turn_count: 0,
+          retry_attempt: normalize_retry_attempt(attempt),
+          started_at: DateTime.utc_now()
+        })
 
-        %{
-          state
-          | running: running,
-            claimed: MapSet.put(state.claimed, issue.id),
-            retry_attempts: Map.delete(state.retry_attempts, issue.id)
-        }
+      %{
+        state
+        | running: running,
+          claimed: MapSet.put(state.claimed, issue.id),
+          retry_attempts: Map.delete(state.retry_attempts, issue.id)
+      }
+    else
+      {:error, :lease_lost} ->
+        Logger.warning("Skipping dispatch after orchestrator lease loss: #{issue_context(issue)}")
+        state
 
       {:error, reason} ->
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
@@ -1021,6 +1073,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
+    case ensure_scheduling_authority(state) do
+      :ok -> do_schedule_issue_retry(state, issue_id, attempt, metadata)
+      {:error, _reason} -> state
+    end
+  end
+
+  defp do_schedule_issue_retry(%State{} = state, issue_id, attempt, metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
     delay_ms = retry_delay(next_attempt, metadata)
@@ -1160,6 +1219,25 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp notify_dashboard do
     StatusDashboard.notify_update()
+  end
+
+  defp refresh_authority_lease(%State{authority_required: true, authority_lease: nil} = state) do
+    %{state | authority_lease: OrchestratorLifecycle.runtime_lease(state.lifecycle_name)}
+  end
+
+  defp refresh_authority_lease(%State{} = state), do: state
+
+  defp ensure_scheduling_authority(%State{authority_required: false}), do: :ok
+
+  defp ensure_scheduling_authority(%State{authority_lease: nil} = state) do
+    case OrchestratorLifecycle.runtime_lease(state.lifecycle_name) do
+      lease when is_map(lease) -> Coordination.heartbeat(lease)
+      _other -> {:error, :lease_lost}
+    end
+  end
+
+  defp ensure_scheduling_authority(%State{authority_lease: lease}) when is_map(lease) do
+    Coordination.heartbeat(lease)
   end
 
   defp handle_active_retry(state, issue, attempt, metadata) do

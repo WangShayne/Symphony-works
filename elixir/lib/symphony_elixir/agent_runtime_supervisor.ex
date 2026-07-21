@@ -52,6 +52,13 @@ defmodule SymphonyElixir.AgentRuntimeSupervisor do
         []
       end
 
+    orchestrator_opts = [
+      name: orchestrator_name,
+      task_supervisor: task_supervisor_name,
+      lifecycle_name: lifecycle_name,
+      authority_required: lifecycle_enabled
+    ]
+
     children =
       lifecycle_children ++
         [
@@ -60,7 +67,7 @@ defmodule SymphonyElixir.AgentRuntimeSupervisor do
             id: task_supervisor_name
           ),
           Supervisor.child_spec(
-            {SymphonyElixir.Orchestrator, name: orchestrator_name, task_supervisor: task_supervisor_name},
+            {SymphonyElixir.Orchestrator, orchestrator_opts},
             id: orchestrator_name
           )
         ]

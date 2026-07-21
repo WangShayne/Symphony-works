@@ -14,9 +14,12 @@ defmodule SymphonyElixir.OrchestratorLifecycle do
   @default_recovery_batch_size 100
   @default_startup_heartbeat_stop_timeout_ms 5_000
 
-  defstruct [:lease, :heartbeat_interval_ms, :heartbeat_timer_ref]
+  @lease_registry_key {__MODULE__, :lease}
+
+  defstruct [:name, :lease, :heartbeat_interval_ms, :heartbeat_timer_ref]
 
   @type state :: %__MODULE__{
+          name: GenServer.server(),
           lease: map(),
           heartbeat_interval_ms: pos_integer(),
           heartbeat_timer_ref: reference() | nil
@@ -28,8 +31,18 @@ defmodule SymphonyElixir.OrchestratorLifecycle do
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
+  @doc false
+  @spec runtime_lease(GenServer.server()) :: map() | nil
+  def runtime_lease(name \\ __MODULE__) do
+    case :persistent_term.get(lease_registry_key(name), nil) do
+      lease when is_map(lease) -> lease
+      _other -> nil
+    end
+  end
+
   @impl true
   def init(opts) do
+    name = Keyword.get(opts, :name, __MODULE__)
     owner_id = Keyword.get_lazy(opts, :owner_id, &OperationId.generate/0)
     ttl_ms = Keyword.get(opts, :lease_ttl_ms, @default_lease_ttl_ms)
 
@@ -75,6 +88,7 @@ defmodule SymphonyElixir.OrchestratorLifecycle do
         :ok ->
           finish_startup(
             startup_heartbeat,
+            name,
             lease,
             heartbeat_interval_ms,
             startup_heartbeat_stop_timeout_ms
@@ -101,6 +115,7 @@ defmodule SymphonyElixir.OrchestratorLifecycle do
   @impl true
   def terminate(_reason, %__MODULE__{lease: lease} = state) do
     cancel_heartbeat(state)
+    clear_runtime_lease(state.name, lease)
     _result = Coordination.release_lease(lease)
     :ok
   end
@@ -146,6 +161,7 @@ defmodule SymphonyElixir.OrchestratorLifecycle do
 
   defp finish_startup(
          startup_heartbeat,
+         name,
          lease,
          heartbeat_interval_ms,
          startup_heartbeat_stop_timeout_ms
@@ -153,7 +169,8 @@ defmodule SymphonyElixir.OrchestratorLifecycle do
     case stop_startup_heartbeat(startup_heartbeat, startup_heartbeat_stop_timeout_ms) do
       :ok ->
         Process.flag(:trap_exit, true)
-        state = %__MODULE__{lease: lease, heartbeat_interval_ms: heartbeat_interval_ms}
+        publish_runtime_lease(name, lease)
+        state = %__MODULE__{name: name, lease: lease, heartbeat_interval_ms: heartbeat_interval_ms}
         {:ok, schedule_heartbeat(state)}
 
       {:error, :startup_heartbeat_stop_timeout} ->
@@ -197,6 +214,18 @@ defmodule SymphonyElixir.OrchestratorLifecycle do
     _release_result = Coordination.release_lease(lease)
     :ok
   end
+
+  defp publish_runtime_lease(name, lease) do
+    :persistent_term.put(lease_registry_key(name), lease)
+    :ok
+  end
+
+  defp clear_runtime_lease(name, _lease) do
+    :persistent_term.erase(lease_registry_key(name))
+    :ok
+  end
+
+  defp lease_registry_key(name), do: {@lease_registry_key, name}
 
   defp acquire_lease(owner_id, ttl_ms) do
     case Coordination.acquire_lease(owner_id, ttl_ms: ttl_ms) do

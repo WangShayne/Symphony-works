@@ -1,7 +1,8 @@
 defmodule SymphonyElixir.OrchestratorLifecycleTest do
   use SymphonyElixir.DataCase, async: false
 
-  alias SymphonyElixir.{AgentRuntimeSupervisor, Coordination, Effects, OrchestratorLifecycle, Repo}
+  alias SymphonyElixir.{AgentRuntimeSupervisor, Configuration, Coordination, Effects, OrchestratorLifecycle, Repo}
+  alias SymphonyElixir.Configuration.{Document, Revision}
   alias SymphonyElixir.Coordination.Lease
   alias SymphonyElixir.Effects.OperationId
 
@@ -237,11 +238,24 @@ defmodule SymphonyElixir.OrchestratorLifecycleTest do
     assert orphan.status == :started
 
     source_control_operation_id = OperationId.generate()
+    source_control_task_id = "startup-source-control-recovery-task"
+
+    source_control_integration = %{
+      "id" => "startup-source-control",
+      "kind" => "source_control",
+      "provider" => "fixture",
+      "settings" => %{
+        "repository" => "acme/startup-recovery",
+        "base_branch" => "main"
+      }
+    }
+
+    pin_integrations(source_control_task_id, [source_control_integration])
 
     source_control_orphan =
       orphan_started(%{
         operation_id: source_control_operation_id,
-        task_id: "startup-source-control-recovery-task",
+        task_id: source_control_task_id,
         plan_revision: 1,
         unit_id: "startup-source-control-recovery-unit",
         action: :ensure_change_request,
@@ -249,13 +263,7 @@ defmodule SymphonyElixir.OrchestratorLifecycleTest do
         target: "acme/startup-recovery",
         intent: %{
           "attrs" => %{
-            "repo" => %{
-              "provider" => "fixture",
-              "settings" => %{
-                "repository" => "acme/startup-recovery",
-                "base_branch" => "main"
-              }
-            },
+            "repo" => source_control_integration,
             "head" => "task/startup-recovery",
             "base" => "main",
             "title" => "Recover source-control effect",
@@ -695,6 +703,37 @@ defmodule SymphonyElixir.OrchestratorLifecycleTest do
       if Process.whereis(@probe_name) == self(), do: Process.unregister(@probe_name)
       stop_named_process(@active_name)
     end)
+  end
+
+  defp pin_integrations(task_id, integrations) do
+    document = %{"integrations" => integrations}
+    content_hash = Document.content_hash(document)
+    timestamp = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    assert {:ok, revision} =
+             %Revision{}
+             |> Revision.draft_changeset(%{
+               document: document,
+               schema_version: 1,
+               content_hash: content_hash,
+               created_by: "test"
+             })
+             |> Repo.insert()
+
+    assert {:ok, revision} =
+             revision
+             |> Revision.activation_changeset(%{
+               validated_by: "test",
+               validation_evidence: %{"source" => "test"},
+               validated_at: timestamp,
+               activated_by: "test",
+               activated_at: timestamp
+             })
+             |> Ecto.Changeset.put_change(:status, :superseded)
+             |> Repo.update()
+
+    assert {:ok, _pin} =
+             Configuration.pin_for_task(task_id, revision_id: revision.id, actor: "test")
   end
 
   defp stop_named_process(name) do

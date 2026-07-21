@@ -236,7 +236,20 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
       [Effects.get!(operation_id), Effects.list(task_id: task_id)]
       |> inspect(limit: :infinity, printable_limit: :infinity)
 
-    for sensitive <- [pinned_secret, current_secret, pinned_reference_id, current_reference_id] do
+    for sensitive <- [
+          pinned_secret,
+          current_secret,
+          pinned_reference_id,
+          current_reference_id,
+          "https://pinned.example.test/api/v3",
+          "https://pinned.example.test",
+          "pinned-bot",
+          "pinned-origin",
+          "https://current.example.test/api/v3",
+          "https://current.example.test",
+          "current-bot",
+          "current-origin"
+        ] do
       refute persisted =~ sensitive
       refute log =~ sensitive
     end
@@ -309,9 +322,11 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
     ]
 
     Enum.each(intents, fn {action, intent} ->
+      operation_id = OperationId.generate()
+
       assert {:ok, %Record{status: :succeeded}} =
                SourceControl.execute_effect(%{
-                 operation_id: OperationId.generate(),
+                 operation_id: operation_id,
                  task_id: task_id,
                  plan_revision: 1,
                  unit_id: "integration",
@@ -323,6 +338,23 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
       assert invoked["settings"] == pinned["settings"]
       assert invoked["credential"] == pinned_secret
       refute Map.has_key?(invoked, "credential_ref")
+
+      persisted =
+        [Effects.get!(operation_id), Effects.list(task_id: task_id)]
+        |> inspect(limit: :infinity, printable_limit: :infinity)
+
+      for runtime_only <- [
+            "https://pinned-actions.example.test/api/v3",
+            "https://pinned-actions.example.test",
+            "pinned-actions-bot",
+            "pinned-actions-origin",
+            "https://current-actions.example.test/api/v3",
+            "https://current-actions.example.test",
+            "current-actions-bot",
+            "current-actions-origin"
+          ] do
+        refute persisted =~ runtime_only
+      end
     end)
   end
 

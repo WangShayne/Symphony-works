@@ -45,6 +45,8 @@ defmodule SymphonyElixir.SourceControl.EffectAdapter do
          {:ok, config} <- config_for(action, intent),
          {:ok, provider} <- provider(config),
          {:ok, target} <- repository(config) do
+      intent = persisted_intent(action, intent, config)
+
       {:ok,
        attrs
        |> drop_keys([:provider, "provider", :target, "target", :action, "action", :intent, "intent"])
@@ -270,6 +272,16 @@ defmodule SymphonyElixir.SourceControl.EffectAdapter do
   end
 
   defp config_for(_action, intent), do: map_value(intent, :config)
+
+  defp persisted_intent("ensure_change_request", intent, config) do
+    Map.update!(intent, "attrs", &Map.put(&1, "repo", persisted_config(config)))
+  end
+
+  defp persisted_intent(_action, intent, config) do
+    Map.put(intent, "config", persisted_config(config))
+  end
+
+  defp persisted_config(config), do: Map.take(config, ["id"])
 
   defp map_value(map, key) when is_map(map) do
     case value(map, key) do

@@ -37,6 +37,17 @@ defmodule SymphonyElixir.SourceControl.EffectAdapter do
   }
   @change_request_identity_key "identity_sha256"
   @providers ~w(fixture github gitlab)
+  @change_request_persisted_keys ~w(
+    provider
+    external_id
+    number
+    repository
+    head_branch
+    base_branch
+    title
+    draft?
+    disposition
+  )
 
   @spec prepare(map()) :: {:ok, map()} | {:error, :invalid_effect}
   def prepare(attrs) when is_map(attrs) do
@@ -277,6 +288,12 @@ defmodule SymphonyElixir.SourceControl.EffectAdapter do
     Map.update!(intent, "attrs", &Map.put(&1, "repo", persisted_config(config)))
   end
 
+  defp persisted_intent(action, intent, config) when action in ["set_draft", "close_or_comment"] do
+    intent
+    |> Map.put("config", persisted_config(config))
+    |> Map.update("change_request", nil, &encode_persisted_change_request/1)
+  end
+
   defp persisted_intent(_action, intent, config) do
     Map.put(intent, "config", persisted_config(config))
   end
@@ -391,9 +408,43 @@ defmodule SymphonyElixir.SourceControl.EffectAdapter do
 
   defp encode_change_request_result(%ChangeRequest{} = change_request) do
     change_request
-    |> json_value()
+    |> encode_persisted_change_request()
     |> put_change_request_identity()
   end
+
+  defp encode_persisted_change_request(%ChangeRequest{} = change_request) do
+    %{
+      "provider" => change_request.provider,
+      "external_id" => change_request.external_id,
+      "number" => change_request.number,
+      "repository" => change_request.repository,
+      "head_branch" => change_request.head_branch,
+      "base_branch" => change_request.base_branch,
+      "title" => change_request.title,
+      "draft?" => change_request.draft?,
+      "disposition" => change_request.disposition
+    }
+    |> json_value()
+  end
+
+  defp encode_persisted_change_request(attrs) when is_map(attrs) do
+    attrs
+    |> json_value()
+    |> then(fn change_request ->
+      change_request
+      |> Map.take(@change_request_persisted_keys)
+      |> Map.put("draft?", draft_value(change_request))
+      |> maybe_put_change_request_identity(value(change_request, :identity_sha256))
+    end)
+  end
+
+  defp encode_persisted_change_request(_attrs), do: nil
+
+  defp maybe_put_change_request_identity(change_request, identity)
+       when is_binary(identity) and byte_size(identity) > 0,
+       do: Map.put(change_request, @change_request_identity_key, identity)
+
+  defp maybe_put_change_request_identity(change_request, _identity), do: change_request
 
   defp put_change_request_identity(change_request) do
     Map.put(change_request, @change_request_identity_key, change_request_identity_hash(change_request))

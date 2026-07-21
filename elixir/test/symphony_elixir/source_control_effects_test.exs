@@ -4,6 +4,7 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
   import ExUnit.CaptureLog
 
   alias Ecto.Adapters.SQL
+  alias SymphonyElixir.Audit
   alias SymphonyElixir.Configuration
   alias SymphonyElixir.Configuration.{Revision, TaskPin}
   alias SymphonyElixir.Effects
@@ -11,6 +12,7 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
   alias SymphonyElixir.Repo
   alias SymphonyElixir.Security.SecretStore
   alias SymphonyElixir.SourceControl
+  alias SymphonyElixir.SourceControl.ChangeRequest
   alias SymphonyElixir.SourceControl.EffectAdapter
 
   defmodule UnknownOutcomeAdapter do
@@ -64,6 +66,62 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
          "action" => action,
          "provider" => config["provider"],
          "repository" => get_in(config, ["settings", "repository"])
+       }}
+    end
+  end
+
+  defmodule FullChangeRequestSourceControl do
+    def ensure_change_request(attrs, _opts) do
+      send(
+        Application.fetch_env!(:symphony_elixir, :source_control_effect_capture_pid),
+        {:source_control_invocation, attrs}
+      )
+
+      repo = get_in(attrs, ["repo"])
+      canary_url = Application.fetch_env!(:symphony_elixir, :source_control_effect_canary_url)
+
+      result = %ChangeRequest{
+        provider: String.to_existing_atom(repo["provider"]),
+        external_id: "provider-change-9",
+        number: 9,
+        url: canary_url,
+        repository: get_in(repo, ["settings", "repository"]),
+        head_branch: attrs["head"],
+        base_branch: attrs["base"],
+        title: attrs["title"],
+        draft?: attrs["draft"],
+        disposition: :created
+      }
+
+      send(
+        Application.fetch_env!(:symphony_elixir, :source_control_effect_capture_pid),
+        {:source_control_result, result}
+      )
+
+      {:ok, result}
+    end
+
+    def set_draft(_config, change_request, opts) do
+      send(
+        Application.fetch_env!(:symphony_elixir, :source_control_effect_capture_pid),
+        {:source_control_followup, "set_draft", change_request}
+      )
+
+      {:ok, %{change_request | draft?: Keyword.fetch!(opts, :draft), disposition: :updated}}
+    end
+
+    def close_or_comment(_config, change_request, _opts) do
+      send(
+        Application.fetch_env!(:symphony_elixir, :source_control_effect_capture_pid),
+        {:source_control_followup, "close_or_comment", change_request}
+      )
+
+      {:ok,
+       %{
+         "provider" => Atom.to_string(change_request.provider),
+         "external_id" => change_request.external_id,
+         "repository" => change_request.repository,
+         "disposition" => "updated"
        }}
     end
   end
@@ -177,6 +235,157 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
     refute serialized =~ canary
     refute serialized =~ "credential"
     refute serialized =~ "transport"
+  end
+
+  test "successful provider change request results persist without remote URLs" do
+    capture_full_change_request_source_control()
+
+    canary_url =
+      "https://source-control-result-url-#{System.unique_integer([:positive])}.example.test/acme/result-url/pull/9"
+
+    Application.put_env(:symphony_elixir, :source_control_effect_canary_url, canary_url)
+
+    assert {:ok, reference} =
+             SecretStore.put("result-url-source-control", "provider-token", actor: "test")
+
+    reference_id = SecretStore.export_reference(reference)
+    operation_id = OperationId.generate()
+    task_id = "result-url-#{System.unique_integer([:positive])}"
+
+    pinned =
+      source_control_integration("github", reference_id, %{
+        "repository" => "acme/result-url",
+        "base_branch" => "main"
+      })
+
+    pin_integrations(task_id, [pinned])
+
+    attrs =
+      provider_effect(operation_id, "github")
+      |> Map.put(:task_id, task_id)
+      |> put_in([:intent, "attrs", "repo"], pinned)
+      |> put_in([:intent, "attrs", "head"], "task/result-url")
+      |> put_in([:intent, "attrs", "title"], "Result URL")
+
+    log =
+      capture_log(fn ->
+        assert {:ok, %Record{status: :succeeded} = record} = SourceControl.execute_effect(attrs)
+
+        assert record.result["provider"] == "github"
+        assert record.result["external_id"] == "provider-change-9"
+        assert record.result["number"] == 9
+        assert record.result["repository"] == "acme/result-url"
+        assert record.result["head_branch"] == "task/result-url"
+        assert record.result["base_branch"] == "main"
+        assert record.result["title"] == "Result URL"
+        assert record.result["draft?"] == true
+        assert record.result["disposition"] == "created"
+        assert is_binary(record.result["identity_sha256"])
+        refute Map.has_key?(record.result, "url")
+      end)
+
+    assert_receive {:source_control_invocation, %{"repo" => invoked}}
+    assert invoked["credential"] == "provider-token"
+
+    assert_receive {:source_control_result, %ChangeRequest{url: ^canary_url}}
+
+    persisted = Effects.get!(operation_id)
+    refute Map.has_key?(persisted.result, "url")
+    refute persisted.result |> inspect(limit: :infinity, printable_limit: :infinity) =~ canary_url
+    refute persisted.result |> inspect(limit: :infinity, printable_limit: :infinity) =~ "https://"
+    refute persisted.result |> inspect(limit: :infinity, printable_limit: :infinity) =~ "http://"
+
+    assert {:ok, %{rows: rows}} =
+             SQL.query(
+               Repo,
+               "select result from effect_records where operation_id = ?",
+               [operation_id]
+             )
+
+    row = inspect(rows, limit: :infinity, printable_limit: :infinity)
+    refute row =~ canary_url
+    refute row =~ "https://"
+    refute row =~ "http://"
+
+    refute log =~ canary_url
+
+    refute Audit.list(task_id: task_id) |> inspect(limit: :infinity, printable_limit: :infinity) =~
+             canary_url
+
+    change_request = Map.put(persisted.result, "url", canary_url)
+
+    assert {:ok, %Record{status: :succeeded} = draft_record} =
+             SourceControl.execute_effect(%{
+               operation_id: OperationId.generate(),
+               task_id: task_id,
+               plan_revision: 1,
+               unit_id: "integration",
+               action: "set_draft",
+               intent: %{"config" => pinned, "change_request" => change_request, "draft" => false}
+             })
+
+    assert_receive {:source_control_followup, "set_draft",
+                    %ChangeRequest{
+                      provider: :github,
+                      external_id: "provider-change-9",
+                      number: 9,
+                      url: nil,
+                      repository: "acme/result-url",
+                      head_branch: "task/result-url",
+                      base_branch: "main",
+                      title: "Result URL",
+                      draft?: true,
+                      disposition: :created
+                    }}
+
+    assert {:ok, %Record{status: :succeeded} = comment_record} =
+             SourceControl.execute_effect(%{
+               operation_id: OperationId.generate(),
+               task_id: task_id,
+               plan_revision: 1,
+               unit_id: "integration",
+               action: "close_or_comment",
+               intent: %{
+                 "config" => pinned,
+                 "change_request" => change_request,
+                 "action" => "comment",
+                 "body" => "Result URL remains out of persistence"
+               }
+             })
+
+    assert_receive {:source_control_followup, "close_or_comment",
+                    %ChangeRequest{
+                      provider: :github,
+                      external_id: "provider-change-9",
+                      number: 9,
+                      url: nil,
+                      repository: "acme/result-url",
+                      head_branch: "task/result-url",
+                      base_branch: "main",
+                      title: "Result URL",
+                      draft?: true,
+                      disposition: :created
+                    }}
+
+    persisted_followups =
+      [draft_record, comment_record]
+      |> inspect(limit: :infinity, printable_limit: :infinity)
+
+    refute persisted_followups =~ canary_url
+    refute persisted_followups =~ "https://"
+    refute persisted_followups =~ "http://"
+
+    assert {:ok, %{rows: rows}} =
+             SQL.query(
+               Repo,
+               "select intent, result from effect_records where task_id = ?",
+               [task_id]
+             )
+
+    rows = inspect(rows, limit: :infinity, printable_limit: :infinity)
+    refute rows =~ canary_url
+    refute rows =~ "https://"
+    refute rows =~ "http://"
   end
 
   test "execution uses the complete pinned integration without persisting credential material" do
@@ -630,6 +839,7 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
 
     invalid_with_reference =
       github_attrs
+      |> Map.put(:operation_id, OperationId.generate())
       |> put_in(
         [:intent, "attrs", "repo", "credential_ref"],
         reference_id
@@ -1004,6 +1214,26 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
     on_exit(fn ->
       restore_env(:source_control_effect_invoker, previous_invoker)
       restore_env(:source_control_effect_capture_pid, previous_capture_pid)
+    end)
+  end
+
+  defp capture_full_change_request_source_control do
+    previous_invoker = Application.get_env(:symphony_elixir, :source_control_effect_invoker)
+    previous_capture_pid = Application.get_env(:symphony_elixir, :source_control_effect_capture_pid)
+    previous_canary_url = Application.get_env(:symphony_elixir, :source_control_effect_canary_url)
+
+    Application.put_env(
+      :symphony_elixir,
+      :source_control_effect_invoker,
+      FullChangeRequestSourceControl
+    )
+
+    Application.put_env(:symphony_elixir, :source_control_effect_capture_pid, self())
+
+    on_exit(fn ->
+      restore_env(:source_control_effect_invoker, previous_invoker)
+      restore_env(:source_control_effect_capture_pid, previous_capture_pid)
+      restore_env(:source_control_effect_canary_url, previous_canary_url)
     end)
   end
 

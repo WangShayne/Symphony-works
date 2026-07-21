@@ -30,6 +30,7 @@ defmodule SymphonyElixir.Effects do
   @poll_interval 10
   @runtime_owner_key {__MODULE__, :runtime_owner}
   @max_owner_bytes 255
+  @semantic_fields [:task_id, :plan_revision, :unit_id, :action, :provider, :target, :intent]
 
   @type execute_error :: atom()
 
@@ -175,17 +176,23 @@ defmodule SymphonyElixir.Effects do
 
   defp resolve_insert_conflict(attrs) do
     case Repo.get(Record, attrs.operation_id) do
-      %Record{dedupe_hash: dedupe_hash} = record when dedupe_hash == attrs.dedupe_hash ->
-        {:ok, record}
-
-      %Record{} ->
-        {:error, :operation_id_conflict}
+      %Record{} = record ->
+        resolve_existing_record(record, attrs, :operation_id_conflict)
 
       nil ->
         case Repo.get_by(Record, dedupe_hash: attrs.dedupe_hash) do
-          %Record{} = record -> {:ok, record}
+          %Record{} = record -> resolve_existing_record(record, attrs, :dedupe_conflict)
+          nil -> {:error, :effect_persistence_failed}
         end
     end
+  end
+
+  defp resolve_existing_record(%Record{} = record, attrs, conflict_reason) do
+    if persisted_semantics_equal?(record, attrs), do: {:ok, record}, else: {:error, conflict_reason}
+  end
+
+  defp persisted_semantics_equal?(%Record{} = record, attrs) do
+    Enum.all?(@semantic_fields, fn field -> Map.fetch!(record, field) == Map.fetch!(attrs, field) end)
   end
 
   defp dispatch(%Record{status: :planned} = record, adapter, context) do

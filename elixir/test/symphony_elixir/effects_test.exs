@@ -345,6 +345,35 @@ defmodule SymphonyElixir.EffectsTest do
     assert OperationId.dedupe_hash(typed) == OperationId.dedupe_hash(reordered)
   end
 
+  test "dedupe conflicts compare persisted mutation intent before reusing a record" do
+    operation_id = OperationId.generate()
+    attrs = effect_attrs(operation_id) |> Map.put(:target, "repo#intent-conflict")
+
+    assert {:ok, original} = Effects.execute(attrs, CountingAdapter)
+
+    same_operation_conflict =
+      attrs
+      |> Map.put(:intent, %{"title" => "Different change request"})
+
+    assert {:error, :operation_id_conflict} =
+             Effects.execute(same_operation_conflict, CountingAdapter)
+
+    same_dedupe_conflict =
+      attrs
+      |> Map.put(:operation_id, OperationId.generate())
+      |> Map.put(:intent, %{"title" => "Another change request"})
+
+    assert {:error, :dedupe_conflict} =
+             Effects.execute(same_dedupe_conflict, CountingAdapter)
+
+    assert Effects.list(dedupe_hash: original.dedupe_hash) |> Enum.map(& &1.operation_id) == [
+             original.operation_id
+           ]
+
+    assert Effects.get!(original.operation_id).intent == %{"title" => "Draft change request"}
+    assert :ets.lookup(@adapter_state, :execute_count) == [{:execute_count, 1}]
+  end
+
   test "invalid effects and operation collisions fail through the public boundary" do
     assert {:error, :invalid_effect} = Effects.execute(:invalid, PersistedIntentAdapter)
     assert {:error, :invalid_effect} = Effects.execute(%{}, PersistedIntentAdapter, :invalid_opts)

@@ -71,6 +71,7 @@ defmodule SymphonyElixir.OrchestratorApplicationRestartTest do
       })
 
     assert orphan.status == :started
+    assert DateTime.compare(orphan.lease_expires_at, DateTime.utc_now()) == :gt
     assert {1, nil} = Repo.delete_all(from(projection in TaskProjection, where: projection.task_id == ^task.id))
     assert {:error, :not_found} = Coordination.snapshot(task.id)
 
@@ -109,7 +110,7 @@ defmodule SymphonyElixir.OrchestratorApplicationRestartTest do
       spawn(fn ->
         Effects.execute(attrs, BlockingAdapter,
           owner_id: "orchestrator-before-application-restart",
-          lease_ttl_ms: 60_000
+          lease_ttl_ms: 250
         )
       end)
 

@@ -49,7 +49,13 @@ defmodule SymphonyElixir.EffectsTest do
     @spec execute(Effects.Record.t()) :: {:ok, map()}
     def execute(record) do
       persisted = Effects.get!(record.operation_id)
-      {:ok, %{"persisted_status" => Atom.to_string(persisted.status)}}
+
+      {:ok,
+       %{
+         "callback_fence" => record.fencing_token,
+         "lookup_fence" => persisted.fencing_token,
+         "persisted_status" => Atom.to_string(persisted.status)
+       }}
     end
 
     @spec reconcile(Effects.Record.t()) :: {:ok, :not_applied}
@@ -122,6 +128,20 @@ defmodule SymphonyElixir.EffectsTest do
     end
   end
 
+  defmodule FenceObservingReconcileAdapter do
+    @moduledoc false
+
+    @spec execute(Effects.Record.t()) :: {:ok, map()}
+    def execute(_record), do: {:ok, %{"unexpected" => true}}
+
+    @spec reconcile(Effects.Record.t()) :: {:ok, :already_applied}
+    def reconcile(record) do
+      [{:test_pid, test_pid}] = :ets.lookup(:symphony_effects_test_adapter_state, :test_pid)
+      send(test_pid, {:reconcile_fencing_token, record.fencing_token})
+      {:ok, :already_applied}
+    end
+  end
+
   defmodule BlockingAdapter do
     @moduledoc false
 
@@ -132,6 +152,26 @@ defmodule SymphonyElixir.EffectsTest do
 
       receive do
         :finish -> {:ok, %{"finished" => true}}
+        {:finish, result} -> result
+      end
+    end
+
+    @spec reconcile(Effects.Record.t()) :: {:ok, :not_applied}
+    def reconcile(_record), do: {:ok, :not_applied}
+  end
+
+  defmodule TerminalBoundaryAdapter do
+    @moduledoc false
+
+    @spec execute(Effects.Record.t()) :: {:ok, map()}
+    def execute(_record) do
+      [{:test_pid, test_pid}] = :ets.lookup(:symphony_effects_test_adapter_state, :test_pid)
+      send(test_pid, {:boundary_adapter_started, self()})
+
+      receive do
+        :finish ->
+          send(test_pid, {:boundary_adapter_returned, self()})
+          {:ok, %{"finished" => true}}
       end
     end
 
@@ -220,16 +260,39 @@ defmodule SymphonyElixir.EffectsTest do
 
   test "intent is persisted before an external mutation starts" do
     operation_id = OperationId.generate()
+    hidden_token = Ecto.UUID.generate()
+
+    fence = %Effects.Fence{
+      operation_id: operation_id,
+      owner_id: "orchestrator-inspect",
+      token: hidden_token,
+      ttl_ms: 60_000
+    }
+
+    assert inspect(fence) =~ operation_id
+    refute inspect(fence) =~ hidden_token
 
     assert {:ok, executed} = Effects.execute(effect_attrs(operation_id), PersistedIntentAdapter)
-    assert executed.result == %{"persisted_status" => "started"}
+
+    assert executed.result == %{
+             "callback_fence" => nil,
+             "lookup_fence" => nil,
+             "persisted_status" => "started"
+           }
 
     assert {:ok, already_reconciled} = Effects.reconcile(operation_id, PersistedIntentAdapter)
     assert already_reconciled.operation_id == operation_id
 
     record = Effects.get!(operation_id)
     assert record.status == :succeeded
-    assert record.result == %{"persisted_status" => "started"}
+    assert record.fencing_token == nil
+    refute inspect(record) =~ "fencing_token"
+
+    assert record.result == %{
+             "callback_fence" => nil,
+             "lookup_fence" => nil,
+             "persisted_status" => "started"
+           }
   end
 
   test "operation identity is UUIDv7 and dedupe covers the stable mutation tuple" do
@@ -625,7 +688,7 @@ defmodule SymphonyElixir.EffectsTest do
     assert {:ok, _completed} = Task.await(caller)
   end
 
-  test "startup recovery leaves a current live lease alone" do
+  test "startup recovery cannot steal a live foreign-owner lease" do
     true = :ets.insert(@adapter_state, {:test_pid, self()})
     operation_id = OperationId.generate()
     attrs = operation_id |> effect_attrs() |> Map.put(:target, "repo#live-lease")
@@ -640,15 +703,17 @@ defmodule SymphonyElixir.EffectsTest do
 
     assert_receive {:adapter_started, adapter_process}
 
-    assert {:ok, %{recovered: [], pending: [], remaining: 0}} =
+    assert {:ok, %{recovered: [], pending: [], remaining: 0, next_check_at: next_check_at}} =
              Effects.recover_orphans(
-               owner_id: "current-orchestrator",
+               owner_id: "takeover-orchestrator",
                now: DateTime.utc_now(),
                limit: 10
              )
 
+    assert DateTime.compare(next_check_at, DateTime.utc_now()) == :gt
+
     assert {:error, :in_progress} =
-             Effects.reconcile(operation_id, ReconcileAsAppliedAdapter, owner_id: "current-orchestrator")
+             Effects.reconcile(operation_id, ReconcileAsAppliedAdapter, owner_id: "takeover-orchestrator")
 
     send(adapter_process, :finish)
     assert {:ok, completed} = Task.await(caller)
@@ -818,6 +883,229 @@ defmodule SymphonyElixir.EffectsTest do
 
     assert eventually(fn -> Effects.get!(operation_id).status == :succeeded end)
     assert Effects.get!(operation_id).result == %{"finished" => true}
+  end
+
+  test "the non-interruptible worker heartbeats after its caller is lost" do
+    true = :ets.insert(@adapter_state, {:test_pid, self()})
+    operation_id = OperationId.generate()
+    attrs = operation_id |> effect_attrs() |> Map.put(:target, "adapter#caller-loss-heartbeat")
+    owner_id = "orchestrator-caller-loss"
+
+    caller =
+      spawn(fn ->
+        Effects.execute(attrs, BlockingAdapter,
+          owner_id: owner_id,
+          lease_ttl_ms: 60
+        )
+      end)
+
+    assert_receive {:adapter_started, adapter_process}
+    caller_monitor = Process.monitor(caller)
+    Process.exit(caller, :kill)
+    assert_receive {:DOWN, ^caller_monitor, :process, ^caller, :killed}
+
+    Process.sleep(180)
+    recovery = Effects.recover_orphans(owner_id: owner_id, now: DateTime.utc_now(), limit: 10)
+
+    adapter_monitor = Process.monitor(adapter_process)
+    send(adapter_process, :finish)
+    assert_receive {:DOWN, ^adapter_monitor, :process, ^adapter_process, :normal}
+
+    assert {:ok, %{recovered: [], pending: [], remaining: 0}} = recovery
+    assert Effects.get!(operation_id).status == :succeeded
+  end
+
+  test "terminal recording waits for a synchronized heartbeat shutdown" do
+    true = :ets.insert(@adapter_state, {:test_pid, self()})
+    operation_id = OperationId.generate()
+    attrs = operation_id |> effect_attrs() |> Map.put(:target, "adapter#terminal-boundary")
+
+    caller =
+      Task.async(fn ->
+        Effects.execute(attrs, TerminalBoundaryAdapter,
+          owner_id: "orchestrator-terminal-boundary",
+          lease_ttl_ms: 60_000
+        )
+      end)
+
+    assert_receive {:boundary_adapter_started, worker}
+    assert {:links, [heartbeat]} = Process.info(worker, :links)
+    true = :erlang.suspend_process(heartbeat)
+
+    blocked_state =
+      try do
+        send(worker, :finish)
+        assert_receive {:boundary_adapter_returned, ^worker}
+        Process.sleep(20)
+        {Effects.get!(operation_id).status, Process.alive?(worker)}
+      after
+        true = :erlang.resume_process(heartbeat)
+      end
+
+    assert blocked_state == {:started, true}
+    assert {:ok, completed} = Task.await(caller)
+    assert completed.status == :succeeded
+  end
+
+  test "a stale same-owner worker cannot overwrite a newer effect claim" do
+    true = :ets.insert(@adapter_state, {:test_pid, self()})
+    operation_id = OperationId.generate()
+    attrs = operation_id |> effect_attrs() |> Map.put(:target, "adapter#fenced-claim")
+    owner_id = "orchestrator-stable-owner"
+
+    first_caller =
+      Task.async(fn ->
+        Effects.execute(attrs, BlockingAdapter,
+          owner_id: owner_id,
+          lease_ttl_ms: 60_000,
+          wait_timeout: 1
+        )
+      end)
+
+    assert_receive {:adapter_started, stale_worker}
+    assert {:error, :in_progress} = Task.await(first_caller)
+
+    operation_id
+    |> Effects.get!()
+    |> Ecto.Changeset.change(status: :unknown, lease_owner: nil, lease_expires_at: nil)
+    |> Repo.update!()
+
+    current_caller =
+      Task.async(fn ->
+        Effects.execute(attrs, BlockingAdapter,
+          owner_id: owner_id,
+          lease_ttl_ms: 60_000
+        )
+      end)
+
+    assert_receive {:adapter_started, current_worker}
+    stale_monitor = Process.monitor(stale_worker)
+    send(stale_worker, :finish)
+    assert_receive {:DOWN, ^stale_monitor, :process, ^stale_worker, :normal}
+
+    record = Effects.get!(operation_id)
+    assert record.status == :started
+    assert record.lease_owner == owner_id
+
+    send(current_worker, :finish)
+    assert {:ok, completed} = Task.await(current_caller)
+    assert completed.status == :succeeded
+  end
+
+  test "a worker with the wrong fence cannot record a terminal outcome" do
+    true = :ets.insert(@adapter_state, {:test_pid, self()})
+    owner_id = "orchestrator-wrong-fence"
+
+    outcomes = [
+      {:ok, %{"finished" => true}},
+      {:error, :provider_rejected},
+      {:unknown, :interrupted}
+    ]
+
+    Enum.each(outcomes, fn outcome ->
+      operation_id = OperationId.generate()
+      target = "adapter#wrong-fence-#{elem(outcome, 0)}"
+      attrs = operation_id |> effect_attrs() |> Map.put(:target, target)
+
+      caller =
+        Task.async(fn ->
+          Effects.execute(attrs, BlockingAdapter,
+            owner_id: owner_id,
+            lease_ttl_ms: 60_000,
+            wait_timeout: 1
+          )
+        end)
+
+      assert_receive {:adapter_started, adapter_process}
+      assert {:error, :in_progress} = Task.await(caller)
+
+      Effects.Record
+      |> Repo.get!(operation_id)
+      |> Ecto.Changeset.change(fencing_token: Ecto.UUID.generate())
+      |> Repo.update!()
+
+      adapter_monitor = Process.monitor(adapter_process)
+      send(adapter_process, {:finish, outcome})
+      assert_receive {:DOWN, ^adapter_monitor, :process, ^adapter_process, :normal}
+
+      stranded = Effects.get!(operation_id)
+      assert stranded.status == :started
+      assert stranded.result == nil
+
+      assert {:ok, %{recovered: [^operation_id], pending: [unknown], remaining: 0}} =
+               Effects.recover_orphans(
+                 owner_id: owner_id,
+                 now: DateTime.add(DateTime.utc_now(), 61, :second),
+                 limit: 10
+               )
+
+      assert unknown.status == :unknown
+      assert unknown.result == nil
+    end)
+  end
+
+  test "heartbeat authority loss terminates the worker without writing through an expired fence" do
+    true = :ets.insert(@adapter_state, {:test_pid, self()})
+    operation_id = OperationId.generate()
+    attrs = operation_id |> effect_attrs() |> Map.put(:target, "adapter#heartbeat-fence-loss")
+    owner_id = "orchestrator-heartbeat-fence-loss"
+
+    caller =
+      Task.async(fn ->
+        Effects.execute(attrs, BlockingAdapter,
+          owner_id: owner_id,
+          lease_ttl_ms: 90,
+          wait_timeout: 1
+        )
+      end)
+
+    assert_receive {:adapter_started, adapter_process}
+    assert {:error, :in_progress} = Task.await(caller)
+    adapter_monitor = Process.monitor(adapter_process)
+
+    Effects.Record
+    |> Repo.get!(operation_id)
+    |> Ecto.Changeset.change(lease_expires_at: DateTime.add(DateTime.utc_now(), -1, :second))
+    |> Repo.update!()
+
+    assert_receive {:DOWN, ^adapter_monitor, :process, ^adapter_process, :killed}
+
+    Process.sleep(20)
+    stranded = Effects.get!(operation_id)
+    assert stranded.status == :started
+    assert stranded.error == nil
+
+    assert {:ok, %{recovered: [^operation_id], pending: [unknown], remaining: 0}} =
+             Effects.recover_orphans(
+               owner_id: "orchestrator-after-heartbeat-fence-loss",
+               now: DateTime.utc_now(),
+               limit: 10
+             )
+
+    assert unknown.status == :unknown
+    assert unknown.error == %{"code" => "orphaned"}
+  end
+
+  test "reconciliation callbacks never receive a persisted fencing token" do
+    true = :ets.insert(@adapter_state, {:test_pid, self()})
+    operation_id = OperationId.generate()
+    attrs = operation_id |> effect_attrs() |> Map.put(:target, "adapter#reconcile-fence-redaction")
+
+    assert {:error, :interrupted} = Effects.execute(attrs, CrashingAdapter)
+    persisted_token = Ecto.UUID.generate()
+
+    Effects.Record
+    |> Repo.get!(operation_id)
+    |> Ecto.Changeset.change(fencing_token: persisted_token)
+    |> Repo.update!()
+
+    assert Repo.get!(Effects.Record, operation_id).fencing_token == persisted_token
+
+    assert {:ok, completed} =
+             Effects.reconcile(operation_id, FenceObservingReconcileAdapter, owner_id: "orchestrator-reconcile-fence-redaction")
+
+    assert_receive {:reconcile_fencing_token, nil}
+    assert completed.status == :succeeded
   end
 
   test "a waiting caller may time out without interrupting the effect worker" do
@@ -1011,6 +1299,12 @@ defmodule SymphonyElixir.EffectsTest do
     assert_receive {:DOWN, ^adapter_monitor, :process, ^adapter_process, :killed}
     Process.exit(caller, :kill)
     assert_receive {:DOWN, ^caller_monitor, :process, ^caller, :killed}
+
+    Effects.Record
+    |> Repo.get!(attrs.operation_id)
+    |> Ecto.Changeset.change(lease_expires_at: DateTime.add(DateTime.utc_now(), -1, :second))
+    |> Repo.update!()
+
     Effects.get!(attrs.operation_id)
   end
 

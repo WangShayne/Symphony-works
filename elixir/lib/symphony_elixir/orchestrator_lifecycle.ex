@@ -254,10 +254,11 @@ defmodule SymphonyElixir.OrchestratorLifecycle do
       |> maybe_put_now(recovery_now)
 
     case Effects.recover_orphans(recovery_opts) do
-      {:ok, %{pending: pending, remaining: remaining}} ->
+      {:ok, %{pending: pending, remaining: remaining, next_check_at: next_check_at}} ->
         continue_recovery(
           pending,
           remaining,
+          next_check_at,
           owner_id,
           recovery_batch_size,
           recovery_now,
@@ -272,6 +273,7 @@ defmodule SymphonyElixir.OrchestratorLifecycle do
   defp continue_recovery(
          pending,
          remaining,
+         next_check_at,
          owner_id,
          recovery_batch_size,
          recovery_now,
@@ -283,22 +285,56 @@ defmodule SymphonyElixir.OrchestratorLifecycle do
         owner_id,
         recovery_batch_size,
         recovery_now,
-        effect_adapter_resolver
+        effect_adapter_resolver,
+        next_check_at
       )
     end
   end
 
-  defp maybe_recover_remaining(0, _owner_id, _recovery_batch_size, _recovery_now, _resolver),
-    do: :ok
+  defp maybe_recover_remaining(
+         0,
+         owner_id,
+         recovery_batch_size,
+         _recovery_now,
+         effect_adapter_resolver,
+         next_check_at
+       ) do
+    wait_for_next_recovery(
+      next_check_at,
+      owner_id,
+      recovery_batch_size,
+      effect_adapter_resolver
+    )
+  end
 
   defp maybe_recover_remaining(
          _remaining,
          owner_id,
          recovery_batch_size,
          recovery_now,
-         effect_adapter_resolver
+         effect_adapter_resolver,
+         _next_check_at
        ) do
     recover_effect_batches(owner_id, recovery_batch_size, recovery_now, effect_adapter_resolver)
+  end
+
+  defp wait_for_next_recovery(nil, _owner_id, _recovery_batch_size, _resolver), do: :ok
+
+  defp wait_for_next_recovery(
+         %DateTime{} = next_check_at,
+         owner_id,
+         recovery_batch_size,
+         effect_adapter_resolver
+       ) do
+    Process.sleep(recovery_delay_ms(next_check_at))
+    recover_effect_batches(owner_id, recovery_batch_size, nil, effect_adapter_resolver)
+  end
+
+  defp recovery_delay_ms(next_check_at) do
+    next_check_at
+    |> DateTime.diff(DateTime.utc_now(), :millisecond)
+    |> Kernel.+(1)
+    |> max(0)
   end
 
   defp reconcile_pending(pending, owner_id, recovery_now, effect_adapter_resolver) do

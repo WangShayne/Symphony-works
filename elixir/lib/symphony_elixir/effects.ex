@@ -3,10 +3,25 @@ defmodule SymphonyElixir.Effects do
   Journals external mutation intent before execution and reconciles unknown outcomes.
   """
 
+  defmodule Fence do
+    @moduledoc false
+
+    @enforce_keys [:operation_id, :owner_id, :token, :ttl_ms]
+    @derive {Inspect, only: [:operation_id, :owner_id]}
+    defstruct [:operation_id, :owner_id, :token, :ttl_ms]
+
+    @opaque t :: %__MODULE__{
+              operation_id: Ecto.UUID.t(),
+              owner_id: String.t(),
+              token: Ecto.UUID.t(),
+              ttl_ms: pos_integer()
+            }
+  end
+
   import Ecto.Query
 
   alias SymphonyElixir.Audit.Redactor
-  alias SymphonyElixir.Effects.{OperationId, Reconciler, Record}
+  alias SymphonyElixir.Effects.{Fence, OperationId, Reconciler, Record}
   alias SymphonyElixir.Repo
 
   @default_wait_timeout 5_000
@@ -33,7 +48,7 @@ defmodule SymphonyElixir.Effects do
   def execute(_attrs, _adapter, _opts), do: {:error, :invalid_effect}
 
   @spec get!(Ecto.UUID.t()) :: Record.t()
-  def get!(operation_id), do: Repo.get!(Record, operation_id)
+  def get!(operation_id), do: operation_id |> get_record!() |> external_record()
 
   @spec reconcile(Ecto.UUID.t(), module()) :: {:ok, Record.t()} | {:error, execute_error()}
   def reconcile(operation_id, adapter), do: reconcile(operation_id, adapter, [])
@@ -60,7 +75,8 @@ defmodule SymphonyElixir.Effects do
            %{
              recovered: [Ecto.UUID.t()],
              pending: [Record.t()],
-             remaining: non_neg_integer()
+             remaining: non_neg_integer(),
+             next_check_at: DateTime.t() | nil
            }}
           | {:error, atom()}
   def recover_orphans(opts) when is_list(opts) do
@@ -86,6 +102,7 @@ defmodule SymphonyElixir.Effects do
     |> Enum.reduce(Record, &apply_filter/2)
     |> order_by([record], asc: record.inserted_at, asc: record.operation_id)
     |> Repo.all()
+    |> Enum.map(&external_record/1)
   end
 
   defp normalize_attrs(attrs) do
@@ -156,23 +173,25 @@ defmodule SymphonyElixir.Effects do
 
   defp dispatch(%Record{status: :planned} = record, adapter, context) do
     case claim(record, :planned, context) do
-      {:ok, claimed} ->
-        run_non_interruptible(claimed, context, &execute_and_record(&1, adapter, context))
+      {:ok, claimed, fence} ->
+        run_non_interruptible(claimed, fence, context, fn current, current_fence ->
+          execute_and_record(current, adapter, current_fence, context)
+        end)
 
       :lost ->
-        record.operation_id |> get!() |> dispatch(adapter, context)
+        record.operation_id |> get_record!() |> dispatch(adapter, context)
     end
   end
 
   defp dispatch(%Record{status: :unknown} = record, adapter, context) do
     case claim(record, :unknown, context) do
-      {:ok, claimed} ->
-        run_non_interruptible(claimed, context, fn current ->
-          reconcile_and_record(current, record, adapter, context)
+      {:ok, claimed, fence} ->
+        run_non_interruptible(claimed, fence, context, fn current, current_fence ->
+          reconcile_and_record(current, record, adapter, current_fence, context)
         end)
 
       :lost ->
-        record.operation_id |> get!() |> dispatch(adapter, context)
+        record.operation_id |> get_record!() |> dispatch(adapter, context)
     end
   end
 
@@ -193,16 +212,18 @@ defmodule SymphonyElixir.Effects do
         completed_at: nil,
         lease_owner: nil,
         lease_expires_at: nil,
+        fencing_token: nil,
         updated_at: transition_now
       ]
     )
 
-    record.operation_id |> get!() |> dispatch(adapter, context)
+    record.operation_id |> get_record!() |> dispatch(adapter, context)
   end
 
   defp claim(record, expected_status, context) do
     claim_now = current_time(context)
     lease_expires_at = DateTime.add(claim_now, context.lease_ttl_ms, :millisecond)
+    token = Ecto.UUID.generate()
 
     {count, _rows} =
       Record
@@ -218,20 +239,33 @@ defmodule SymphonyElixir.Effects do
           error: nil,
           lease_owner: context.owner_id,
           lease_expires_at: lease_expires_at,
+          fencing_token: token,
           updated_at: claim_now
         ]
       )
 
-    if count == 1, do: {:ok, get!(record.operation_id)}, else: :lost
+    if count == 1 do
+      fence = %Fence{
+        operation_id: record.operation_id,
+        owner_id: context.owner_id,
+        token: token,
+        ttl_ms: context.lease_ttl_ms
+      }
+
+      {:ok, record.operation_id |> get_record!() |> external_record(), fence}
+    else
+      :lost
+    end
   end
 
-  defp run_non_interruptible(record, context, operation) do
+  defp run_non_interruptible(record, fence, context, operation) do
     caller = self()
     result_ref = make_ref()
 
     {_pid, monitor_ref} =
       spawn_monitor(fn ->
-        result = operation.(record)
+        Process.flag(:trap_exit, false)
+        result = operation.(record, fence)
         send(caller, {result_ref, result})
       end)
 
@@ -241,7 +275,7 @@ defmodule SymphonyElixir.Effects do
         result
 
       {:DOWN, ^monitor_ref, :process, _pid, _reason} ->
-        mark_unknown_if_started(record.operation_id, :interrupted, context)
+        mark_unknown_if_started(fence, :interrupted, context)
         {:error, :interrupted}
     after
       context.wait_timeout ->
@@ -250,24 +284,100 @@ defmodule SymphonyElixir.Effects do
     end
   end
 
-  defp execute_and_record(record, adapter, context) do
-    adapter
-    |> safe_execute(record)
-    |> case do
-      {:ok, result} -> record_succeeded(record.operation_id, result, context)
-      {:error, reason} -> record_failed(record.operation_id, reason, context)
-      {:unknown, reason} -> record_unknown(record.operation_id, reason, context)
+  defp with_fence_heartbeat(%Fence{} = fence, context, operation) do
+    worker = self()
+
+    heartbeat =
+      spawn_link(fn ->
+        Process.flag(:trap_exit, true)
+        worker_monitor = Process.monitor(worker)
+        fence_heartbeat_loop(worker, worker_monitor, fence, context)
+      end)
+
+    result = operation.()
+    stop_ref = make_ref()
+    send(heartbeat, {:stop, worker, stop_ref})
+
+    receive do
+      {^stop_ref, :stopped} -> result
     end
   end
 
-  defp reconcile_and_record(claimed, unknown_record, adapter, context) do
-    case Reconciler.reconcile(adapter, unknown_record) do
-      :already_applied -> record_succeeded(claimed.operation_id, :already_applied, context)
-      {:applied, result} -> record_succeeded(claimed.operation_id, result, context)
-      :not_applied -> execute_and_record(claimed, adapter, context)
-      {:unknown, reason} -> record_unknown(claimed.operation_id, reason, context)
+  defp fence_heartbeat_loop(worker, worker_monitor, fence, context) do
+    receive do
+      {:stop, ^worker, stop_ref} ->
+        send(worker, {stop_ref, :stopped})
+        Process.demonitor(worker_monitor, [:flush])
+        :ok
+
+      {:DOWN, ^worker_monitor, :process, ^worker, _reason} ->
+        :ok
+    after
+      heartbeat_interval(fence) ->
+        case heartbeat_fence(fence, context) do
+          :ok -> fence_heartbeat_loop(worker, worker_monitor, fence, context)
+          :lost -> stop_fence_lost_worker(worker, worker_monitor, fence, context)
+        end
     end
   end
+
+  defp stop_fence_lost_worker(worker, worker_monitor, fence, context) do
+    Process.exit(worker, :kill)
+
+    receive do
+      {:DOWN, ^worker_monitor, :process, ^worker, _reason} -> :ok
+    end
+
+    mark_unknown_if_started(fence, :lease_lost, context)
+  end
+
+  defp heartbeat_fence(%Fence{} = fence, context) do
+    heartbeat_now = current_time(context)
+    lease_expires_at = DateTime.add(heartbeat_now, fence.ttl_ms, :millisecond)
+
+    {count, _rows} =
+      fence
+      |> fenced_started_query()
+      |> where([effect], effect.lease_expires_at > ^heartbeat_now)
+      |> Repo.update_all(set: [lease_expires_at: lease_expires_at, updated_at: heartbeat_now])
+
+    if count == 1, do: :ok, else: :lost
+  end
+
+  defp heartbeat_interval(%Fence{ttl_ms: ttl_ms}), do: max(div(ttl_ms, 3), 1)
+
+  defp execute_and_record(record, adapter, fence, context) do
+    fence
+    |> with_fence_heartbeat(context, fn -> safe_execute(adapter, record) end)
+    |> record_outcome(fence, context)
+  end
+
+  defp reconcile_and_record(claimed, unknown_record, adapter, fence, context) do
+    result =
+      with_fence_heartbeat(fence, context, fn ->
+        reconcile_outcome(claimed, unknown_record, adapter)
+      end)
+
+    record_outcome(result, fence, context)
+  end
+
+  defp reconcile_outcome(claimed, unknown_record, adapter) do
+    case Reconciler.reconcile(adapter, external_record(unknown_record)) do
+      :already_applied -> {:ok, :already_applied}
+      {:applied, result} -> {:ok, result}
+      :not_applied -> safe_execute(adapter, claimed)
+      {:unknown, reason} -> {:unknown, reason}
+    end
+  end
+
+  defp record_outcome({:ok, result}, fence, context),
+    do: record_succeeded(fence, result, context)
+
+  defp record_outcome({:error, reason}, fence, context),
+    do: record_failed(fence, reason, context)
+
+  defp record_outcome({:unknown, reason}, fence, context),
+    do: record_unknown(fence, reason, context)
 
   defp safe_execute(adapter, record) do
     if Code.ensure_loaded?(adapter) and function_exported?(adapter, :execute, 1) do
@@ -287,77 +397,107 @@ defmodule SymphonyElixir.Effects do
   defp normalize_execute_result({:unknown, reason}) when is_atom(reason), do: {:unknown, reason}
   defp normalize_execute_result(_result), do: {:unknown, :invalid_adapter_result}
 
-  defp record_succeeded(operation_id, result, context) do
+  defp record_succeeded(fence, result, context) do
     transition_now = current_time(context)
 
-    update_status(operation_id,
-      status: :succeeded,
-      result: encode_result(result),
-      error: nil,
-      completed_at: transition_now,
-      lease_owner: nil,
-      lease_expires_at: nil,
-      updated_at: transition_now
-    )
-
-    {:ok, get!(operation_id)}
+    case update_status(fence,
+           status: :succeeded,
+           result: encode_result(result),
+           error: nil,
+           completed_at: transition_now,
+           lease_owner: nil,
+           lease_expires_at: nil,
+           fencing_token: nil,
+           updated_at: transition_now,
+           context: context
+         ) do
+      1 -> {:ok, get!(fence.operation_id)}
+      0 -> fence_lost_after_outcome(fence, context)
+    end
   end
 
-  defp record_failed(operation_id, reason, context) do
+  defp record_failed(fence, reason, context) do
     transition_now = current_time(context)
     reason = safe_reason(reason, :adapter_failed)
 
-    update_status(operation_id,
-      status: :failed,
-      result: nil,
-      error: %{"code" => Atom.to_string(reason)},
-      completed_at: transition_now,
-      lease_owner: nil,
-      lease_expires_at: nil,
-      updated_at: transition_now
-    )
-
-    {:error, reason}
+    case update_status(fence,
+           status: :failed,
+           result: nil,
+           error: %{"code" => Atom.to_string(reason)},
+           completed_at: transition_now,
+           lease_owner: nil,
+           lease_expires_at: nil,
+           fencing_token: nil,
+           updated_at: transition_now,
+           context: context
+         ) do
+      1 -> {:error, reason}
+      0 -> fence_lost_after_outcome(fence, context)
+    end
   end
 
-  defp record_unknown(operation_id, reason, context) do
+  defp record_unknown(fence, reason, context) do
     reason = safe_reason(reason, :interrupted)
 
-    update_status(operation_id,
-      status: :unknown,
-      result: nil,
-      error: %{"code" => Atom.to_string(reason)},
-      completed_at: nil,
-      lease_owner: nil,
-      lease_expires_at: nil,
-      updated_at: current_time(context)
-    )
-
-    {:error, reason}
+    case update_status(fence,
+           status: :unknown,
+           result: nil,
+           error: %{"code" => Atom.to_string(reason)},
+           completed_at: nil,
+           lease_owner: nil,
+           lease_expires_at: nil,
+           fencing_token: nil,
+           updated_at: current_time(context),
+           context: context
+         ) do
+      1 -> {:error, reason}
+      0 -> fence_lost_after_outcome(fence, context)
+    end
   end
 
-  defp mark_unknown_if_started(operation_id, reason, context) do
-    reason = safe_reason(reason, :interrupted)
+  defp fence_lost_after_outcome(fence, context) do
+    mark_unknown_if_started(fence, :lease_lost, context)
+    {:error, :fence_lost}
+  end
 
-    Record
-    |> where([effect], effect.operation_id == ^operation_id and effect.status == :started)
+  defp mark_unknown_if_started(fence, reason, context) do
+    reason = safe_reason(reason, :interrupted)
+    transition_now = current_time(context)
+
+    fence
+    |> fenced_started_query()
+    |> where([effect], effect.lease_expires_at > ^transition_now)
     |> Repo.update_all(
       set: [
         status: :unknown,
         error: %{"code" => Atom.to_string(reason)},
         lease_owner: nil,
         lease_expires_at: nil,
-        updated_at: current_time(context)
+        fencing_token: nil,
+        updated_at: transition_now
       ]
     )
 
     :ok
   end
 
-  defp update_status(operation_id, values) do
-    Record
-    |> where([effect], effect.operation_id == ^operation_id and effect.status == :started)
+  defp update_status(%Fence{} = fence, values) do
+    {context, values} = Keyword.pop!(values, :context)
+    transition_now = current_time(context)
+
+    fence
+    |> fenced_started_query()
+    |> where([effect], effect.lease_expires_at > ^transition_now)
     |> Repo.update_all(set: values)
+    |> elem(0)
+  end
+
+  defp fenced_started_query(%Fence{} = fence) do
+    from(effect in Record,
+      where:
+        effect.operation_id == ^fence.operation_id and effect.status == :started and
+          effect.lease_owner == ^fence.owner_id and effect.fencing_token == ^fence.token
+    )
   end
 
   defp reconcile_dispatch(%Record{status: :unknown} = record, adapter, context),
@@ -390,6 +530,7 @@ defmodule SymphonyElixir.Effects do
         completed_at: nil,
         lease_owner: nil,
         lease_expires_at: nil,
+        fencing_token: nil,
         updated_at: recovery_now
       ]
     )
@@ -422,10 +563,24 @@ defmodule SymphonyElixir.Effects do
             |> orphaned_started_query(recovery_now)
             |> Repo.aggregate(:count, :operation_id)
 
+          next_check_at =
+            Record
+            |> where(
+              [effect],
+              effect.status == :started and not is_nil(effect.fencing_token) and
+                not is_nil(effect.lease_owner) and not is_nil(effect.lease_expires_at) and
+                effect.lease_expires_at > ^recovery_now
+            )
+            |> order_by([effect], asc: effect.lease_expires_at)
+            |> limit(1)
+            |> select([effect], effect.lease_expires_at)
+            |> Repo.one()
+
           %{
             recovered: Enum.map(pending, & &1.operation_id),
             pending: pending,
-            remaining: remaining
+            remaining: remaining,
+            next_check_at: next_check_at
           }
         end,
         mode: :immediate
@@ -450,6 +605,7 @@ defmodule SymphonyElixir.Effects do
         completed_at: nil,
         lease_owner: nil,
         lease_expires_at: nil,
+        fencing_token: nil,
         updated_at: recovery_now
       ]
     )
@@ -457,11 +613,11 @@ defmodule SymphonyElixir.Effects do
     :ok
   end
 
-  defp orphaned_started_query(owner_id, recovery_now) do
+  defp orphaned_started_query(_owner_id, recovery_now) do
     from(effect in Record,
       where:
         effect.status == :started and
-          (is_nil(effect.lease_owner) or effect.lease_owner != ^owner_id or
+          (is_nil(effect.fencing_token) or is_nil(effect.lease_owner) or
              is_nil(effect.lease_expires_at) or effect.lease_expires_at <= ^recovery_now)
     )
   end
@@ -642,6 +798,10 @@ defmodule SymphonyElixir.Effects do
     do: where(query, [effect], effect.dedupe_hash == ^value)
 
   defp apply_filter(_filter, query), do: query
+
+  defp get_record!(operation_id), do: Repo.get!(Record, operation_id)
+
+  defp external_record(%Record{} = record), do: %{record | fencing_token: nil}
 
   defp now, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)
 end

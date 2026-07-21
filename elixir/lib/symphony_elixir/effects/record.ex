@@ -11,6 +11,7 @@ defmodule SymphonyElixir.Effects.Record do
   @foreign_key_type :binary_id
   @statuses [:planned, :started, :unknown, :succeeded, :failed]
 
+  @derive {Inspect, except: [:fencing_token]}
   schema "effect_records" do
     field(:dedupe_hash, :string)
     field(:task_id, :string)
@@ -27,6 +28,7 @@ defmodule SymphonyElixir.Effects.Record do
     field(:completed_at, :utc_datetime_usec)
     field(:lease_owner, :string)
     field(:lease_expires_at, :utc_datetime_usec)
+    field(:fencing_token, :binary_id)
 
     timestamps(type: :utc_datetime_usec)
   end
@@ -50,6 +52,7 @@ defmodule SymphonyElixir.Effects.Record do
           completed_at: DateTime.t() | nil,
           lease_owner: String.t() | nil,
           lease_expires_at: DateTime.t() | nil,
+          fencing_token: Ecto.UUID.t() | nil,
           inserted_at: DateTime.t() | nil,
           updated_at: DateTime.t() | nil
         }

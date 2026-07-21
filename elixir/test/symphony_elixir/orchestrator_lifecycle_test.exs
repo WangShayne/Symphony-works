@@ -284,6 +284,96 @@ defmodule SymphonyElixir.OrchestratorLifecycleTest do
     assert source_control_recovered.result["repository"] == "acme/startup-recovery"
   end
 
+  test "startup waits for an unexpired crashed effect lease before recovery" do
+    register_probe!()
+    operation_id = OperationId.generate()
+
+    orphan =
+      orphan_started(
+        %{
+          operation_id: operation_id,
+          task_id: "unexpired-startup-recovery-task",
+          plan_revision: 1,
+          unit_id: "unexpired-startup-recovery-unit",
+          action: :create_change_request,
+          provider: :simulated,
+          target: "repository#unexpired-startup-recovery",
+          intent: %{"reconcile" => "already_applied"}
+        },
+        lease_ttl_ms: 250,
+        expire?: false
+      )
+
+    assert orphan.status == :started
+    assert DateTime.compare(orphan.lease_expires_at, DateTime.utc_now()) == :gt
+
+    starter =
+      Task.async(fn ->
+        OrchestratorLifecycle.start_link(
+          name: @active_name,
+          owner_id: "orchestrator-after-unexpired-crash",
+          lease_ttl_ms: 1_000,
+          heartbeat_interval_ms: 100
+        )
+      end)
+
+    assert nil == Task.yield(starter, 30)
+    assert {:ok, _lifecycle} = Task.await(starter, 2_000)
+    assert Effects.get!(operation_id).status == :succeeded
+  end
+
+  test "startup does not take over a live foreign effect that keeps heartbeating" do
+    register_probe!()
+    operation_id = OperationId.generate()
+
+    effect_caller =
+      Task.async(fn ->
+        Effects.execute(
+          %{
+            operation_id: operation_id,
+            task_id: "live-foreign-effect-task",
+            plan_revision: 1,
+            unit_id: "live-foreign-effect-unit",
+            action: :create_change_request,
+            provider: :simulated,
+            target: "repository#live-foreign-effect",
+            intent: %{"reconcile" => "already_applied"}
+          },
+          BlockingAdapter,
+          owner_id: "live-foreign-effect-owner",
+          lease_ttl_ms: 120
+        )
+      end)
+
+    assert_receive {:adapter_started, adapter_process}, 1_000
+    original = Repo.get!(Effects.Record, operation_id)
+
+    starter =
+      Task.async(fn ->
+        OrchestratorLifecycle.start_link(
+          name: @active_name,
+          owner_id: "waiting-orchestrator",
+          lease_ttl_ms: 1_000,
+          heartbeat_interval_ms: 100
+        )
+      end)
+
+    assert nil == Task.yield(starter, 30)
+    Process.sleep(300)
+    assert nil == Task.yield(starter, 0)
+
+    current = Repo.get!(Effects.Record, operation_id)
+    assert current.status == :started
+    assert current.lease_owner == "live-foreign-effect-owner"
+    assert current.fencing_token == original.fencing_token
+    assert DateTime.compare(current.lease_expires_at, original.lease_expires_at) == :gt
+
+    send(adapter_process, :finish)
+    assert {:ok, completed} = Task.await(effect_caller, 1_000)
+    assert completed.status == :succeeded
+    assert {:ok, _lifecycle} = Task.await(starter, 2_000)
+  end
+
   test "lease loss stops the supervised orchestrator and prevents work from restarting" do
     on_exit(fn ->
       stop_named_process(@runtime_name)
@@ -540,12 +630,15 @@ defmodule SymphonyElixir.OrchestratorLifecycleTest do
     assert Effects.get!(orphan.operation_id).status == :unknown
   end
 
-  defp orphan_started(attrs) do
+  defp orphan_started(attrs, opts \\ []) do
+    lease_ttl_ms = Keyword.get(opts, :lease_ttl_ms, 60_000)
+    expire? = Keyword.get(opts, :expire?, true)
+
     caller =
       spawn(fn ->
         Effects.execute(attrs, BlockingAdapter,
           owner_id: "orchestrator-before-restart",
-          lease_ttl_ms: 60_000
+          lease_ttl_ms: lease_ttl_ms
         )
       end)
 
@@ -569,6 +662,14 @@ defmodule SymphonyElixir.OrchestratorLifecycleTest do
     assert_receive {:DOWN, ^adapter_monitor, :process, ^adapter_process, :killed}, 1_000
     Process.exit(caller, :kill)
     assert_receive {:DOWN, ^caller_monitor, :process, ^caller, :killed}, 1_000
+
+    if expire? do
+      Effects.Record
+      |> Repo.get!(attrs.operation_id)
+      |> Ecto.Changeset.change(lease_expires_at: DateTime.add(DateTime.utc_now(), -1, :second))
+      |> Repo.update!()
+    end
+
     Effects.get!(attrs.operation_id)
   end
 

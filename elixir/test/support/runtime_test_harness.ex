@@ -4,6 +4,7 @@ defmodule SymphonyElixir.RuntimeTestHarness do
   alias SymphonyElixir.AgentRuntimeSupervisor
 
   @parent SymphonyElixir.Supervisor
+  @supervisor_adapter_key {__MODULE__, :supervisor_adapter}
 
   defmodule Lease do
     @moduledoc false
@@ -56,13 +57,28 @@ defmodule SymphonyElixir.RuntimeTestHarness do
   @spec restart_default_runtime!(Lease.t()) :: :ok
   def restart_default_runtime!(%Lease{}), do: restart_default_runtime()
 
+  @spec with_supervisor_adapter(module(), (-> result)) :: result when result: var
+  def with_supervisor_adapter(adapter, fun) when is_atom(adapter) and is_function(fun, 0) do
+    previous = Process.get(@supervisor_adapter_key, :unset)
+    Process.put(@supervisor_adapter_key, adapter)
+
+    try do
+      fun.()
+    after
+      case previous do
+        :unset -> Process.delete(@supervisor_adapter_key)
+        module -> Process.put(@supervisor_adapter_key, module)
+      end
+    end
+  end
+
   defp stop_default_runtime do
     case default_runtime_child_pid() do
       nil ->
         :ok
 
       _pid ->
-        case Supervisor.terminate_child(@parent, AgentRuntimeSupervisor) do
+        case supervisor_adapter().terminate_child(@parent, AgentRuntimeSupervisor) do
           :ok -> :ok
           {:error, reason} -> raise "failed to stop the default agent runtime: #{inspect(reason)}"
         end
@@ -75,7 +91,7 @@ defmodule SymphonyElixir.RuntimeTestHarness do
         :ok
 
       nil ->
-        case Supervisor.restart_child(@parent, AgentRuntimeSupervisor) do
+        case supervisor_adapter().restart_child(@parent, AgentRuntimeSupervisor) do
           {:ok, _pid} -> :ok
           {:error, {:already_started, _pid}} -> :ok
           {:error, reason} -> raise "failed to restart the default agent runtime: #{inspect(reason)}"
@@ -89,10 +105,14 @@ defmodule SymphonyElixir.RuntimeTestHarness do
 
   defp default_runtime_child_pid do
     @parent
-    |> Supervisor.which_children()
+    |> supervisor_adapter().which_children()
     |> Enum.find_value(fn
       {AgentRuntimeSupervisor, pid, _type, _modules} when is_pid(pid) -> pid
       _child -> nil
     end)
+  end
+
+  defp supervisor_adapter do
+    Process.get(@supervisor_adapter_key, Supervisor)
   end
 end

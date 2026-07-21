@@ -235,7 +235,8 @@ defmodule SymphonyElixir.SourceControlTransportCoverageTest do
 
     flush_transport_requests()
 
-    {invalid_dispatch_config, invalid_dispatch_agent} = transport_config([{:ok, %{status: 200, headers: %{}, body: :ok}}])
+    {invalid_dispatch_config, invalid_dispatch_agent} =
+      transport_config([{:ok, %{status: 200, headers: %{}, body: :ok}}])
 
     assert {:error, :transport_failure} =
              authenticated_request(%{invalid_dispatch_config | transport: :invalid}, request)

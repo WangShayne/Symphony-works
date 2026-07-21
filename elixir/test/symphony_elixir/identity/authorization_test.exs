@@ -52,6 +52,7 @@ defmodule SymphonyElixir.Identity.AuthorizationTest do
     assert :write_secret = Authorization.action_for_path("GET", "/api/v1/secrets")
     assert :write_configuration = Authorization.action_for_path("GET", "/api/v1/configuration")
     assert :retry_task = Authorization.action_for_path("POST", "/api/v1/tasks/demo/retry")
+    assert :read_task = Authorization.action_for_path("GET", "")
     assert :read_task = Authorization.action_for_path("GET", "/api/v1/tasks")
     assert :read_task = Authorization.action_for_path("GET", "/api/v1/unknown")
     assert :write_secret = Authorization.action_for_path("GET", "/configuration/secrets")

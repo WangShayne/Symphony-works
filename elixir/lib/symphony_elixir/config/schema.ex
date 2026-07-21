@@ -110,7 +110,7 @@ defmodule SymphonyElixir.Config.Schema do
 
     @primary_key false
     embedded_schema do
-      field(:root, :string, default: Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      field(:root, :string)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -135,7 +135,17 @@ defmodule SymphonyElixir.Config.Schema do
     def changeset(schema, attrs) do
       schema
       |> cast(attrs, [:ssh_hosts, :max_concurrent_agents_per_host], empty_values: [])
+      |> validate_change(:ssh_hosts, &validate_ssh_hosts/2)
       |> validate_number(:max_concurrent_agents_per_host, greater_than: 0)
+    end
+
+    defp validate_ssh_hosts(:ssh_hosts, hosts) when is_list(hosts) do
+      invalid_hosts = Enum.reject(hosts, &(SymphonyElixir.SSH.validate_destination(&1) == :ok))
+
+      case invalid_hosts do
+        [] -> []
+        _ -> [ssh_hosts: "contains invalid SSH destinations"]
+      end
     end
   end
 
@@ -504,6 +514,8 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp resolve_secret_setting(value, _fallback), do: value
+
+  defp resolve_path_value(nil, default), do: default
 
   defp resolve_path_value(value, default) when is_binary(value) do
     case normalize_path_token(value) do

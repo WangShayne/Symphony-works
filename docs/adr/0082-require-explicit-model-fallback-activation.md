@@ -1,0 +1,3 @@
+# Require explicit model fallback activation
+
+Symphony never transparently switches models when a Routing Model, Task Model, or selected Execution Model fails, is unavailable, or produces invalid output. A configured Routing Fallback Model or Execution Fallback Model may be selected only by an audited Operator action or a new explicit routing or rescheduling plan; selecting the Execution Fallback Model for a Dynamic Task Type in its initial explicit plan is planned selection, not failure-triggered switching. This overrides automatic activation implied by ADR-0002, ADR-0004, and ADR-0031 while preserving their separate roles and failure classification.

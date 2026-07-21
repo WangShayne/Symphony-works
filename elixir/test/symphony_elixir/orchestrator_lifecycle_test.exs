@@ -236,6 +236,37 @@ defmodule SymphonyElixir.OrchestratorLifecycleTest do
 
     assert orphan.status == :started
 
+    source_control_operation_id = OperationId.generate()
+
+    source_control_orphan =
+      orphan_started(%{
+        operation_id: source_control_operation_id,
+        task_id: "startup-source-control-recovery-task",
+        plan_revision: 1,
+        unit_id: "startup-source-control-recovery-unit",
+        action: :ensure_change_request,
+        provider: :fixture,
+        target: "acme/startup-recovery",
+        intent: %{
+          "attrs" => %{
+            "repo" => %{
+              "provider" => "fixture",
+              "settings" => %{
+                "repository" => "acme/startup-recovery",
+                "base_branch" => "main"
+              }
+            },
+            "head" => "task/startup-recovery",
+            "base" => "main",
+            "title" => "Recover source-control effect",
+            "body" => "Reconcile before retry",
+            "draft" => true
+          }
+        }
+      })
+
+    assert source_control_orphan.status == :started
+
     assert {:ok, _lifecycle} =
              OrchestratorLifecycle.start_link(
                name: @active_name,
@@ -247,6 +278,10 @@ defmodule SymphonyElixir.OrchestratorLifecycleTest do
     recovered = Effects.get!(operation_id)
     assert recovered.status == :succeeded
     assert recovered.error == nil
+
+    source_control_recovered = Effects.get!(source_control_operation_id)
+    assert source_control_recovered.status == :succeeded
+    assert source_control_recovered.result["repository"] == "acme/startup-recovery"
   end
 
   test "lease loss stops the supervised orchestrator and prevents work from restarting" do

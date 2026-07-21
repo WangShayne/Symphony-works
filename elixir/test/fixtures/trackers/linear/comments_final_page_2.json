@@ -1,0 +1,25 @@
+{
+  "status": 200,
+  "headers": {},
+  "body": {
+    "data": {
+      "issue": {
+        "comments": {
+          "nodes": [
+            {
+              "id": "comment-final",
+              "body": "<!-- symphony-tracker:final issue=linear:issue-1 -->\nprevious summary",
+              "user": {
+                "id": "linear-bot"
+              }
+            }
+          ],
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          }
+        }
+      }
+    }
+  }
+}

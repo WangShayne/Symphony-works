@@ -345,9 +345,9 @@ The durable intent, unique operation identity, and observed result for an extern
 _Avoid_: Application log, untracked API call
 
 **Routing Fallback Model**:
-The separately configured model that takes over when the routing model is unavailable or repeatedly produces an invalid execution plan.
+The separately configured model that an Operator or a new explicit routing or rescheduling plan may select when routing cannot continue with the current model. It never takes over automatically.
 _Avoid_: Execution fallback model
 
 **Execution Fallback Model**:
-The separately configured model that executes an otherwise unroutable execution unit when its task type has no usable task model, and the default model for a dynamic task type. A failed acceptance result does not activate this fallback.
+The separately configured model that an Operator or explicit plan may select for an execution unit, including as the initial default for a Dynamic Task Type. It never replaces a failing or unavailable selected model automatically.
 _Avoid_: Routing fallback model

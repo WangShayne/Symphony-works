@@ -1,0 +1,25 @@
+[
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/pulls",
+    "status": 200,
+    "headers": {},
+    "body": []
+  },
+  {
+    "method": "POST",
+    "path": "/repos/acme/widget/pulls",
+    "status": 201,
+    "headers": {},
+    "body": {
+      "id": 9009,
+      "number": 9,
+      "html_url": "https://github.test/acme/widget/pull/9",
+      "title": "ABC-9",
+      "body": "Accepted implementation",
+      "draft": true,
+      "head": {"ref": "symphony/ABC-9", "sha": "9999999999999999999999999999999999999999"},
+      "base": {"ref": "main", "sha": "1111111111111111111111111111111111111111"}
+    }
+  }
+]

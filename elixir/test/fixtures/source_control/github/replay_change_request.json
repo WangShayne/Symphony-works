@@ -1,0 +1,58 @@
+[
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/pulls",
+    "status": 200,
+    "headers": {"link": "<https://api.github.test/repos/acme/widget/pulls?page=2>; rel=\"next\""},
+    "body": []
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/pulls",
+    "status": 200,
+    "headers": {},
+    "body": []
+  },
+  {
+    "method": "POST",
+    "path": "/repos/acme/widget/pulls",
+    "status": 201,
+    "headers": {},
+    "body": {
+      "id": 18018,
+      "number": 18,
+      "html_url": "https://github.test/acme/widget/pull/18",
+      "title": "ABC-18",
+      "body": "Accepted implementation",
+      "draft": true,
+      "head": {"ref": "symphony/ABC-18"},
+      "base": {"ref": "main"}
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/pulls",
+    "status": 200,
+    "headers": {"link": "<https://api.github.test/repos/acme/widget/pulls?page=2>; rel=\"next\""},
+    "body": []
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/pulls",
+    "status": 200,
+    "headers": {},
+    "body": [
+      {
+        "id": 18018,
+        "number": 18,
+        "html_url": "https://github.test/acme/widget/pull/18",
+        "title": "ABC-18",
+        "body": "{{last_mutation_body}}",
+        "draft": true,
+        "user": {"id": 424242},
+        "head": {"ref": "symphony/ABC-18"},
+        "base": {"ref": "main"}
+      }
+    ]
+  }
+]

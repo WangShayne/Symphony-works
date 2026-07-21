@@ -4,9 +4,11 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.{Config, ExecCommand, PathSafety, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
+  @exec_stop_timeout_ms 2_500
+  @owner_shutdown_grace_ms @exec_stop_timeout_ms * 2 + 1_000
 
   @type worker_host :: String.t() | nil
 
@@ -341,18 +343,11 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
-    task =
-      Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
-      end)
-
-    case Task.yield(task, timeout_ms) do
+    case run_local_hook_command(command, workspace, timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
-      nil ->
-        Task.shutdown(task, :brutal_kill)
-
+      {:error, :timeout} ->
         Logger.warning("Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local timeout_ms=#{timeout_ms}")
 
         {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
@@ -373,6 +368,59 @@ defmodule SymphonyElixir.Workspace do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp run_local_hook_command(command, workspace, timeout_ms) do
+    caller = self()
+    ref = make_ref()
+
+    owner =
+      spawn(fn ->
+        Process.flag(:trap_exit, true)
+        caller_ref = Process.monitor(caller)
+        result = run_owned_exec_hook(command, workspace, timeout_ms, caller_ref)
+        send(caller, {ref, result})
+      end)
+
+    owner_ref = Process.monitor(owner)
+
+    receive do
+      {^ref, result} ->
+        Process.demonitor(owner_ref, [:flush])
+        result
+
+      {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
+        {:error, :timeout}
+    after
+      timeout_ms + @owner_shutdown_grace_ms ->
+        kill_owner_and_wait(owner, owner_ref)
+        {:error, :timeout}
+    end
+  end
+
+  defp run_owned_exec_hook(command, workspace, timeout_ms, caller_ref) do
+    shell = System.find_executable("sh") || "/bin/sh"
+
+    case ExecCommand.run([shell, "-lc", command],
+           cd: workspace,
+           timeout_ms: timeout_ms,
+           stop_timeout_ms: @exec_stop_timeout_ms,
+           caller_ref: caller_ref
+         ) do
+      {:ok, result} -> {:ok, {result.stdout, result.status}}
+      {:error, :caller_down} -> {:error, :timeout}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp kill_owner_and_wait(owner, owner_ref) do
+    Process.exit(owner, :kill)
+
+    receive do
+      {:DOWN, ^owner_ref, :process, ^owner, _reason} -> :ok
+    after
+      1_000 -> :ok
     end
   end
 

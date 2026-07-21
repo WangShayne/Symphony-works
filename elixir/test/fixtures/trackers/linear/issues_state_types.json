@@ -1,0 +1,101 @@
+{
+  "status": 200,
+  "headers": {},
+  "body": {
+    "data": {
+      "issues": {
+        "nodes": [
+          {
+            "id": "issue-1",
+            "identifier": "ENG-1",
+            "title": "Issue with typed blockers",
+            "description": "Issue body",
+            "priority": 2,
+            "state": {
+              "id": "state-started",
+              "name": "Custom building name",
+              "type": "started"
+            },
+            "branchName": "feature/ENG-1",
+            "url": "https://linear.test/issue/ENG-1",
+            "assignee": {
+              "id": "worker-1"
+            },
+            "labels": {
+              "nodes": [
+                {
+                  "name": "ready-for-agent"
+                }
+              ]
+            },
+            "inverseRelations": {
+              "nodes": [
+                {
+                  "type": "blocks",
+                  "issue": {
+                    "id": "blocker-complete",
+                    "identifier": "ENG-90",
+                    "state": {
+                      "name": "Released to customers",
+                      "type": "completed"
+                    }
+                  }
+                },
+                {
+                  "type": "blocks",
+                  "issue": {
+                    "id": "blocker-active",
+                    "identifier": "ENG-91",
+                    "state": {
+                      "name": "Waiting on legal",
+                      "type": "started"
+                    }
+                  }
+                }
+              ],
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              }
+            },
+            "createdAt": "2026-07-20T00:00:00Z",
+            "updatedAt": "2026-07-20T00:01:00Z"
+          },
+          {
+            "id": "issue-2",
+            "identifier": "ENG-2",
+            "title": "Issue in a custom terminal state",
+            "description": "Issue body",
+            "priority": 3,
+            "state": {
+              "id": "state-completed",
+              "name": "Released to customers",
+              "type": "completed"
+            },
+            "branchName": "feature/ENG-2",
+            "url": "https://linear.test/issue/ENG-2",
+            "assignee": {
+              "id": "worker-1"
+            },
+            "labels": {
+              "nodes": [
+                {
+                  "name": "ready-for-agent"
+                }
+              ]
+            },
+            "inverseRelations": {
+              "nodes": [],
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              }
+            },
+            "createdAt": "2026-07-20T00:00:00Z",
+            "updatedAt": "2026-07-20T00:01:00Z"
+          }
+        ]
+      }
+    }
+  }
+}

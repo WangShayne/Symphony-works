@@ -1,0 +1,14 @@
+{
+  "status": 200,
+  "headers": {},
+  "body": {
+    "data": {
+      "commentUpdate": {
+        "success": true,
+        "comment": {
+          "id": "comment-1"
+        }
+      }
+    }
+  }
+}

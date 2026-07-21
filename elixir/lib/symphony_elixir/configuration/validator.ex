@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Configuration.Validator do
   Runs local validation for a configuration revision and returns redacted evidence.
   """
 
-  alias SymphonyElixir.Configuration.{Document, Exporter}
+  alias SymphonyElixir.Configuration.{Document, Exporter, IntegrationProbe}
   alias SymphonyElixir.Runtime.CapabilityProbe
 
   @spec validate(term(), keyword()) :: {:ok, map()} | {:error, {:invalid_configuration, list()} | tuple()}
@@ -47,8 +47,13 @@ defmodule SymphonyElixir.Configuration.Validator do
   end
 
   defp default_probes(document) do
-    if CapabilityProbe.configured?(document), do: [CapabilityProbe], else: []
+    []
+    |> maybe_add_probe(CapabilityProbe.configured?(document), CapabilityProbe)
+    |> maybe_add_probe(IntegrationProbe.configured?(document), IntegrationProbe)
   end
+
+  defp maybe_add_probe(probes, true, probe), do: probes ++ [probe]
+  defp maybe_add_probe(probes, false, _probe), do: probes
 
   defp extra_probes(opts) do
     case Keyword.get(opts, :probes, Application.get_env(:symphony_elixir, :configuration_probes, [])) do

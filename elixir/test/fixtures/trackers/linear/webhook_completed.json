@@ -1,0 +1,18 @@
+{
+  "webhookId": "webhook-completed",
+  "webhookTimestamp": 1721430000000,
+  "type": "Issue",
+  "action": "update",
+  "actor": {
+    "id": "human-1",
+    "type": "user"
+  },
+  "data": {
+    "id": "issue-1",
+    "identifier": "ENG-1",
+    "state": {
+      "name": "Released to customers",
+      "type": "completed"
+    }
+  }
+}

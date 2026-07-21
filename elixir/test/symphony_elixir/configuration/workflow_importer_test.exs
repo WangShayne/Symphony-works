@@ -30,6 +30,7 @@ defmodule SymphonyElixir.Configuration.WorkflowImporterTest do
     assert [project] = draft.document["automation_projects"]
     assert project["tracker"]["kind"] == "github"
     assert project["tracker"]["scope"] == "WangShayne/Symphony-works"
+    assert project["tracker_integration_ref"] == "tracker"
     assert hd(draft.document["task_types"])["name"] == "General"
     profile = hd(draft.document["execution_profiles"])
     assert profile["instructions"] =~ "Implement the tracked issue"
@@ -37,6 +38,14 @@ defmodule SymphonyElixir.Configuration.WorkflowImporterTest do
     refute Map.has_key?(profile, "thread_sandbox")
 
     integrations = Map.new(draft.document["integrations"], &{&1["id"], &1})
+    assert integrations["tracker"]["provider"] == "github"
+
+    assert integrations["tracker"]["settings"] == %{
+             "owner" => "WangShayne",
+             "repository" => "Symphony-works"
+           }
+
+    refute Map.has_key?(integrations["tracker"], "credential_ref")
     assert integrations["workspace"]["settings"]["root"] == "/tmp/symphony-workspaces"
     assert integrations["codex"]["settings"]["command"] == "codex app-server"
     assert integrations["codex"]["settings"]["thread_sandbox"] == "workspace-write"
@@ -68,5 +77,27 @@ defmodule SymphonyElixir.Configuration.WorkflowImporterTest do
     assert {:error, :missing_workflow_source} = WorkflowImporter.import(%{})
   after
     File.rm(Path.join(System.tmp_dir!(), "symphony-workflow-importer-test.md"))
+  end
+
+  test "imports provider-specific tracker settings only when legacy API keys exist" do
+    for {kind, project_slug, expected_settings} <- [
+          {"github", "not-a-repository-slug", %{}},
+          {"gitlab", "group/project", %{"project_id" => "group/project"}},
+          {"linear", "ENG", %{"project_slug" => "ENG"}},
+          {"unknown", "ignored", %{}}
+        ] do
+      workflow = """
+      ---
+      tracker:
+        kind: #{kind}
+        project_slug: #{project_slug}
+        api_key: legacy-secret
+      ---
+      Prompt
+      """
+
+      assert {:ok, draft} = WorkflowImporter.import(%{"content" => workflow})
+      assert [%{"id" => "tracker", "settings" => ^expected_settings}] = draft["integrations"]
+    end
   end
 end

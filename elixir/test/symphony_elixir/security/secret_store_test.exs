@@ -72,6 +72,11 @@ defmodule SymphonyElixir.Security.SecretStoreTest do
   end
 
   test "invalid create, fetch, replace, export, and rotation inputs fail closed" do
+    assert SecretStore.valid_reference_id?(Ecto.UUID.generate())
+    refute SecretStore.valid_reference_id?("plaintext-secret")
+    refute SecretStore.valid_reference_id?("1234567890abcdef")
+    refute SecretStore.valid_reference_id?("00000000-0000-0000-0000-00000000000z")
+
     assert {:error, :invalid_name} = SecretStore.put("", "value", actor: "admin-1")
     assert {:error, :invalid_name} = SecretStore.put(String.duplicate("n", 129), "value", actor: "admin-1")
     assert {:error, :invalid_name} = SecretStore.put(:bad_name, "value", actor: "admin-1")

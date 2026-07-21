@@ -1,0 +1,19 @@
+[
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/branches/main",
+    "status": 429,
+    "headers": {"retry-after": "0"},
+    "body": {"message": "SECRET provider limit body"}
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/branches/main",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "name": "main",
+      "commit": {"sha": "2020202020202020202020202020202020202020"}
+    }
+  }
+]

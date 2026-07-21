@@ -1,0 +1,20 @@
+{
+  "action": "closed",
+  "issue": {
+    "id": 1000017,
+    "number": 17,
+    "title": "Wire identity",
+    "body": "Issue body",
+    "state": "closed",
+    "labels": [
+      {"name": "ready-for-agent"}
+    ],
+    "assignee": {
+      "id": 42,
+      "login": "symphony-bot"
+    },
+    "html_url": "https://github.test/acme/symphony/issues/17",
+    "created_at": "2026-07-20T00:00:00Z",
+    "updated_at": "2026-07-20T00:02:00Z"
+  }
+}

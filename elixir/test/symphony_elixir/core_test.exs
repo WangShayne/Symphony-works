@@ -349,7 +349,6 @@ defmodule SymphonyElixir.CoreTest do
 
     hook_marker = Path.join(test_root, "before-run-started")
     hook_fifo = Path.join(test_root, "before-run-blocker")
-    hook_pid_file = Path.join(test_root, "before-run-pids")
     runtime_supervisor_name = Module.concat(__MODULE__, "AgentRuntimeSupervisor#{issue_suffix}")
     task_supervisor_name = Module.concat(__MODULE__, "TaskSupervisor#{issue_suffix}")
     orchestrator_name = Module.concat(__MODULE__, "RestartOrchestrator#{issue_suffix}")
@@ -368,13 +367,11 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     on_exit(fn ->
-      terminate_hook_processes(hook_pid_file)
-
       if pid = Process.whereis(runtime_supervisor_name) do
         GenServer.stop(pid)
       end
 
-      terminate_hook_processes(hook_pid_file)
+      terminate_hook_processes(test_root)
       restore_app_env(:memory_tracker_issues, previous_memory_issues)
       restart_default_runtime!()
       File.rm_rf(test_root)
@@ -392,7 +389,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_kind: "memory",
       workspace_root: test_root,
       poll_interval_ms: 10,
-      hook_before_run: "printf '%s\\n' $$ >> \"#{hook_pid_file}\"; mkfifo \"#{hook_fifo}\"; : > \"#{hook_marker}\"; read _ < \"#{hook_fifo}\"",
+      hook_before_run: "mkfifo \"#{hook_fifo}\"; : > \"#{hook_marker}\"; read _ < \"#{hook_fifo}\"",
       hook_timeout_ms: 60_000
     )
 
@@ -463,6 +460,17 @@ defmodule SymphonyElixir.CoreTest do
 
     assert is_pid(second_worker_pid)
     assert Process.alive?(second_worker_pid)
+
+    runtime_supervisor_name
+    |> Process.whereis()
+    |> GenServer.stop()
+
+    assert eventually_value(fn ->
+             case hook_process_ids(test_root) do
+               [] -> true
+               _pids -> nil
+             end
+           end)
   end
 
   test "linear issue state reconciliation fetch with no running issues is a no-op" do
@@ -1126,6 +1134,20 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
+  test "agent runner rejects unsafe preferred ssh hosts before remote startup" do
+    issue = %Issue{
+      id: "issue-unsafe-worker-host",
+      identifier: "MT-UNSAFE-WORKER",
+      title: "Reject unsafe worker host",
+      description: "Do not pass option-shaped destinations to ssh",
+      state: "In Progress"
+    }
+
+    assert_raise RuntimeError, ~r/invalid_ssh_destination/, fn ->
+      AgentRunner.run(issue, nil, worker_host: "-oProxyCommand=bad")
+    end
+  end
+
   defp assert_due_after_delay(due_at_ms, requested_at_ms, observed_at_ms, delay_ms) do
     assert due_at_ms >= requested_at_ms + delay_ms
     assert due_at_ms <= observed_at_ms + delay_ms
@@ -1133,50 +1155,6 @@ defmodule SymphonyElixir.CoreTest do
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
   defp restore_app_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
-
-  defp terminate_hook_processes(pid_file) do
-    pid_file
-    |> hook_pids()
-    |> Enum.each(&terminate_os_process/1)
-  end
-
-  defp hook_pids(pid_file) do
-    if File.exists?(pid_file), do: read_hook_pids(pid_file), else: []
-  end
-
-  defp read_hook_pids(pid_file) do
-    pid_file
-    |> File.read!()
-    |> String.split("\n", trim: true)
-    |> Enum.flat_map(&parse_hook_pid/1)
-    |> Enum.uniq()
-  end
-
-  defp parse_hook_pid(pid) do
-    case Integer.parse(pid) do
-      {integer, ""} when integer > 0 -> [integer]
-      _invalid -> []
-    end
-  end
-
-  defp terminate_os_process(pid) do
-    pid_string = Integer.to_string(pid)
-    _term = System.cmd("kill", ["-TERM", pid_string], stderr_to_stdout: true)
-    Process.sleep(20)
-
-    if os_process_alive?(pid_string) do
-      _kill = System.cmd("kill", ["-KILL", pid_string], stderr_to_stdout: true)
-    end
-
-    :ok
-  end
-
-  defp os_process_alive?(pid_string) do
-    case System.cmd("kill", ["-0", pid_string], stderr_to_stdout: true) do
-      {_output, 0} -> true
-      {_output, _status} -> false
-    end
-  end
 
   defp restart_default_runtime! do
     if Process.whereis(SymphonyElixir.AgentRuntimeSupervisor) do
@@ -2268,6 +2246,59 @@ defmodule SymphonyElixir.CoreTest do
              end)
     after
       File.rm_rf(test_root)
+    end
+  end
+
+  defp terminate_hook_processes(test_root) do
+    cleaned_up? = eventually_value(fn -> terminate_hook_processes_once(test_root) end)
+
+    unless cleaned_up?, do: flunk_uncleaned_hook_processes(test_root)
+  end
+
+  defp terminate_hook_processes_once(test_root) do
+    case hook_process_ids(test_root) do
+      [] ->
+        true
+
+      pids ->
+        Enum.each(pids, fn pid ->
+          System.cmd("kill", ["-TERM", Integer.to_string(pid)], stderr_to_stdout: true)
+        end)
+
+        nil
+    end
+  end
+
+  defp flunk_uncleaned_hook_processes(test_root) do
+    case hook_process_ids(test_root) do
+      [] -> :ok
+      pids -> flunk("hook process cleanup timed out: #{inspect(pids)}")
+    end
+  end
+
+  defp hook_process_ids(test_root) do
+    case System.cmd("ps", ["-axo", "pid=,command="], stderr_to_stdout: true) do
+      {output, 0} ->
+        output
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.contains?(&1, test_root))
+        |> Enum.flat_map(&process_id_from_ps_line/1)
+
+      {_output, _status} ->
+        []
+    end
+  end
+
+  defp process_id_from_ps_line(line) do
+    case line |> String.trim() |> String.split(~r/\s+/, parts: 2) do
+      [pid, _command] ->
+        case Integer.parse(pid) do
+          {pid, ""} -> [pid]
+          _invalid -> []
+        end
+
+      _invalid ->
+        []
     end
   end
 end

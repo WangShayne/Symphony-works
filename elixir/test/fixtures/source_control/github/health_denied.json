@@ -1,0 +1,37 @@
+[
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget",
+    "status": 200,
+    "headers": {"x-oauth-scopes": "repo"},
+    "body": {
+      "full_name": "acme/widget",
+      "permissions": {"pull": true, "push": false, "admin": false}
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/branches/main",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "name": "main",
+      "protected": true,
+      "commit": {"sha": "1111111111111111111111111111111111111111"}
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/rules/branches/main",
+    "status": 200,
+    "headers": {},
+    "body": []
+  },
+  {
+    "method": "GET",
+    "path": "/user",
+    "status": 200,
+    "headers": {},
+    "body": {"id": 424242, "login": "symphony-bot"}
+  }
+]

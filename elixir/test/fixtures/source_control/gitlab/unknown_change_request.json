@@ -1,0 +1,33 @@
+[
+  {
+    "method": "GET",
+    "path": "/projects/acme%2Fwidget/merge_requests",
+    "status": 200,
+    "headers": {},
+    "body": []
+  },
+  {
+    "method": "POST",
+    "path": "/projects/acme%2Fwidget/merge_requests",
+    "error": "timeout"
+  },
+  {
+    "method": "GET",
+    "path": "/projects/acme%2Fwidget/merge_requests",
+    "status": 200,
+    "headers": {},
+    "body": [
+      {
+        "id": 19019,
+        "iid": 19,
+        "web_url": "https://gitlab.test/acme/widget/-/merge_requests/19",
+        "title": "Draft: ABC-19",
+        "description": "{{last_mutation_body}}",
+        "draft": true,
+        "author": {"id": 31337},
+        "source_branch": "symphony/ABC-19",
+        "target_branch": "main"
+      }
+    ]
+  }
+]

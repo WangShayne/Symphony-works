@@ -1,0 +1,25 @@
+{
+  "status": 200,
+  "headers": {},
+  "body": {
+    "data": {
+      "issue": {
+        "comments": {
+          "nodes": [
+            {
+              "id": "embedded-marker",
+              "body": "Human-authored preface\n<!-- symphony-tracker:progress issue=linear:issue-1 -->\nDo not overwrite this comment.",
+              "user": {
+                "id": "linear-bot"
+              }
+            }
+          ],
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          }
+        }
+      }
+    }
+  }
+}

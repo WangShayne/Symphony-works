@@ -245,10 +245,13 @@ defmodule SymphonyElixir.ConfigurationTest do
   end
 
   test "Administrator rolls back to a prior immutable revision and exports redacted configuration" do
-    {:ok, first_draft} = Configuration.create_draft(secret_document("first-secret"), actor: "admin")
+    {:ok, first_reference} = SecretStore.put("first-secret", "first-plaintext", actor: "admin")
+    {:ok, next_reference} = SecretStore.put("next-secret", "next-plaintext", actor: "admin")
+
+    {:ok, first_draft} = Configuration.create_draft(secret_document(first_reference.id), actor: "admin")
     {:ok, first_active} = Configuration.activate(first_draft.id, actor: "admin")
 
-    {:ok, next_draft} = Configuration.create_draft(secret_document("next-secret"), actor: "admin")
+    {:ok, next_draft} = Configuration.create_draft(secret_document(next_reference.id), actor: "admin")
     {:ok, next_active} = Configuration.activate(next_draft.id, actor: "admin")
 
     assert next_active.id == Configuration.active!().id
@@ -262,7 +265,8 @@ defmodule SymphonyElixir.ConfigurationTest do
     assert {:ok, exported} = Configuration.export(rolled_back.id, redacted: true)
     encoded = Jason.encode!(exported)
 
-    refute encoded =~ "first-secret"
+    refute encoded =~ "first-plaintext"
+    refute encoded =~ first_reference.id
     assert encoded =~ "[REDACTED]"
 
     assert {:error, {:invalid_transition, :active, :rollback}} =
@@ -413,10 +417,10 @@ defmodule SymphonyElixir.ConfigurationTest do
     })
   end
 
-  defp secret_document(secret) do
+  defp secret_document(credential_ref) do
     valid_document()
-    |> Map.put("integrations", [
-      %{"id" => "tracker", "kind" => "github", "credential_ref" => "secret:#{secret}"}
+    |> Map.put("providers", [
+      %{"id" => "provider", "name" => "Provider", "credential_ref" => credential_ref}
     ])
   end
 

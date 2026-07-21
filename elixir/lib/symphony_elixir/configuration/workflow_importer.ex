@@ -45,6 +45,7 @@ defmodule SymphonyElixir.Configuration.WorkflowImporter do
       }
     ])
     |> Map.put("integrations", integrations(tracker, workspace, codex))
+    |> Document.ensure_project_integration_refs()
   end
 
   defp integrations(tracker, workspace, codex) do
@@ -55,12 +56,42 @@ defmodule SymphonyElixir.Configuration.WorkflowImporter do
     |> Enum.reverse()
   end
 
-  defp maybe_add_tracker(integrations, %{"api_key" => api_key})
+  defp maybe_add_tracker(integrations, %{"api_key" => api_key} = tracker)
        when is_binary(api_key) and api_key != "" do
-    [%{"id" => "tracker", "kind" => "tracker", "credential_ref" => "secret:tracker"} | integrations]
+    provider = Map.get(tracker, "kind", "github")
+
+    [
+      %{
+        "id" => "tracker",
+        "kind" => "tracker",
+        "provider" => provider,
+        "settings" => tracker_settings(provider, tracker)
+      }
+      | integrations
+    ]
   end
 
   defp maybe_add_tracker(integrations, _tracker), do: integrations
+
+  defp tracker_settings("github", tracker) do
+    case String.split(Map.get(tracker, "project_slug", ""), "/", parts: 2) do
+      [owner, repository] when owner != "" and repository != "" ->
+        %{"owner" => owner, "repository" => repository}
+
+      _parts ->
+        %{}
+    end
+  end
+
+  defp tracker_settings("gitlab", tracker) do
+    %{"project_id" => Map.get(tracker, "project_slug", "")}
+  end
+
+  defp tracker_settings("linear", tracker) do
+    %{"project_slug" => Map.get(tracker, "project_slug", "")}
+  end
+
+  defp tracker_settings(_provider, _tracker), do: %{}
 
   defp maybe_add_workspace(integrations, workspace) when map_size(workspace) > 0 do
     [%{"id" => "workspace", "kind" => "workspace", "settings" => workspace} | integrations]

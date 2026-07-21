@@ -1759,7 +1759,7 @@ defmodule SymphonyElixir.AppServerTest do
       lines = String.split(trace, "\n", trim: true)
 
       assert argv_line = Enum.find(lines, &String.starts_with?(&1, "ARGV:"))
-      assert argv_line =~ "-T -p 2200 worker-01 bash -lc"
+      assert argv_line =~ "-T -p 2200 -- worker-01 bash -lc"
       assert argv_line =~ "cd "
       assert argv_line =~ remote_workspace
       assert argv_line =~ "exec "

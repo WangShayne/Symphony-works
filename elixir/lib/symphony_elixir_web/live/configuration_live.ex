@@ -10,6 +10,14 @@ defmodule SymphonyElixirWeb.ConfigurationLive do
   alias SymphonyElixir.Identity
   alias SymphonyElixir.Identity.Authorization
 
+  @health_atom_keys %{
+    "repository" => :repository,
+    "base_branch" => :base_branch,
+    "evidence" => :evidence,
+    "scope" => :scope,
+    "transport" => :transport
+  }
+
   @runtime_model_roles [
     %{
       key: "routing",
@@ -32,9 +40,9 @@ defmodule SymphonyElixirWeb.ConfigurationLive do
       default_reference_id: "routing-fallback-model",
       default_model_id: "codex-routing-fallback",
       default_context_window: 64_000,
-      default_capability_context_window: 32_000,
+      default_capability_context_window: 64_000,
       default_structured_output: true,
-      default_tool_use: false,
+      default_tool_use: true,
       default_input_price: "0",
       default_cached_input_price: "0",
       default_output_price: "0"
@@ -120,7 +128,8 @@ defmodule SymphonyElixirWeb.ConfigurationLive do
   def handle_event("update_draft", %{"project" => project}, %{assigns: %{revision: revision}} = socket)
       when not is_nil(revision) do
     authorize_event(socket, :write_configuration, fn actor ->
-      document = Document.for_project(project)
+      [sanitized_project] = Document.for_project(project)["automation_projects"]
+      document = Map.put(revision.document, "automation_projects", [sanitized_project])
 
       case Configuration.update_draft(revision.id, document, actor: actor) do
         {:ok, revision} -> {:noreply, assign(socket, revision: revision, exported: nil, error: nil, actor: actor)}
@@ -131,12 +140,60 @@ defmodule SymphonyElixirWeb.ConfigurationLive do
 
   def handle_event("bind_runtime_model", %{"runtime_model" => params}, %{assigns: %{revision: revision}} = socket)
       when not is_nil(revision) do
-    document = runtime_model_document(revision.document, params)
+    authorize_event(socket, :write_configuration, fn actor ->
+      document = runtime_model_document(revision.document, params)
 
-    case Configuration.update_draft(revision.id, document, actor: "bootstrap-admin") do
-      {:ok, revision} -> {:noreply, assign(socket, revision: revision, exported: nil, error: nil)}
-      {:error, reason} -> {:noreply, assign(socket, error: error_message(reason))}
-    end
+      case Configuration.update_draft(revision.id, document, actor: actor) do
+        {:ok, revision} ->
+          {:noreply, assign(socket, revision: revision, exported: nil, error: nil, actor: actor)}
+
+        {:error, reason} ->
+          {:noreply, assign(socket, error: error_message(reason), actor: actor)}
+      end
+    end)
+  end
+
+  def handle_event(
+        "configure_integration",
+        %{"integration" => params},
+        %{assigns: %{revision: revision}} = socket
+      )
+      when not is_nil(revision) do
+    authorize_event(socket, :write_configuration, fn actor ->
+      with {:ok, integration} <- normalize_integration(params),
+           document <- upsert_integration(revision.document, integration),
+           {:ok, revision} <- Configuration.update_draft(revision.id, document, actor: actor) do
+        {:noreply, assign(socket, revision: revision, exported: nil, error: nil, actor: actor)}
+      else
+        {:error, reason} ->
+          {:noreply, assign(socket, error: error_message(reason), actor: actor)}
+      end
+    end)
+  end
+
+  def handle_event(
+        "create_task_type",
+        %{"task_type" => params},
+        %{assigns: %{revision: revision}} = socket
+      )
+      when not is_nil(revision) do
+    authorize_event(socket, :write_configuration, fn actor ->
+      document = task_type_document(revision.document, params)
+
+      case Configuration.update_draft(revision.id, document, actor: actor) do
+        {:ok, revision} ->
+          {:noreply, assign(socket, revision: revision, exported: nil, error: nil, actor: actor)}
+
+        {:error, reason} ->
+          {:noreply, assign(socket, error: error_message(reason), actor: actor)}
+      end
+    end)
+  end
+
+  def handle_event("create_task_type", _params, socket) do
+    authorize_event(socket, :write_configuration, fn actor ->
+      {:noreply, assign(socket, error: "Invalid configuration", actor: actor)}
+    end)
   end
 
   def handle_event("templates", _params, socket) do
@@ -226,6 +283,11 @@ defmodule SymphonyElixirWeb.ConfigurationLive do
 
   defp error_message(:not_found), do: "Configuration revision not found"
   defp error_message({:invalid_configuration, [error | _]}), do: "Invalid configuration: #{format_error(error)}"
+
+  defp error_message({:probe_failed, :integration, %{"integration" => %{"id" => id, "provider" => provider, "reason" => reason}}}) do
+    "Integration health check failed / 集成健康检查失败: #{id} · #{provider} · #{reason}"
+  end
+
   defp error_message(_reason), do: "Invalid configuration"
 
   defp format_error(%{path: path, message: message}) do
@@ -423,6 +485,166 @@ defmodule SymphonyElixirWeb.ConfigurationLive do
     end
   end
 
+  defp normalize_integration(params) when is_map(params) do
+    id = params |> Map.get("id", "") |> String.trim()
+    kind = params |> Map.get("kind", "") |> String.trim()
+    provider = params |> Map.get("provider", "") |> String.trim()
+
+    if id == "" or kind == "" or provider == "" do
+      {:error, :invalid_integration}
+    else
+      settings =
+        params
+        |> Map.take([
+          "endpoint",
+          "api_base_url",
+          "project_slug",
+          "assignee",
+          "owner",
+          "repository",
+          "project_id",
+          "base_branch",
+          "scenario",
+          "webhook_secret_ref",
+          "bot_actor_id"
+        ])
+        |> compact_strings()
+        |> canonicalize_integration_settings(kind)
+        |> maybe_put_state_ids(Map.get(params, "state_ids"))
+
+      integration = %{
+        "id" => id,
+        "kind" => kind,
+        "provider" => provider,
+        "settings" => settings
+      }
+
+      {:ok, maybe_put_credential_ref(integration, Map.get(params, "credential_ref"))}
+    end
+  end
+
+  defp normalize_integration(_params), do: {:error, :invalid_integration}
+
+  defp canonicalize_integration_settings(settings, "source_control") do
+    case Map.pop(settings, "endpoint") do
+      {nil, settings} ->
+        settings
+
+      {endpoint, settings} ->
+        Map.put_new(settings, "api_base_url", endpoint)
+    end
+  end
+
+  defp canonicalize_integration_settings(settings, _kind), do: settings
+
+  defp compact_strings(values) do
+    Map.new(values, fn {key, value} -> {key, if(is_binary(value), do: String.trim(value), else: value)} end)
+    |> Map.reject(fn {_key, value} -> value in [nil, ""] end)
+  end
+
+  defp maybe_put_state_ids(settings, state_ids) when is_map(state_ids) do
+    case compact_strings(state_ids) do
+      state_ids when map_size(state_ids) > 0 -> Map.put(settings, "state_ids", state_ids)
+      _state_ids -> settings
+    end
+  end
+
+  defp maybe_put_state_ids(settings, _state_ids), do: settings
+
+  defp maybe_put_credential_ref(integration, reference) when is_binary(reference) do
+    case String.trim(reference) do
+      "" -> integration
+      reference -> Map.put(integration, "credential_ref", reference)
+    end
+  end
+
+  defp maybe_put_credential_ref(integration, _reference), do: integration
+
+  defp upsert_integration(document, integration) do
+    integrations =
+      document
+      |> Map.get("integrations", [])
+      |> Enum.reject(&(Map.get(&1, "id") == integration["id"]))
+      |> Kernel.++([integration])
+
+    Map.put(document, "integrations", integrations)
+  end
+
+  defp task_type_document(document, params) do
+    id = field(params, "id", "general")
+
+    task_type = %{
+      "id" => id,
+      "name" => field(params, "name", "General"),
+      "profile_id" => field(params, "profile_id", "general-profile")
+    }
+
+    task_types =
+      document
+      |> Map.get("task_types", [])
+      |> Enum.reject(&(Map.get(&1, "id") == id))
+      |> Kernel.++([task_type])
+
+    Map.put(document, "task_types", task_types)
+  end
+
+  defp project_value(revision, field) do
+    revision.document
+    |> Map.fetch!("automation_projects")
+    |> hd()
+    |> Map.get(field, "")
+  end
+
+  defp integration_health(nil), do: nil
+
+  defp integration_health(revision) do
+    revision.validation_evidence
+    |> case do
+      %{"probes" => probes} when is_list(probes) ->
+        Enum.find(probes, &(is_map(&1) and Map.get(&1, "probe") == "integrations"))
+
+      _evidence ->
+        nil
+    end
+  end
+
+  defp display_revision(nil, active), do: active
+  defp display_revision(revision, _active), do: revision
+
+  defp integration_kind_label("tracker"), do: "Tracker / 任务跟踪"
+  defp integration_kind_label("source_control"), do: "Source Control / 源代码托管"
+  defp integration_kind_label(kind), do: kind
+
+  defp integration_health_summary(%{"health" => health}) when is_map(health) do
+    evidence = health_value(health, "evidence")
+
+    [
+      health_value(health, "repository"),
+      health_value(health, "base_branch"),
+      health_value(evidence, "endpoint"),
+      health_value(evidence, "scope"),
+      health_value(evidence, "transport")
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.map_join(" · ", &health_display_value/1)
+  end
+
+  defp integration_health_summary(_item), do: ""
+
+  defp health_display_value(:deterministic_fixture),
+    do: "Deterministic fixture / 确定性夹具"
+
+  defp health_display_value("deterministic_fixture"),
+    do: "Deterministic fixture / 确定性夹具"
+
+  defp health_display_value(value), do: to_string(value)
+
+  defp health_value(value, key) when is_map(value) do
+    Map.get(value, key) || Map.get(value, Map.get(@health_atom_keys, key))
+  end
+
+  defp health_value(_value, _key), do: nil
+
   @impl true
   def render(assigns) do
     ~H"""
@@ -465,6 +687,14 @@ defmodule SymphonyElixirWeb.ConfigurationLive do
           <label>
             Target branch
             <input name="project[repository][target_branch]" value="main" required />
+          </label>
+          <label>
+            Tracker integration ref
+            <input name="project[tracker_integration_ref]" placeholder="tracker-fixture" />
+          </label>
+          <label>
+            Source Control integration ref
+            <input name="project[source_control_integration_ref]" placeholder="delivery-fixture" />
           </label>
           <button type="submit">Create draft</button>
         </form>
@@ -521,8 +751,190 @@ defmodule SymphonyElixirWeb.ConfigurationLive do
             Target branch
             <input name="project[repository][target_branch]" value={@revision.document["automation_projects"] |> hd() |> Map.fetch!("repository") |> Map.fetch!("target_branch")} required />
           </label>
+          <label>
+            Tracker integration ref
+            <input name="project[tracker_integration_ref]" value={project_value(@revision, "tracker_integration_ref")} />
+          </label>
+          <label>
+            Source Control integration ref
+            <input name="project[source_control_integration_ref]" value={project_value(@revision, "source_control_integration_ref")} />
+          </label>
           <button type="submit">Update draft</button>
         </form>
+
+        <section :if={display_revision(@revision, @active)} id="integrations-panel" class="integration-panel">
+          <div class="integration-heading">
+            <div>
+              <p class="eyebrow">Provider-neutral boundaries</p>
+              <h2>Integrations / 集成</h2>
+            </div>
+          </div>
+
+          <div class="integration-list" aria-live="polite">
+            <article
+              :for={integration <- Map.get(display_revision(@revision, @active).document, "integrations", [])}
+              id={"integration-#{integration["id"]}"}
+              class="integration-card"
+            >
+              <span class="integration-kind">{integration_kind_label(integration["kind"])}</span>
+              <strong>{integration["id"]}</strong>
+              <span>{integration["provider"]}</span>
+            </article>
+            <p
+              :if={Map.get(display_revision(@revision, @active).document, "integrations", []) == []}
+              class="empty-integrations"
+            >
+              No integrations configured / 尚未配置集成
+            </p>
+          </div>
+        </section>
+
+        <form
+          :if={@revision && @revision.status == :draft}
+          id="integration-form"
+          phx-submit="configure_integration"
+        >
+          <div class="form-intro wide-field">
+            <h2>Configure integration / 配置集成</h2>
+          </div>
+          <label>
+            Integration ID / 集成 ID
+            <input name="integration[id]" placeholder="tracker-main" required />
+          </label>
+          <label>
+            Boundary / 边界
+            <select name="integration[kind]" required>
+              <option value="tracker">Tracker / 任务跟踪</option>
+              <option value="source_control">Source Control / 源代码托管</option>
+            </select>
+          </label>
+          <label>
+            Provider / 提供商
+            <select name="integration[provider]" required>
+              <option value="fixture">Deterministic fixture / 确定性夹具</option>
+              <option value="linear">Linear (Tracker only)</option>
+              <option value="github">GitHub</option>
+              <option value="gitlab">GitLab</option>
+            </select>
+          </label>
+          <label class="wide-field">
+            Secret reference UUID / 密钥引用 UUID
+            <input
+              name="integration[credential_ref]"
+              autocomplete="off"
+              placeholder="Not required for deterministic fixtures"
+            />
+          </label>
+          <label class="wide-field">
+            Webhook secret reference UUID / Webhook 密钥引用 UUID
+            <input
+              name="integration[webhook_secret_ref]"
+              autocomplete="off"
+              placeholder="Required for production Tracker adapters"
+            />
+          </label>
+          <label>
+            GitHub owner
+            <input name="integration[owner]" placeholder="WangShayne" />
+          </label>
+          <label>
+            Repository / 仓库
+            <input name="integration[repository]" placeholder="Symphony-works" />
+          </label>
+          <label>
+            Linear project slug
+            <input name="integration[project_slug]" placeholder="engineering" />
+          </label>
+          <label>
+            GitLab project ID
+            <input name="integration[project_id]" placeholder="group/project" />
+          </label>
+          <label>
+            Base branch / 目标分支
+            <input name="integration[base_branch]" placeholder="main" />
+          </label>
+          <label>
+            Endpoint / 端点
+            <input name="integration[endpoint]" placeholder="Provider default" />
+          </label>
+          <label>
+            Fixture scenario / 夹具场景
+            <input name="integration[scenario]" value="healthy" />
+          </label>
+          <label>
+            Bot actor ID / 机器人身份 ID
+            <input name="integration[bot_actor_id]" placeholder="symphony-bot" />
+          </label>
+          <label>
+            Linear assignee
+            <input name="integration[assignee]" placeholder="Optional" />
+          </label>
+          <fieldset class="integration-state-ids wide-field">
+            <legend>Linear workflow state IDs / Linear 工作流状态 ID</legend>
+            <label>
+              Backlog
+              <input name="integration[state_ids][backlog]" autocomplete="off" />
+            </label>
+            <label>
+              Unstarted
+              <input name="integration[state_ids][unstarted]" autocomplete="off" />
+            </label>
+            <label>
+              Started
+              <input name="integration[state_ids][started]" autocomplete="off" />
+            </label>
+            <label>
+              Completed
+              <input name="integration[state_ids][completed]" autocomplete="off" />
+            </label>
+            <label>
+              Cancelled
+              <input name="integration[state_ids][cancelled]" autocomplete="off" />
+            </label>
+          </fieldset>
+          <button type="submit">Save integration / 保存集成</button>
+        </form>
+
+        <form :if={@revision && @revision.status == :draft} id="task-type-form" phx-submit="create_task_type">
+          <h2>Task type</h2>
+          <label>
+            Task type ID
+            <input name="task_type[id]" value="general" required />
+          </label>
+          <label>
+            Name
+            <input name="task_type[name]" value="General" required />
+          </label>
+          <label>
+            Execution profile ID
+            <input name="task_type[profile_id]" value="general-profile" required />
+          </label>
+          <button type="submit">Save task type</button>
+        </form>
+
+        <section
+          :if={integration_health(display_revision(@revision, @active))}
+          id="integration-health"
+          class="integration-health"
+        >
+          <div class="integration-heading">
+            <div>
+              <p class="eyebrow">Read-only validation</p>
+              <h2>Integration health / 集成健康</h2>
+            </div>
+            <span class="health-summary">Healthy / 正常</span>
+          </div>
+          <ul>
+            <li :for={item <- integration_health(display_revision(@revision, @active))["integrations"]}>
+              <strong>{item["id"]}</strong>
+              <span>
+                {item["provider"]} · {integration_kind_label(item["kind"])}
+                <small>{integration_health_summary(item)}</small>
+              </span>
+              <span class="health-chip">Healthy / 正常</span>
+            </li>
+          </ul>
+        </section>
 
         <form :if={@revision && @revision.status == :draft} id="runtime-model-form" phx-submit="bind_runtime_model">
           <h2>Runtime models</h2>

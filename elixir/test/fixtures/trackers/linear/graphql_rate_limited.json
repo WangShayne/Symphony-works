@@ -1,0 +1,17 @@
+{
+  "status": 400,
+  "headers": {
+    "retry-after": "9"
+  },
+  "body": {
+    "errors": [
+      {
+        "message": "rate limit response must stay redacted: fixture-secret",
+        "extensions": {
+          "code": "RATELIMITED",
+          "statusCode": 429
+        }
+      }
+    ]
+  }
+}

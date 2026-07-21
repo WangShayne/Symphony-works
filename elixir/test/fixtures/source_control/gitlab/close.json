@@ -1,0 +1,41 @@
+[
+  {
+    "method": "GET",
+    "path": "/projects/acme%2Fwidget/merge_requests/17",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "id": 17017,
+      "iid": 17,
+      "state": "opened",
+      "draft": false,
+      "source_branch": "symphony/ABC-17",
+      "target_branch": "main"
+    }
+  },
+  {
+    "method": "PUT",
+    "path": "/projects/acme%2Fwidget/merge_requests/17",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "id": 17017,
+      "iid": 17,
+      "state": "closed"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/projects/acme%2Fwidget/merge_requests/17",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "id": 17017,
+      "iid": 17,
+      "state": "closed",
+      "draft": false,
+      "source_branch": "symphony/ABC-17",
+      "target_branch": "main"
+    }
+  }
+]

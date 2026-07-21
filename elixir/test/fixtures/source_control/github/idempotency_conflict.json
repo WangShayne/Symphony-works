@@ -1,0 +1,44 @@
+[
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/pulls",
+    "status": 200,
+    "headers": {},
+    "body": []
+  },
+  {
+    "method": "POST",
+    "path": "/repos/acme/widget/pulls",
+    "status": 201,
+    "headers": {},
+    "body": {
+      "id": 21021,
+      "number": 21,
+      "html_url": "https://github.test/acme/widget/pull/21",
+      "title": "ABC-21",
+      "body": "Original intent",
+      "draft": true,
+      "head": {"ref": "symphony/ABC-21"},
+      "base": {"ref": "main"}
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/pulls",
+    "status": 200,
+    "headers": {},
+    "body": [
+      {
+        "id": 21021,
+        "number": 21,
+        "html_url": "https://github.test/acme/widget/pull/21",
+        "title": "ABC-21",
+        "body": "{{last_mutation_body}}",
+        "draft": true,
+        "user": {"id": 424242},
+        "head": {"ref": "symphony/ABC-21"},
+        "base": {"ref": "main"}
+      }
+    ]
+  }
+]

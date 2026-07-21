@@ -1,0 +1,19 @@
+{
+  "status": 200,
+  "headers": {},
+  "body": {
+    "data": {
+      "issues": {
+        "nodes": []
+      }
+    },
+    "errors": [
+      {
+        "message": "partial data is not safe to consume: fixture-secret",
+        "extensions": {
+          "code": "INTERNAL_ERROR"
+        }
+      }
+    ]
+  }
+}

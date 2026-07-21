@@ -1,0 +1,82 @@
+[
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/pulls/11",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "id": 11011,
+      "number": 11,
+      "state": "closed",
+      "draft": false,
+      "merged": true,
+      "merged_at": "2026-07-20T00:00:00Z",
+      "mergeable": true,
+      "mergeable_state": "clean",
+      "merge_commit_sha": "cccccccccccccccccccccccccccccccccccccccc",
+      "head": {"ref": "symphony/ABC-11", "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+      "base": {"ref": "main", "sha": "1111111111111111111111111111111111111111"}
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/pulls/11/merge",
+    "status": 204,
+    "headers": {},
+    "body": null
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/rules/branches/main",
+    "status": 200,
+    "headers": {},
+    "body": [
+      {
+        "type": "required_status_checks",
+        "parameters": {
+          "required_status_checks": [
+            {"context": "ci/test", "integration_id": 99},
+            {"context": "security"}
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/commits/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/check-runs",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "check_runs": [
+        {
+          "name": "ci/test",
+          "status": "completed",
+          "conclusion": "failure",
+          "details_url": "https://checks.test/wrong-app",
+          "app": {"id": 7}
+        },
+        {
+          "name": "ci/test",
+          "status": "completed",
+          "conclusion": "success",
+          "details_url": "https://checks.test/ci",
+          "app": {"id": 99}
+        }
+      ]
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/commits/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/statuses",
+    "status": 200,
+    "headers": {},
+    "body": [
+      {
+        "context": "security",
+        "state": "pending",
+        "target_url": "https://status.test/security"
+      }
+    ]
+  }
+]

@@ -1,0 +1,31 @@
+[
+  {
+    "id": 1000017,
+    "number": 17,
+    "title": "Open health sample",
+    "body": "Issue body",
+    "state": "open",
+    "labels": [
+      {"name": "ready-for-agent"}
+    ],
+    "assignee": {
+      "id": 42,
+      "login": "symphony-bot"
+    },
+    "html_url": "https://github.test/acme/symphony/issues/17",
+    "created_at": "2026-07-20T00:00:00Z",
+    "updated_at": "2026-07-20T00:01:00Z"
+  },
+  {
+    "id": 1000018,
+    "number": 18,
+    "title": "Closed health sample",
+    "body": "Issue body",
+    "state": "closed",
+    "labels": [],
+    "assignee": null,
+    "html_url": "https://github.test/acme/symphony/issues/18",
+    "created_at": "2026-07-19T00:00:00Z",
+    "updated_at": "2026-07-20T00:02:00Z"
+  }
+]

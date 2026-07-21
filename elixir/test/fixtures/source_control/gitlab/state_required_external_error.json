@@ -1,0 +1,45 @@
+[
+  {
+    "method": "GET",
+    "path": "/projects/acme%2Fwidget/merge_requests/12",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "id": 12012,
+      "iid": 12,
+      "state": "opened",
+      "draft": false,
+      "detailed_merge_status": "checking",
+      "sha": "dddddddddddddddddddddddddddddddddddddddd",
+      "diff_refs": {"base_sha": "3333333333333333333333333333333333333333"},
+      "merge_commit_sha": null,
+      "source_branch": "symphony/ABC-12",
+      "target_branch": "main"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/projects/acme%2Fwidget",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "only_allow_merge_if_pipeline_succeeds": false,
+      "allow_merge_on_skipped_pipeline": false,
+      "only_allow_merge_if_all_status_checks_passed": true
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/projects/acme%2Fwidget/merge_requests/12/pipelines",
+    "status": 200,
+    "headers": {},
+    "body": []
+  },
+  {
+    "method": "GET",
+    "path": "/projects/acme%2Fwidget/merge_requests/12/status_checks",
+    "status": 500,
+    "headers": {},
+    "body": {"message": "provider unavailable"}
+  }
+]

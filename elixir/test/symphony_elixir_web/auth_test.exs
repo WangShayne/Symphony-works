@@ -374,6 +374,43 @@ defmodule SymphonyElixirWeb.AuthTest do
     assert html_response(get(browser_conn(conn, admin), "/zh-CN/tasks"), 200) =~ "任务"
   end
 
+  test "root layout html lang follows supported task locales and defaults safely", %{conn: conn} do
+    admin = insert_principal!(roles: [:administrator])
+
+    assert html_lang(get(browser_conn(conn, admin), "/tasks")) == ["en"]
+    assert html_lang(get(browser_conn(conn, admin), "/en-US/tasks")) == ["en-US"]
+    assert html_lang(get(browser_conn(conn, admin), "/zh-CN/tasks")) == ["zh-CN"]
+    assert html_lang(get(browser_conn(conn, admin), "/zz-ZZ/tasks")) == ["en"]
+
+    assert html_lang(
+             conn
+             |> browser_conn(admin)
+             |> put_req_header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
+             |> get("/tasks")
+           ) == ["zh-CN"]
+
+    assert html_lang(
+             conn
+             |> browser_conn(admin)
+             |> put_req_header("accept-language", "zh-CN,zh;q=0.9")
+             |> get("/en-US/tasks")
+           ) == ["en-US"]
+  end
+
+  test "auth login html lang uses supported locale inputs and defaults safely", %{conn: conn} do
+    assert html_lang(get(conn, "/auth/login")) == ["en"]
+    assert html_lang(get(recycle(conn), "/auth/login", %{"locale" => "zh-CN"})) == ["zh-CN"]
+    assert html_lang(get(recycle(conn), "/auth/login", %{"return_to" => "/zh-CN/tasks"})) == ["zh-CN"]
+    assert html_lang(get(recycle(conn), "/auth/login", %{"locale" => "../../bad"})) == ["en"]
+
+    assert html_lang(
+             conn
+             |> recycle()
+             |> put_req_header("accept-language", "en-US,en;q=0.9")
+             |> get("/auth/login")
+           ) == ["en-US"]
+  end
+
   test "test principal injection is explicitly disabled outside test auth mode", %{conn: conn} do
     previous = Application.get_env(:symphony_elixir, :auth)
     admin = insert_principal!(roles: [:administrator])
@@ -449,6 +486,13 @@ defmodule SymphonyElixirWeb.AuthTest do
     |> html_response(200)
     |> Floki.parse_document!()
     |> Floki.attribute("[data-nav-key]", "data-nav-key")
+  end
+
+  defp html_lang(conn) do
+    conn
+    |> html_response(200)
+    |> Floki.parse_document!()
+    |> Floki.attribute("html", "lang")
   end
 
   defp valid_project do

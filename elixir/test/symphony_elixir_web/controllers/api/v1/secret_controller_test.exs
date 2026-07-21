@@ -1,6 +1,8 @@
 defmodule SymphonyElixirWeb.Api.V1.SecretControllerTest do
   use SymphonyElixirWeb.ConnCase, async: false
 
+  import ExUnit.CaptureLog
+
   alias SymphonyElixir.Security.SecretStore
 
   @bootstrap_token "test-bootstrap-token-with-32-bytes"
@@ -25,6 +27,27 @@ defmodule SymphonyElixirWeb.Api.V1.SecretControllerTest do
     assert %{"data" => %{"id" => ^id, "name" => "github"}} = replace
     refute Jason.encode!(replace) =~ "replacement-value"
     assert {:ok, "replacement-value"} = SecretStore.fetch(%SecretStore.Reference{id: id, name: "github"})
+  end
+
+  test "Phoenix logs filter secret API POST values", %{conn: conn} do
+    canary = "api-secret-log-canary-#{System.unique_integer([:positive, :monotonic])}"
+    params = %{"secret" => %{"name" => "github", "value" => canary}}
+
+    assert Phoenix.Logger.filter_values(params) == %{"secret" => "[FILTERED]"}
+
+    log =
+      capture_log([level: :debug], fn ->
+        response =
+          conn
+          |> authenticated()
+          |> post("/api/v1/secrets", params)
+          |> json_response(201)
+
+        assert %{"data" => %{"name" => "github"}} = response
+      end)
+
+    refute log =~ canary
+    if log != "", do: assert(log =~ "[FILTERED]")
   end
 
   test "API normalizes invalid secret errors without echoing submitted values", %{conn: conn} do

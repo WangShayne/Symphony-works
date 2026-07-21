@@ -1,0 +1,29 @@
+[
+  {
+    "method": "GET",
+    "path": "/projects/acme%2Fwidget/repository/branches/symphony%2FABC-6",
+    "status": 404,
+    "headers": {},
+    "body": {"message": "404 Branch Not Found"}
+  },
+  {
+    "method": "POST",
+    "path": "/projects/acme%2Fwidget/repository/branches",
+    "status": 201,
+    "headers": {},
+    "body": {
+      "name": "symphony/ABC-6",
+      "commit": {"id": "6666666666666666666666666666666666666666"}
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/projects/acme%2Fwidget/repository/branches/symphony%2FABC-6",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "name": "symphony/ABC-6",
+      "commit": {"id": "6666666666666666666666666666666666666666"}
+    }
+  }
+]

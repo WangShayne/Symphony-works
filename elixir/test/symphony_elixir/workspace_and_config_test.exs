@@ -1,5 +1,14 @@
 defmodule SymphonyElixir.WorkspaceAndConfigTest do
   use SymphonyElixir.TestSupport
+
+  import SymphonyElixir.ProcessTestSupport,
+    only: [
+      eventually_value: 1,
+      monitored_process: 1,
+      read_pid: 1,
+      refute_os_process_alive: 1
+    ]
+
   alias Ecto.Changeset
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
@@ -55,6 +64,24 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert first_workspace == second_workspace
     assert Path.basename(first_workspace) == Workspace.workspace_key("MT/Det")
     assert String.starts_with?(Path.basename(first_workspace), "MT_Det--")
+  end
+
+  test "worker ssh_hosts reject unsafe ssh destinations in configuration" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               "worker" => %{
+                 "ssh_hosts" => ["deploy@example.com:2222", "root@[::1]:2200"]
+               }
+             })
+
+    assert settings.worker.ssh_hosts == ["deploy@example.com:2222", "root@[::1]:2200"]
+
+    for destination <- ["-oProxyCommand=bad", "root@-host", "host name", "[127.0.0.1]:22"] do
+      assert {:error, {:invalid_workflow_config, message}} =
+               Schema.parse(%{"worker" => %{"ssh_hosts" => [destination]}})
+
+      assert message =~ "worker.ssh_hosts contains invalid SSH destinations"
+    end
   end
 
   test "workspace keys disambiguate identifiers that sanitize to the same path" do
@@ -257,6 +284,77 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:error, {:workspace_hook_timeout, "after_create", 10}} =
                Workspace.create_for_issue("MT-TIMEOUT")
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "local workspace hook timeout terminates shell process group" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-hook-timeout-group-#{System.unique_integer([:positive])}"
+      )
+
+    parent_pid_file = Path.join(workspace_root, "hook-parent.pid")
+    child_pid_file = Path.join(workspace_root, "hook-child.pid")
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_timeout_ms: 50,
+        hook_after_create: blocking_pid_hook(parent_pid_file, child_pid_file)
+      )
+
+      assert {:error, {:workspace_hook_timeout, "after_create", 50}} =
+               Workspace.create_for_issue("MT-TIMEOUT-GROUP")
+
+      parent_pid = read_pid!(parent_pid_file)
+      child_pid = read_pid!(child_pid_file)
+
+      assert parent_pid != child_pid
+      refute_os_process_alive(parent_pid)
+      refute_os_process_alive(child_pid)
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "local workspace hook caller death terminates shell process group" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-hook-caller-death-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(workspace_root, "MT-CALLER-DEATH")
+    parent_pid_file = Path.join(workspace_root, "hook-parent.pid")
+    child_pid_file = Path.join(workspace_root, "hook-child.pid")
+
+    try do
+      File.mkdir_p!(workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_timeout_ms: 60_000,
+        hook_before_run: blocking_pid_hook(parent_pid_file, child_pid_file)
+      )
+
+      runner = spawn(fn -> Workspace.run_before_run_hook(workspace, "MT-CALLER-DEATH") end)
+      parent_pid = eventually_value(fn -> read_pid(parent_pid_file) end)
+      child_pid = eventually_value(fn -> read_pid(child_pid_file) end)
+      owner = eventually_value(fn -> monitored_process(runner) end)
+      assert parent_pid != child_pid
+      assert is_pid(owner)
+
+      ref = Process.monitor(runner)
+      owner_ref = Process.monitor(owner)
+      Process.exit(runner, :kill)
+      assert_receive {:DOWN, ^ref, :process, _pid, :killed}, 1_000
+      assert_receive {:DOWN, ^owner_ref, :process, ^owner, _reason}, 8_000
+
+      refute_os_process_alive(parent_pid)
+      refute_os_process_alive(child_pid)
     after
       File.rm_rf(workspace_root)
     end
@@ -1090,6 +1188,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert message =~ "must be greater than or equal to 0"
   end
 
+  test "server schema accepts non-negative ports and rejects negative ports" do
+    valid_changeset = Schema.Server.changeset(%Schema.Server{}, %{"port" => 0, "host" => "127.0.0.1"})
+    assert valid_changeset.valid?
+
+    invalid_changeset = Schema.Server.changeset(%Schema.Server{}, %{"port" => -1})
+    refute invalid_changeset.valid?
+    assert {"must be greater than or equal to %{number}", error_options} = invalid_changeset.errors[:port]
+    assert error_options[:number] == 0
+  end
+
   test "config resolves $VAR references for path values without owning secret env names" do
     workspace_env_var = "SYMP_WORKSPACE_ROOT_#{System.unique_integer([:positive])}"
     workspace_root = Path.join("/tmp", "symphony-workspace-root")
@@ -1627,7 +1735,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert :ok = Workspace.remove_issue_workspaces("MT-SSH-WS", "worker-01:2200")
 
       trace = File.read!(trace_file)
-      assert trace =~ "-p 2200 worker-01 bash -lc"
+      assert trace =~ "-p 2200 -- worker-01 bash -lc"
       assert trace =~ "__SYMPHONY_WORKSPACE__"
       assert trace =~ "~/.symphony-remote-workspaces/MT-SSH-WS"
       assert trace =~ "${workspace#\\~/}"
@@ -1644,4 +1752,21 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   defp test_credential_broker(token) do
     fn _reference, :linear_graphql, fun -> fun.(token) end
   end
+
+  defp blocking_pid_hook(parent_pid_file, child_pid_file) do
+    """
+    printf '%s\\n' "$$" > #{shell_escape(parent_pid_file)}
+    (
+      trap '' TERM
+      while :; do sleep 1; done
+    ) &
+    child_pid=$!
+    printf '%s\\n' "$child_pid" > #{shell_escape(child_pid_file)}
+    wait "$child_pid"
+    """
+  end
+
+  defp shell_escape(value), do: "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
+
+  defp read_pid!(path), do: path |> File.read!() |> String.trim() |> String.to_integer()
 end

@@ -7,6 +7,7 @@ defmodule SymphonyElixir.OrchestratorLifecycle do
 
   alias SymphonyElixir.{Coordination, Effects}
   alias SymphonyElixir.Effects.{OperationId, Record, SimulatedAdapter}
+  alias SymphonyElixir.SourceControl.EffectAdapter, as: SourceControlEffectAdapter
 
   @default_lease_ttl_ms 30_000
   @default_heartbeat_interval_ms 10_000
@@ -349,6 +350,11 @@ defmodule SymphonyElixir.OrchestratorLifecycle do
     do: startup_error(:resolve_effect_adapter, :invalid_resolver_result)
 
   defp default_recovery_adapter(%Record{provider: "simulated"}), do: {:ok, SimulatedAdapter}
+
+  defp default_recovery_adapter(%Record{provider: provider})
+       when provider in ["fixture", "github", "gitlab"],
+       do: {:ok, SourceControlEffectAdapter}
+
   defp default_recovery_adapter(%Record{}), do: {:error, :unsupported_provider}
 
   defp maybe_put_now(opts, nil), do: opts

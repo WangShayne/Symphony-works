@@ -34,6 +34,25 @@ defmodule SymphonyElixirWeb.ConfigurationLiveTest do
     def stop_session(%{thread_id: "probe-thread"}), do: :ok
   end
 
+  defmodule LeakyIntegrationHealth do
+    def health_check(%{"credential" => credential}) do
+      {:error, %{"code" => "denied", "message" => credential}}
+    end
+  end
+
+  defmodule SourceControlEndpointHealth do
+    def health_check(%{
+          "kind" => "source_control",
+          "provider" => "github",
+          "credential" => "source-control-live-secret",
+          "settings" => %{"api_base_url" => "https://source-control.example.test/api/v4"}
+        }) do
+      {:ok, %{status: :healthy, evidence: %{"endpoint" => "custom"}}}
+    end
+
+    def health_check(_integration), do: {:error, %{"code" => "missing_api_base_url"}}
+  end
+
   setup do
     previous = Application.get_env(:symphony_elixir, :runtime_health_app_server)
     Application.put_env(:symphony_elixir, :runtime_health_app_server, FakeHealthAppServer)
@@ -77,6 +96,291 @@ defmodule SymphonyElixirWeb.ConfigurationLiveTest do
     assert render(view) =~ "Symphony"
   end
 
+  test "bootstrap Administrator opens Configuration through the admin route alias", %{conn: conn} do
+    conn = put_req_header(conn, "authorization", "Bearer #{@bootstrap_token}")
+
+    assert {:ok, _view, html} = live(conn, "/admin/configuration")
+    assert html =~ "Automation Project"
+  end
+
+  test "Administrator configures independent fixture integrations and sees health evidence", %{conn: conn} do
+    conn = put_req_header(conn, "authorization", "Bearer #{@bootstrap_token}")
+    assert {:ok, view, _html} = live(conn, "/configuration")
+
+    view
+    |> form("#project-form", project: valid_project())
+    |> render_submit()
+
+    view
+    |> form("#integration-form",
+      integration: %{
+        "id" => "tracker-fixture",
+        "kind" => "tracker",
+        "provider" => "fixture",
+        "credential_ref" => "",
+        "scenario" => "healthy",
+        "owner" => "",
+        "repository" => "",
+        "project_slug" => "",
+        "project_id" => "",
+        "base_branch" => "",
+        "endpoint" => "",
+        "state_ids" => %{
+          "started" => "state-started",
+          "completed" => "state-completed",
+          "cancelled" => "state-cancelled"
+        }
+      }
+    )
+    |> render_submit()
+
+    assert get_in(Repo.one!(Revision).document, [
+             "integrations",
+             Access.at(0),
+             "settings",
+             "state_ids"
+           ]) == %{
+             "started" => "state-started",
+             "completed" => "state-completed",
+             "cancelled" => "state-cancelled"
+           }
+
+    view
+    |> form("#integration-form",
+      integration: %{
+        "id" => "delivery-fixture",
+        "kind" => "source_control",
+        "provider" => "fixture",
+        "credential_ref" => "",
+        "scenario" => "healthy",
+        "owner" => "",
+        "repository" => "WangShayne/Symphony-works",
+        "project_slug" => "",
+        "project_id" => "",
+        "base_branch" => "main",
+        "endpoint" => "https://source-control.example.test/api/v4"
+      }
+    )
+    |> render_submit()
+
+    delivery_settings =
+      Repo.one!(Revision).document
+      |> get_in(["integrations", Access.at(1), "settings"])
+
+    assert delivery_settings["api_base_url"] == "https://source-control.example.test/api/v4"
+    refute Map.has_key?(delivery_settings, "endpoint")
+    persisted_project = Repo.one!(Revision).document["automation_projects"] |> hd()
+    assert persisted_project["tracker_integration_ref"] == "tracker-fixture"
+    assert persisted_project["source_control_integration_ref"] == "delivery-fixture"
+
+    view
+    |> form("#integration-form",
+      integration: %{
+        "id" => "delivery-default",
+        "kind" => "source_control",
+        "provider" => "fixture",
+        "credential_ref" => "",
+        "repository" => "WangShayne/Symphony-works",
+        "base_branch" => "main",
+        "endpoint" => ""
+      }
+    )
+    |> render_submit()
+
+    default_delivery_settings =
+      Repo.one!(Revision).document
+      |> get_in(["integrations", Access.at(2), "settings"])
+
+    refute Map.has_key?(default_delivery_settings, "api_base_url")
+    refute Map.has_key?(default_delivery_settings, "endpoint")
+
+    html = render(view)
+    assert html =~ "Integrations / 集成"
+    assert html =~ "tracker-fixture"
+    assert html =~ "delivery-fixture"
+    assert html =~ "delivery-default"
+
+    view
+    |> form("#draft-update-form", project: put_in(valid_project(), ["name"], "Symphony Integrations"))
+    |> render_submit()
+
+    html = render(view)
+    assert html =~ "Symphony Integrations"
+    assert html =~ "tracker-fixture"
+    assert html =~ "delivery-fixture"
+
+    view
+    |> form("#task-type-form",
+      task_type: %{
+        "id" => "review",
+        "name" => "Review",
+        "profile_id" => "general-profile"
+      }
+    )
+    |> render_submit()
+
+    assert Repo.one!(Revision).document["task_types"] == [
+             %{"id" => "review", "name" => "Review", "profile_id" => "general-profile"}
+           ]
+
+    view
+    |> form("#task-type-form",
+      task_type: %{
+        "id" => "review",
+        "name" => "Review updated",
+        "profile_id" => "review-profile"
+      }
+    )
+    |> render_submit()
+
+    assert Repo.one!(Revision).document["task_types"] == [
+             %{"id" => "review", "name" => "Review updated", "profile_id" => "review-profile"}
+           ]
+
+    view
+    |> element("button", "Validate")
+    |> render_click()
+
+    html = render(view)
+    assert html =~ "Integration health / 集成健康"
+    assert html =~ "Healthy / 正常"
+    assert html =~ "Deterministic fixture / 确定性夹具"
+    refute html =~ "credential_ref"
+  end
+
+  test "Dashboard rejects malformed integration form events without corrupting draft", %{conn: conn} do
+    conn = put_req_header(conn, "authorization", "Bearer #{@bootstrap_token}")
+    assert {:ok, view, _html} = live(conn, "/configuration")
+
+    view
+    |> form("#project-form", project: valid_project())
+    |> render_submit()
+
+    assert render_submit(view, "configure_integration", %{"integration" => "bad"}) =~
+             "Invalid configuration"
+
+    assert render_submit(view, "configure_integration", %{
+             "integration" => %{
+               "id" => "tracker-fixture",
+               "kind" => "tracker",
+               "provider" => "fixture",
+               "scenario" => "healthy"
+             }
+           }) =~ "tracker-fixture"
+
+    integration = Repo.one!(Revision).document["integrations"] |> hd()
+    refute Map.has_key?(integration, "credential_ref")
+    refute Map.has_key?(integration["settings"], "state_ids")
+  end
+
+  test "Dashboard stores Source Control endpoint as api_base_url and health uses it", %{conn: conn} do
+    previous = Application.get_env(:symphony_elixir, :integration_health_adapters)
+
+    Application.put_env(:symphony_elixir, :integration_health_adapters, %{
+      "source_control" => SourceControlEndpointHealth
+    })
+
+    on_exit(fn -> Application.put_env(:symphony_elixir, :integration_health_adapters, previous) end)
+
+    assert {:ok, reference} =
+             SecretStore.put("live-source-control", "source-control-live-secret", actor: "admin")
+
+    conn = put_req_header(conn, "authorization", "Bearer #{@bootstrap_token}")
+    assert {:ok, view, _html} = live(conn, "/configuration")
+
+    view
+    |> form("#project-form", project: valid_project())
+    |> render_submit()
+
+    view
+    |> form("#integration-form",
+      integration: %{
+        "id" => "delivery-github",
+        "kind" => "source_control",
+        "provider" => "github",
+        "credential_ref" => reference.id,
+        "repository" => "WangShayne/Symphony-works",
+        "base_branch" => "main",
+        "endpoint" => "https://source-control.example.test/api/v4",
+        "bot_actor_id" => "424242"
+      }
+    )
+    |> render_submit()
+
+    settings = Repo.one!(Revision).document |> get_in(["integrations", Access.at(0), "settings"])
+    assert settings["api_base_url"] == "https://source-control.example.test/api/v4"
+    refute Map.has_key?(settings, "endpoint")
+
+    view
+    |> element("button", "Validate")
+    |> render_click()
+
+    html = render(view)
+    assert html =~ "Integration health / 集成健康"
+    assert html =~ "Healthy / 正常"
+    assert html =~ "custom"
+    refute html =~ "missing_api_base_url"
+    refute html =~ "source-control-live-secret"
+    refute html =~ reference.id
+  end
+
+  test "Dashboard shows useful redacted integration health failures", %{conn: conn} do
+    previous = Application.get_env(:symphony_elixir, :integration_health_adapters)
+
+    Application.put_env(:symphony_elixir, :integration_health_adapters, %{
+      "tracker" => LeakyIntegrationHealth
+    })
+
+    on_exit(fn -> Application.put_env(:symphony_elixir, :integration_health_adapters, previous) end)
+
+    assert {:ok, api_reference} =
+             SecretStore.put("dashboard-tracker-api", "dashboard-api-secret", actor: "admin")
+
+    assert {:ok, webhook_reference} =
+             SecretStore.put("dashboard-webhook", "dashboard-webhook-secret", actor: "admin")
+
+    conn = put_req_header(conn, "authorization", "Bearer #{@bootstrap_token}")
+    assert {:ok, view, _html} = live(conn, "/configuration")
+
+    view
+    |> form("#project-form", project: valid_project())
+    |> render_submit()
+
+    view
+    |> form("#integration-form",
+      integration: %{
+        "id" => "tracker-main",
+        "kind" => "tracker",
+        "provider" => "github",
+        "credential_ref" => api_reference.id,
+        "webhook_secret_ref" => webhook_reference.id,
+        "bot_actor_id" => "symphony-bot",
+        "owner" => "WangShayne",
+        "repository" => "Symphony-works",
+        "project_slug" => "",
+        "project_id" => "",
+        "base_branch" => "",
+        "endpoint" => "",
+        "scenario" => "healthy"
+      }
+    )
+    |> render_submit()
+
+    view
+    |> element("button", "Validate")
+    |> render_click()
+
+    html = render(view)
+    assert html =~ "Integration health check failed / 集成健康检查失败"
+    assert html =~ "tracker-main"
+    assert html =~ "github"
+    assert html =~ "denied"
+    refute html =~ "dashboard-api-secret"
+    refute html =~ "dashboard-webhook-secret"
+    refute html =~ api_reference.id
+    refute html =~ webhook_reference.id
+  end
+
   test "Dashboard displays an existing active revision and validation errors", %{conn: conn} do
     {:ok, draft} =
       Configuration.create_draft(
@@ -102,6 +406,75 @@ defmodule SymphonyElixirWeb.ConfigurationLiveTest do
 
     assert render(view) =~ "Invalid configuration"
     refute render(view) =~ "{:invalid_configuration"
+  end
+
+  test "Dashboard reload displays persisted active integration health evidence", %{conn: conn} do
+    document =
+      valid_project()
+      |> Document.for_project()
+      |> Map.put("integrations", [
+        %{
+          "id" => "tracker-fixture",
+          "kind" => "tracker",
+          "provider" => "fixture",
+          "settings" => %{"scenario" => "healthy"}
+        }
+      ])
+
+    assert {:ok, draft} = Configuration.create_draft(document, actor: "bootstrap-admin")
+    assert {:ok, _active} = Configuration.activate(draft.id, actor: "bootstrap-admin")
+
+    conn = put_req_header(conn, "authorization", "Bearer #{@bootstrap_token}")
+    assert {:ok, _view, html} = live(conn, "/configuration")
+
+    assert html =~ "Integration health / 集成健康"
+    assert html =~ "tracker-fixture"
+    assert html =~ "Deterministic fixture / 确定性夹具"
+  end
+
+  test "Dashboard renders persisted health with atom-key evidence and malformed items", %{conn: conn} do
+    document = Document.for_project(valid_project())
+    assert {:ok, draft} = Configuration.create_draft(document, actor: "bootstrap-admin")
+
+    evidence = %{
+      "probes" => [
+        %{
+          "probe" => "integrations",
+          "status" => "passed",
+          "integrations" => [
+            %{
+              "id" => "tracker-atom",
+              "kind" => "tracker",
+              "provider" => "fixture",
+              "status" => "passed",
+              "health" => %{evidence: %{scope: "atom/scope", transport: :deterministic_fixture}}
+            },
+            %{"id" => "missing-health", "kind" => "tracker", "provider" => "fixture"}
+          ]
+        }
+      ]
+    }
+
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    assert {:ok, _active} =
+             draft
+             |> Ecto.Changeset.change(%{
+               status: :active,
+               validation_evidence: evidence,
+               validated_by: "bootstrap-admin",
+               validated_at: now,
+               activated_by: "bootstrap-admin",
+               activated_at: now
+             })
+             |> Repo.update()
+
+    conn = put_req_header(conn, "authorization", "Bearer #{@bootstrap_token}")
+    assert {:ok, _view, html} = live(conn, "/configuration")
+
+    assert html =~ "atom/scope"
+    assert html =~ "Deterministic fixture / 确定性夹具"
+    assert html =~ "missing-health"
   end
 
   test "Dashboard binds runtime models, probes, and activates compatible profiles", %{conn: conn} do
@@ -358,6 +731,23 @@ defmodule SymphonyElixirWeb.ConfigurationLiveTest do
     assert get_in(latest.document, ["model_references", Access.at(0), "capabilities", "structured_output"]) == true
   end
 
+  test "Dashboard task type creation handles stale drafts", %{conn: conn} do
+    conn = put_req_header(conn, "authorization", "Bearer #{@bootstrap_token}")
+    {:ok, view, _html} = live(conn, "/configuration")
+
+    view
+    |> form("#project-form", project: valid_project())
+    |> render_submit()
+
+    Repo.delete_all(Revision)
+
+    assert view
+           |> form("#task-type-form",
+             task_type: %{"id" => "review", "name" => "Review", "profile_id" => "general-profile"}
+           )
+           |> render_submit() =~ "Configuration revision not found"
+  end
+
   test "Dashboard rejects plaintext runtime credentials before persistence", %{conn: conn} do
     conn = put_req_header(conn, "authorization", "Bearer #{@bootstrap_token}")
     {:ok, view, _html} = live(conn, "/configuration")
@@ -411,6 +801,52 @@ defmodule SymphonyElixirWeb.ConfigurationLiveTest do
 
     assert_redirect(view, "/auth/login")
     assert Repo.aggregate(Revision, :count) == 0
+  end
+
+  test "mounted bootstrap Dashboard cannot configure integrations after bootstrap retires", %{conn: conn} do
+    conn = put_req_header(conn, "authorization", "Bearer #{@bootstrap_token}")
+    {:ok, view, _html} = live(conn, "/configuration")
+
+    view
+    |> form("#project-form", project: valid_project())
+    |> render_submit()
+
+    assert {:ok, _admin} =
+             Identity.upsert_oidc_principal(%{
+               issuer: "https://issuer.example.test",
+               subject: "retiring-integration-admin",
+               email: "admin@example.test",
+               roles: [:administrator]
+             })
+
+    view
+    |> form("#integration-form",
+      integration: %{"id" => "tracker-fixture", "kind" => "tracker", "provider" => "fixture"}
+    )
+    |> render_submit()
+
+    assert_redirect(view, "/auth/login")
+  end
+
+  test "mounted bootstrap Dashboard cannot create task types after bootstrap retires", %{conn: conn} do
+    conn = put_req_header(conn, "authorization", "Bearer #{@bootstrap_token}")
+    {:ok, view, _html} = live(conn, "/configuration")
+
+    view
+    |> form("#project-form", project: valid_project())
+    |> render_submit()
+
+    assert {:ok, _admin} =
+             Identity.upsert_oidc_principal(%{
+               issuer: "https://issuer.example.test",
+               subject: "retiring-task-type-admin",
+               email: "admin@example.test",
+               roles: [:administrator]
+             })
+
+    render_submit(view, "create_task_type", %{})
+
+    assert_redirect(view, "/auth/login")
   end
 
   test "Dashboard reports when a validated revision disappears before activation", %{conn: conn} do
@@ -467,6 +903,26 @@ defmodule SymphonyElixirWeb.ConfigurationLiveTest do
     assert render(view) =~ "Imported WORKFLOW.md"
 
     view
+    |> form("#integration-form",
+      integration: %{
+        "id" => "tracker",
+        "kind" => "tracker",
+        "provider" => "fixture",
+        "credential_ref" => "",
+        "webhook_secret_ref" => "",
+        "bot_actor_id" => "",
+        "scenario" => "healthy",
+        "owner" => "",
+        "repository" => "",
+        "project_slug" => "",
+        "project_id" => "",
+        "base_branch" => "",
+        "endpoint" => ""
+      }
+    )
+    |> render_submit()
+
+    view
     |> element("button", "Validate")
     |> render_click()
 
@@ -482,7 +938,7 @@ defmodule SymphonyElixirWeb.ConfigurationLiveTest do
 
     exported = render(view)
     refute exported =~ "ghp_live_secret"
-    assert exported =~ "[REDACTED]"
+    refute exported =~ "api_key"
 
     view
     |> form("#project-form", project: put_in(valid_project(), ["name"], "Replacement"))

@@ -1,0 +1,43 @@
+[
+  {
+    "method": "GET",
+    "path": "/projects/acme%2Fwidget",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "path_with_namespace": "acme/widget",
+      "default_branch": "main",
+      "permissions": {"project_access": {"access_level": 40}}
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/projects/acme%2Fwidget/repository/branches/main",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "name": "main",
+      "protected": true,
+      "can_push": true,
+      "commit": {"id": "3333333333333333333333333333333333333333"}
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/projects/acme%2Fwidget/protected_branches/main",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "name": "main",
+      "push_access_levels": [{"access_level": 40}],
+      "merge_access_levels": [{"access_level": 40}]
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/user",
+    "status": 200,
+    "headers": {},
+    "body": {"id": 31337, "username": "symphony-bot"}
+  }
+]

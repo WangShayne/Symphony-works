@@ -1,0 +1,9 @@
+{
+  "id": 77,
+  "path_with_namespace": "acme/symphony",
+  "issues_access_level": "enabled",
+  "permissions": {
+    "project_access": {"access_level": 30},
+    "group_access": null
+  }
+}

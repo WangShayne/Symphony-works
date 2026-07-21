@@ -1,0 +1,13 @@
+{
+  "id": 1000099,
+  "title": "Missing REST number",
+  "body": "Malformed provider success",
+  "state": "open",
+  "labels": [
+    {"name": "ready-for-agent"}
+  ],
+  "assignee": null,
+  "html_url": "https://github.test/acme/symphony/issues/99",
+  "created_at": "2026-07-20T00:00:00Z",
+  "updated_at": "2026-07-20T00:01:00Z"
+}

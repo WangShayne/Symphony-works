@@ -1,0 +1,39 @@
+[
+  {
+    "method": "GET",
+    "path": "/projects/acme%2Fwidget/merge_requests/15",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "id": 15015,
+      "iid": 15,
+      "web_url": "https://gitlab.test/acme/widget/-/merge_requests/15",
+      "title": "Draft: ABC-15",
+      "draft": true,
+      "source_branch": "symphony/ABC-15",
+      "target_branch": "main"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/projects/acme%2Fwidget/merge_requests/15/notes",
+    "status": 201,
+    "headers": {},
+    "body": {"id": 1515, "body": "/ready"}
+  },
+  {
+    "method": "GET",
+    "path": "/projects/acme%2Fwidget/merge_requests/15",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "id": 15015,
+      "iid": 15,
+      "web_url": "https://gitlab.test/acme/widget/-/merge_requests/15",
+      "title": "ABC-15",
+      "draft": false,
+      "source_branch": "symphony/ABC-15",
+      "target_branch": "main"
+    }
+  }
+]

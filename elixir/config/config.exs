@@ -1,6 +1,8 @@
 import Config
 
-config :phoenix, :json_library, Jason
+config :phoenix,
+  json_library: Jason,
+  filter_parameters: ["password", "token", "secret", "credential", "authorization"]
 
 config :symphony_elixir,
   ecto_repos: [SymphonyElixir.Repo]

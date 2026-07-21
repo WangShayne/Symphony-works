@@ -1,0 +1,29 @@
+[
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/git/ref/heads/symphony%2FABC-5",
+    "status": 404,
+    "headers": {},
+    "body": {"message": "Not Found"}
+  },
+  {
+    "method": "POST",
+    "path": "/repos/acme/widget/git/refs",
+    "status": 201,
+    "headers": {},
+    "body": {
+      "ref": "refs/heads/symphony/ABC-5",
+      "object": {"sha": "5555555555555555555555555555555555555555"}
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/git/ref/heads/symphony%2FABC-5",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "ref": "refs/heads/symphony/ABC-5",
+      "object": {"sha": "5555555555555555555555555555555555555555"}
+    }
+  }
+]

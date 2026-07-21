@@ -1,0 +1,11 @@
+{
+  "id": 9001,
+  "full_name": "acme/symphony",
+  "permissions": {
+    "admin": false,
+    "maintain": false,
+    "push": false,
+    "triage": false,
+    "pull": true
+  }
+}

@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, PromptBuilder, SSH, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -20,18 +20,23 @@ defmodule SymphonyElixir.AgentRunner do
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
-    # The orchestrator owns host retries so one worker lifetime never hops machines.
-    worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
-
-    Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
-
-    case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
-      :ok ->
-        :ok
-
+    case selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts) do
       {:error, reason} ->
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
         raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+
+      worker_host ->
+        # The orchestrator owns host retries so one worker lifetime never hops machines.
+        Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
+
+        case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
+            raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+        end
     end
   end
 
@@ -192,12 +197,21 @@ defmodule SymphonyElixir.AgentRunner do
       configured_hosts
       |> Enum.map(&String.trim/1)
       |> Enum.reject(&(&1 == ""))
+      |> Enum.filter(&(SSH.validate_destination(&1) == :ok))
       |> Enum.uniq()
 
     case preferred_host do
-      host when is_binary(host) and host != "" -> host
-      _ when hosts == [] -> nil
-      _ -> List.first(hosts)
+      host when is_binary(host) and host != "" ->
+        case SSH.validate_destination(host) do
+          :ok -> host
+          {:error, reason} -> {:error, reason}
+        end
+
+      _ when hosts == [] ->
+        nil
+
+      _ ->
+        List.first(hosts)
     end
   end
 

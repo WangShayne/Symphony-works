@@ -1,8 +1,12 @@
 defmodule SymphonyElixir.Configuration.ValidatorTest do
   use SymphonyElixir.DataCase, async: false
 
+  import ExUnit.CaptureLog
+
   alias SymphonyElixir.Configuration
   alias SymphonyElixir.Configuration.Document
+  alias SymphonyElixir.Configuration.IntegrationProbe
+  alias SymphonyElixir.Configuration.Validator
   alias SymphonyElixir.Runtime.CapabilityProbe
   alias SymphonyElixir.Security.SecretStore
 
@@ -38,15 +42,126 @@ defmodule SymphonyElixir.Configuration.ValidatorTest do
     def stop_session(%{thread_id: "probe-thread"}), do: :ok
   end
 
+  defmodule FakeTrackerHealth do
+    def health_check(%{
+          "provider" => "github",
+          "credential" => "tracker-health-secret",
+          "webhook_secret" => "tracker-webhook-secret"
+        }) do
+      {:ok,
+       %{
+         provider: :github,
+         status: :healthy,
+         evidence: %{"scope" => "WangShayne/Symphony-works", "message" => "credential accepted"}
+       }}
+    end
+  end
+
+  defmodule SelectedTrackerHealth do
+    def health_check(%{"id" => "tracker-selected", "project_integration_ref" => "tracker-selected"}) do
+      Process.put({__MODULE__, :called}, ["tracker-selected" | Process.get({__MODULE__, :called}, [])])
+      {:ok, %{status: :healthy, evidence: %{"selected" => true}}}
+    end
+
+    def health_check(%{"id" => id}) do
+      Process.put({__MODULE__, :called}, [id | Process.get({__MODULE__, :called}, [])])
+      {:error, %{"code" => "unselected_probe"}}
+    end
+  end
+
+  defmodule FakeSourceControlHealth do
+    def health_check(%{"provider" => "gitlab", "credential" => "source-control-health-secret"}) do
+      {:ok,
+       %{
+         provider: :gitlab,
+         status: :healthy,
+         evidence: %{"base_branch" => "main", "message" => "credential accepted"}
+       }}
+    end
+  end
+
+  defmodule LeakyWebhookTrackerHealth do
+    def health_check(%{"webhook_secret" => webhook_secret}) do
+      {:error, %{"code" => "denied", "message" => webhook_secret}}
+    end
+  end
+
+  defmodule RichIntegrationHealth do
+    def health_check(%{"credential" => credential, "webhook_secret" => webhook_secret}) do
+      {credential_ref, webhook_ref} = Process.get({__MODULE__, :references})
+
+      {:ok,
+       %{
+         status: :healthy,
+         nested: [
+           credential_ref,
+           %{tuple: {:secret_refs, webhook_ref, credential != webhook_secret}}
+         ]
+       }}
+    end
+  end
+
+  defmodule AdversarialIntegrationHealth do
+    def health_check(%{"credential" => credential, "webhook_secret" => webhook_secret}) do
+      {:ok,
+       %{
+         "status" => "healthy",
+         "credential #{credential}" => "bearer #{credential}",
+         "nested" => [
+           %{"webhook #{webhook_secret}" => "signed with #{webhook_secret}"},
+           "combined #{credential}:#{webhook_secret}"
+         ]
+       }}
+    end
+  end
+
+  defmodule InvalidIntegrationHealth do
+    def health_check(_integration), do: :unexpected_health_result
+  end
+
+  defmodule InvalidOkIntegrationHealth do
+    def health_check(_integration), do: {:ok, ["not", "a", "health", "map"]}
+  end
+
+  defmodule BinaryReasonIntegrationHealth do
+    def health_check(%{"credential" => _credential}) do
+      {credential_ref, _webhook_ref} = Process.get({RichIntegrationHealth, :references})
+      {:error, "adapter denied #{credential_ref} #{String.duplicate("x", 180)}"}
+    end
+  end
+
+  defmodule MapCodeIntegrationHealth do
+    def health_check(%{"credential" => _credential}), do: {:error, %{"code" => "map_code"}}
+  end
+
+  defmodule AtomMapCodeIntegrationHealth do
+    def health_check(%{"credential" => _credential}), do: {:error, %{code: :atom_map_code}}
+  end
+
+  defmodule TupleReasonIntegrationHealth do
+    def health_check(%{"credential" => _credential}), do: {:error, {:tuple_code, %{details: true}}}
+  end
+
+  defmodule UnknownReasonIntegrationHealth do
+    def health_check(%{"credential" => _credential}), do: {:error, ["unexpected"]}
+  end
+
   setup do
     previous = Application.get_env(:symphony_elixir, :configuration_probes)
     previous_health = Application.get_env(:symphony_elixir, :runtime_health_app_server)
+    previous_integration_adapters = Application.get_env(:symphony_elixir, :integration_health_adapters)
     Application.put_env(:symphony_elixir, :configuration_probes, [])
     Application.put_env(:symphony_elixir, :runtime_health_app_server, FakeHealthAppServer)
+
+    Application.put_env(:symphony_elixir, :integration_health_adapters, %{
+      "tracker" => FakeTrackerHealth,
+      "source_control" => FakeSourceControlHealth
+    })
 
     on_exit(fn ->
       Application.put_env(:symphony_elixir, :configuration_probes, previous)
       Application.put_env(:symphony_elixir, :runtime_health_app_server, previous_health)
+      Application.put_env(:symphony_elixir, :integration_health_adapters, previous_integration_adapters)
     end)
   end
 
@@ -102,6 +217,469 @@ defmodule SymphonyElixir.Configuration.ValidatorTest do
     reloaded = SymphonyElixir.Repo.get!(SymphonyElixir.Configuration.Revision, draft.id)
     refute inspect(reloaded.document) =~ "sk-plaintext-runtime-secret"
     assert inspect(reloaded.document) =~ reference.id
+  end
+
+  test "integration credential plaintext is rejected before a draft can persist it" do
+    assert {:ok, api_reference} =
+             SecretStore.put("github-tracker-api", "github-api-secret", actor: "admin")
+
+    fixture_document =
+      valid_project()
+      |> Document.for_project()
+      |> Map.put("integrations", [
+        %{
+          "id" => "fixture-tracker",
+          "kind" => "tracker",
+          "provider" => "fixture",
+          "settings" => %{"scenario" => "healthy"}
+        }
+      ])
+
+    assert {:ok, draft} = Configuration.create_draft(fixture_document, actor: "admin")
+
+    unsafe_document =
+      Map.put(fixture_document, "integrations", [
+        %{
+          "id" => "github-tracker",
+          "kind" => "tracker",
+          "provider" => "github",
+          "credential_ref" => "plaintext-secret",
+          "settings" => %{"owner" => "WangShayne", "repository" => "Symphony-works"}
+        }
+      ])
+
+    assert {:error, {:invalid_credential_ref, evidence}} =
+             Configuration.update_draft(draft.id, unsafe_document, actor: "admin")
+
+    assert evidence["credential_ref"] == "[REDACTED]"
+    refute inspect(evidence) =~ "plaintext-secret"
+
+    unsafe_webhook_document =
+      Map.put(fixture_document, "integrations", [
+        %{
+          "id" => "github-tracker",
+          "kind" => "tracker",
+          "provider" => "github",
+          "credential_ref" => api_reference.id,
+          "settings" => %{
+            "owner" => "WangShayne",
+            "repository" => "Symphony-works",
+            "webhook_secret_ref" => "1234567890abcdef"
+          }
+        }
+      ])
+
+    assert {:error, {:invalid_credential_ref, nested_evidence}} =
+             Configuration.update_draft(draft.id, unsafe_webhook_document, actor: "admin")
+
+    assert nested_evidence["credential_ref"] == "[REDACTED]"
+    refute inspect(nested_evidence) =~ "1234567890abcdef"
+
+    unsafe_field_document =
+      Map.put(fixture_document, "integrations", [
+        %{
+          "id" => "fixture-tracker",
+          "kind" => "tracker",
+          "provider" => "fixture",
+          "settings" => %{
+            "scenario" => "healthy",
+            "webhook_secret" => "raw-webhook-credential"
+          }
+        }
+      ])
+
+    assert {:error, {:invalid_credential_ref, field_evidence}} =
+             Configuration.update_draft(draft.id, unsafe_field_document, actor: "admin")
+
+    assert field_evidence["credential_ref"] == "[REDACTED]"
+    assert field_evidence["reason"] == "plaintext_field"
+    refute inspect(field_evidence) =~ "raw-webhook-credential"
+
+    assert {:ok, exported} = Configuration.export(draft.id, redacted: true)
+    refute inspect(exported) =~ "plaintext-secret"
+    refute inspect(exported) =~ "1234567890abcdef"
+    refute inspect(exported) =~ "raw-webhook-credential"
+    assert inspect(exported) =~ "fixture-tracker"
+
+    unsafe_transport_document =
+      Map.put(fixture_document, "integrations", [
+        %{
+          "id" => "fixture-source-control",
+          "kind" => "source_control",
+          "provider" => "fixture",
+          "settings" => %{
+            "repository" => "WangShayne/Symphony-works",
+            "base_branch" => "main",
+            "Transport" => "runtime-only-transport"
+          }
+        }
+      ])
+
+    assert {:error, {:invalid_credential_ref, transport_evidence}} =
+             Configuration.create_draft(unsafe_transport_document, actor: "admin")
+
+    assert transport_evidence["reason"] == "plaintext_field"
+
+    refute inspect(SymphonyElixir.Repo.all(SymphonyElixir.Configuration.Revision)) =~
+             "runtime-only-transport"
+
+    for {field, value} <- [
+          {"Credential", "mixed-case-credential"},
+          {"credentialRef", "camel-case-credential"},
+          {"webhookSecret", "camel-case-webhook"},
+          {"webhook-secret", "hyphen-webhook"},
+          {"WEBHOOKSECRET", "uppercase-webhook"},
+          {"Transport", "runtime-only-transport-alias"}
+        ] do
+      unsafe_alias_document =
+        Map.put(fixture_document, "integrations", [
+          %{
+            "id" => "fixture-tracker",
+            "kind" => "tracker",
+            "provider" => "fixture",
+            "settings" => Map.put(%{"scenario" => "healthy"}, field, value)
+          }
+        ])
+
+      assert {:error, {:invalid_credential_ref, alias_evidence}} =
+               Configuration.create_draft(unsafe_alias_document, actor: "admin")
+
+      assert alias_evidence["reason"] == "plaintext_field"
+      refute inspect(SymphonyElixir.Repo.all(SymphonyElixir.Configuration.Revision)) =~ value
+    end
+  end
+
+  test "activation brokers integration credentials and stores only redacted health evidence" do
+    Application.put_env(:symphony_elixir, :integration_health_adapters, %{
+      "tracker" => FakeTrackerHealth,
+      source_control: FakeSourceControlHealth
+    })
+
+    assert {:ok, tracker_reference} =
+             SecretStore.put("tracker-health", "tracker-health-secret", actor: "admin")
+
+    assert {:ok, webhook_reference} =
+             SecretStore.put("tracker-webhook", "tracker-webhook-secret", actor: "admin")
+
+    assert {:ok, source_control_reference} =
+             SecretStore.put("source-control-health", "source-control-health-secret", actor: "admin")
+
+    document =
+      valid_project()
+      |> Document.for_project()
+      |> Map.put("integrations", [
+        %{
+          "id" => "tracker-main",
+          "kind" => "tracker",
+          "provider" => "github",
+          "credential_ref" => tracker_reference.id,
+          "settings" => %{
+            "owner" => "WangShayne",
+            "repository" => "Symphony-works",
+            "bot_actor_id" => "symphony-bot",
+            "webhook_secret_ref" => webhook_reference.id
+          }
+        },
+        %{
+          "id" => "delivery-main",
+          "kind" => "source_control",
+          "provider" => "gitlab",
+          "credential_ref" => source_control_reference.id,
+          "settings" => %{
+            "repository" => "WangShayne/Symphony-works",
+            "base_branch" => "main",
+            "bot_actor_id" => "31337"
+          }
+        }
+      ])
+
+    assert {:ok, draft} = Configuration.create_draft(document, actor: "admin")
+    assert {:ok, active} = Configuration.activate(draft.id, actor: "admin")
+
+    assert %{"probes" => [%{"probe" => "integrations"} = probe]} = active.validation_evidence
+    assert probe["status"] == "passed"
+    assert Enum.map(probe["integrations"], & &1["kind"]) == ["tracker", "source_control"]
+    assert hd(probe["integrations"])["webhook_signing"] == "resolved"
+
+    encoded = Jason.encode!(active.validation_evidence)
+    refute encoded =~ "tracker-health-secret"
+    refute encoded =~ "tracker-webhook-secret"
+    refute encoded =~ "source-control-health-secret"
+    refute encoded =~ tracker_reference.id
+    refute encoded =~ webhook_reference.id
+    refute encoded =~ source_control_reference.id
+    refute encoded =~ "credential_ref"
+
+    missing_webhook_reference = Ecto.UUID.generate()
+
+    missing_webhook_document =
+      put_in(
+        document,
+        ["integrations", Access.at(0), "settings", "webhook_secret_ref"],
+        missing_webhook_reference
+      )
+
+    assert {:ok, missing_webhook_draft} =
+             Configuration.create_draft(missing_webhook_document, actor: "admin")
+
+    assert {:error, {:probe_failed, :integration, failed_evidence}} =
+             Configuration.activate(missing_webhook_draft.id, actor: "admin")
+
+    assert failed_evidence["integration"]["id"] == "tracker-main"
+    assert failed_evidence["integration"]["reason"] == "not_found"
+    refute Jason.encode!(failed_evidence) =~ missing_webhook_reference
+    assert Configuration.active!().id == active.id
+
+    Application.put_env(:symphony_elixir, :integration_health_adapters, %{
+      "tracker" => LeakyWebhookTrackerHealth,
+      "source_control" => FakeSourceControlHealth
+    })
+
+    assert {:ok, leaky_draft} = Configuration.create_draft(document, actor: "admin")
+
+    assert {:error, {:probe_failed, :integration, leaky_evidence}} =
+             Configuration.activate(leaky_draft.id, actor: "admin")
+
+    assert leaky_evidence["integration"]["reason"] == "denied"
+
+    leaky_encoded = Jason.encode!(leaky_evidence)
+    refute leaky_encoded =~ "tracker-health-secret"
+    refute leaky_encoded =~ "tracker-webhook-secret"
+    refute leaky_encoded =~ tracker_reference.id
+    refute leaky_encoded =~ webhook_reference.id
+    assert Configuration.active!().id == active.id
+  end
+
+  test "integration probe resolves and uses project-selected integration refs" do
+    Process.put({SelectedTrackerHealth, :called}, [])
+
+    Application.put_env(:symphony_elixir, :integration_health_adapters, %{
+      "tracker" => SelectedTrackerHealth
+    })
+
+    document =
+      valid_project()
+      |> Map.put("tracker_integration_ref", "tracker-selected")
+      |> Document.for_project()
+      |> Map.put("integrations", [
+        %{
+          "id" => "tracker-unselected",
+          "kind" => "tracker",
+          "provider" => "fixture",
+          "settings" => %{"scenario" => "unselected"}
+        },
+        %{
+          "id" => "tracker-selected",
+          "kind" => "tracker",
+          "provider" => "fixture",
+          "settings" => %{"scenario" => "healthy"}
+        }
+      ])
+
+    assert {:ok, document} = Document.validate(document)
+    assert {:ok, evidence} = Validator.validate(document)
+
+    assert %{"probes" => [%{"integrations" => [selected]}]} = evidence
+    assert selected["id"] == "tracker-selected"
+    assert selected["project_integration_ref"] == "tracker-selected"
+    assert Process.get({SelectedTrackerHealth, :called}) == ["tracker-selected"]
+  end
+
+  test "integration probe resolves atom-keyed tracker health adapters" do
+    Application.put_env(:symphony_elixir, :integration_health_adapters, %{
+      tracker: InvalidIntegrationHealth
+    })
+
+    document = %{
+      "integrations" => [
+        %{
+          "id" => "tracker-atom-adapter",
+          "kind" => "tracker",
+          "provider" => "fixture",
+          "settings" => %{}
+        }
+      ]
+    }
+
+    assert {:error, {:integration, %{"integration" => failed}}} =
+             IntegrationProbe.validate(document)
+
+    assert failed["reason"] == "invalid_health_result"
+  end
+
+  test "integration probe scrubs adversarial plaintext health evidence before persistence or logs" do
+    Application.put_env(:symphony_elixir, :integration_health_adapters, %{
+      "tracker" => AdversarialIntegrationHealth
+    })
+
+    assert {:ok, tracker_reference} =
+             SecretStore.put("tracker-adversarial", "tracker-adversarial-secret", actor: "admin")
+
+    assert {:ok, webhook_reference} =
+             SecretStore.put("tracker-webhook-adversarial", "webhook-adversarial-secret", actor: "admin")
+
+    document =
+      valid_project()
+      |> Document.for_project()
+      |> Map.put("integrations", [
+        %{
+          "id" => "tracker-adversarial",
+          "kind" => "tracker",
+          "provider" => "github",
+          "credential_ref" => tracker_reference.id,
+          "settings" => %{
+            "owner" => "WangShayne",
+            "repository" => "Symphony-works",
+            "bot_actor_id" => "symphony-bot",
+            "webhook_secret_ref" => webhook_reference.id
+          }
+        }
+      ])
+
+    assert {:ok, draft} = Configuration.create_draft(document, actor: "admin")
+
+    log =
+      capture_log(fn ->
+        assert {:ok, active} = Configuration.activate(draft.id, actor: "admin")
+        persisted = SymphonyElixir.Repo.get!(SymphonyElixir.Configuration.Revision, active.id)
+        encoded = Jason.encode!(persisted.validation_evidence)
+
+        assert encoded =~ "[REDACTED]"
+        refute encoded =~ "tracker-adversarial-secret"
+        refute encoded =~ "webhook-adversarial-secret"
+        refute encoded =~ tracker_reference.id
+        refute encoded =~ webhook_reference.id
+      end)
+
+    refute log =~ "tracker-adversarial-secret"
+    refute log =~ "webhook-adversarial-secret"
+  end
+
+  test "validator ignores invalid extra probe configuration" do
+    document = valid_project() |> Document.for_project()
+
+    assert {:ok, %{"probes" => []}} = Validator.validate(document, probes: :invalid)
+  end
+
+  test "integration probe validates malformed documents and redacts rich adapter evidence" do
+    assert IntegrationProbe.configured?(:not_a_document) == false
+
+    assert {:ok, %{"integration_count" => 0, "integrations" => []}} =
+             IntegrationProbe.validate(:not_a_document)
+
+    assert {:ok, %{"integration_count" => 0, "integrations" => []}} =
+             IntegrationProbe.validate(%{"automation_projects" => [:not_a_project], "integrations" => []})
+
+    assert {:ok, tracker_reference} =
+             SecretStore.put("tracker-health-rich", "tracker-rich-secret", actor: "admin")
+
+    assert {:ok, webhook_reference} =
+             SecretStore.put("tracker-webhook-rich", "webhook-rich-secret", actor: "admin")
+
+    document =
+      valid_project()
+      |> Document.for_project()
+      |> Map.put("integrations", [
+        %{
+          "id" => "tracker-rich",
+          "kind" => "tracker",
+          "provider" => "github",
+          "credential_ref" => tracker_reference.id,
+          "settings" => %{
+            "owner" => "WangShayne",
+            "repository" => "Symphony-works",
+            "bot_actor_id" => "symphony-bot",
+            "webhook_secret_ref" => webhook_reference.id
+          }
+        }
+      ])
+
+    Application.put_env(:symphony_elixir, :integration_health_adapters, %{
+      "tracker" => RichIntegrationHealth
+    })
+
+    Process.put({RichIntegrationHealth, :references}, {tracker_reference.id, webhook_reference.id})
+
+    assert {:ok, %{"integrations" => [%{"health" => health}]}} = IntegrationProbe.validate(document)
+    encoded = inspect(health)
+    assert encoded =~ "[REDACTED]"
+    refute encoded =~ tracker_reference.id
+    refute encoded =~ webhook_reference.id
+    refute encoded =~ "tracker-rich-secret"
+    refute encoded =~ "webhook-rich-secret"
+
+    invalid_result_document =
+      valid_project()
+      |> Document.for_project()
+      |> Map.put("integrations", [
+        %{
+          "id" => "fixture-invalid",
+          "kind" => "tracker",
+          "provider" => "fixture",
+          "settings" => %{"scenario" => "healthy"}
+        }
+      ])
+
+    Application.put_env(:symphony_elixir, :integration_health_adapters, %{
+      "tracker" => InvalidIntegrationHealth
+    })
+
+    assert {:error, {:integration, %{"integration" => failed}}} =
+             IntegrationProbe.validate(invalid_result_document)
+
+    assert failed["reason"] == "invalid_health_result"
+
+    invalid_non_fixture_document =
+      valid_project()
+      |> Document.for_project()
+      |> Map.put("integrations", [
+        %{
+          "id" => "tracker-invalid",
+          "kind" => "tracker",
+          "provider" => "github",
+          "credential_ref" => tracker_reference.id,
+          "settings" => %{
+            "owner" => "WangShayne",
+            "repository" => "Symphony-works",
+            "bot_actor_id" => "symphony-bot",
+            "webhook_secret_ref" => webhook_reference.id
+          }
+        }
+      ])
+
+    assert {:error, {:integration, %{"integration" => non_fixture_failed}}} =
+             IntegrationProbe.validate(invalid_non_fixture_document)
+
+    assert non_fixture_failed["reason"] == "invalid_health_result"
+
+    Application.put_env(:symphony_elixir, :integration_health_adapters, %{
+      "tracker" => InvalidOkIntegrationHealth
+    })
+
+    assert {:error, {:integration, %{"integration" => ok_non_map_failed}}} =
+             IntegrationProbe.validate(invalid_non_fixture_document)
+
+    assert ok_non_map_failed["reason"] == "invalid_health_result"
+
+    for {adapter, expected_reason} <- [
+          {BinaryReasonIntegrationHealth, "adapter denied [REDACTED]"},
+          {MapCodeIntegrationHealth, "map_code"},
+          {AtomMapCodeIntegrationHealth, "atom_map_code"},
+          {TupleReasonIntegrationHealth, "tuple_code"},
+          {UnknownReasonIntegrationHealth, "health_check_failed"}
+        ] do
+      Application.put_env(:symphony_elixir, :integration_health_adapters, %{
+        "tracker" => adapter
+      })
+
+      assert {:error, {:integration, %{"integration" => failed}}} =
+               IntegrationProbe.validate(document)
+
+      assert failed["reason"] =~ expected_reason
+      refute failed["reason"] =~ tracker_reference.id
+      refute failed["reason"] =~ "tracker-rich-secret"
+      assert String.length(failed["reason"]) <= 120
+    end
   end
 
   test "runtime capability probe rejects unsupported and malformed provider bindings with redacted evidence" do

@@ -1,0 +1,79 @@
+[
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/pulls/22",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "id": 22022,
+      "number": 22,
+      "state": "open",
+      "draft": false,
+      "merged": false,
+      "merged_at": null,
+      "mergeable": true,
+      "mergeable_state": "clean",
+      "merge_commit_sha": null,
+      "head": {"ref": "symphony/ABC-22", "sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},
+      "base": {"ref": "main", "sha": "1111111111111111111111111111111111111111"}
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/pulls/22/merge",
+    "status": 404,
+    "headers": {},
+    "body": {"message": "Not Found"}
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/rules/branches/main",
+    "status": 200,
+    "headers": {},
+    "body": []
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/branches/main/protection/required_status_checks",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "contexts": ["legacy", "app-check"],
+      "checks": [{"context": "app-check", "app_id": 42}]
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/commits/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/check-runs",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "check_runs": [
+        {
+          "name": "app-check",
+          "status": "completed",
+          "conclusion": "success",
+          "details_url": "https://checks.test/wrong-app",
+          "app": {"id": 7}
+        },
+        {
+          "name": "app-check",
+          "status": "completed",
+          "conclusion": "failure",
+          "details_url": "https://checks.test/right-app",
+          "app": {"id": 42}
+        }
+      ]
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/commits/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/statuses",
+    "status": 200,
+    "headers": {},
+    "body": [
+      {"context": "legacy", "state": "success", "target_url": "https://status.test/latest"},
+      {"context": "legacy", "state": "failure", "target_url": "https://status.test/older"}
+    ]
+  }
+]

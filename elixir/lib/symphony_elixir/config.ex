@@ -99,6 +99,36 @@ defmodule SymphonyElixir.Config do
     )
   end
 
+  @doc false
+  @spec source_control_trusted_origins() :: term()
+  def source_control_trusted_origins do
+    Application.get_env(:symphony_elixir, :source_control_trusted_origins, %{})
+  end
+
+  @doc false
+  @spec source_control_endpoint_resolver() :: term()
+  def source_control_endpoint_resolver do
+    Application.get_env(:symphony_elixir, :source_control_endpoint_resolver, &:inet.getaddrs/2)
+  end
+
+  @doc false
+  @spec source_control_git_trusted_origins() :: term()
+  def source_control_git_trusted_origins do
+    Application.get_env(:symphony_elixir, :source_control_git_trusted_origins, %{})
+  end
+
+  @doc false
+  @spec source_control_git_endpoint_resolver() :: term()
+  def source_control_git_endpoint_resolver do
+    Application.get_env(:symphony_elixir, :source_control_git_endpoint_resolver, &:inet.getaddrs/2)
+  end
+
+  @doc false
+  @spec tracker_trusted_origins() :: term()
+  def tracker_trusted_origins do
+    Application.get_env(:symphony_elixir, :tracker_trusted_origins, %{})
+  end
+
   @spec validate!() :: :ok | {:error, term()}
   def validate! do
     WorkflowStore.force_reload()

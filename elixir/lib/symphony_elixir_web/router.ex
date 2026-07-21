@@ -71,6 +71,7 @@ defmodule SymphonyElixirWeb.Router do
   scope "/", SymphonyElixirWeb do
     pipe_through([:browser, :trusted_admin_browser])
 
+    live("/admin/configuration", ConfigurationLive, :index)
     live("/configuration", ConfigurationLive, :index)
     live("/configuration/secrets", Configuration.SecretLive, :index)
   end

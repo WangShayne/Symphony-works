@@ -1708,8 +1708,6 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp apply_codex_rate_limits(state, _update), do: state
-
   defp apply_token_delta(codex_totals, token_delta) do
     input_tokens = Map.get(codex_totals, :input_tokens, 0) + token_delta.input_tokens
     output_tokens = Map.get(codex_totals, :output_tokens, 0) + token_delta.output_tokens

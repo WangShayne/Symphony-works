@@ -355,8 +355,8 @@ defmodule SymphonyElixir.SourceControl.EffectAdapter do
 
   defp validate_remote_change_request_identity(attrs, %ChangeRequest{provider: provider} = change_request)
        when provider in [:github, :gitlab] do
-    with true <- nonempty_string?(change_request.external_id),
-         true <- positive_integer?(change_request.number),
+    with :ok <- validate_remote_external_id(change_request.external_id),
+         :ok <- validate_remote_number(change_request.number),
          identity when is_binary(identity) <- value(attrs, :identity_sha256),
          ^identity <- change_request_identity_hash(attrs) do
       :ok
@@ -366,6 +366,16 @@ defmodule SymphonyElixir.SourceControl.EffectAdapter do
   end
 
   defp validate_remote_change_request_identity(_attrs, %ChangeRequest{}), do: :ok
+
+  defp validate_remote_external_id(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> {:error, :invalid_configuration}
+      _external_id -> :ok
+    end
+  end
+
+  defp validate_remote_number(value) when is_integer(value) and value > 0, do: :ok
+  defp validate_remote_number(_value), do: {:error, :invalid_configuration}
 
   defp encode_change_request_result(%ChangeRequest{} = change_request) do
     change_request
@@ -391,9 +401,6 @@ defmodule SymphonyElixir.SourceControl.EffectAdapter do
     |> then(&:crypto.hash(:sha256, &1))
     |> Base.encode16(case: :lower)
   end
-
-  defp nonempty_string?(value), do: is_binary(value) and String.trim(value) != ""
-  defp positive_integer?(value), do: is_integer(value) and value > 0
 
   defp json_value(%struct{} = value) when is_atom(struct),
     do: value |> Map.from_struct() |> json_value()

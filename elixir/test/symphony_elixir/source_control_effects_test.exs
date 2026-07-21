@@ -449,7 +449,19 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
       {"gitlab-config-github-cr", gitlab, valid_github_change_request},
       {"repository-mismatch", github, Map.put(valid_github_change_request, "repository", "acme/other")},
       {"base-branch-mismatch", github, Map.put(valid_github_change_request, "base_branch", "develop")},
+      {"github-empty-external-id", github,
+       valid_github_change_request
+       |> Map.put("external_id", "")
+       |> with_change_request_identity()},
       {"github-external-id-mismatch", github, Map.put(valid_github_change_request, "external_id", "github-change-2")},
+      {"github-zero-number", github,
+       valid_github_change_request
+       |> Map.put("number", 0)
+       |> with_change_request_identity()},
+      {"github-nil-number", github,
+       valid_github_change_request
+       |> Map.put("number", nil)
+       |> with_change_request_identity()},
       {"github-number-mismatch", github, Map.put(valid_github_change_request, "number", 2)},
       {"github-missing-identity", github, legacy_change_request},
       {"gitlab-external-id-mismatch", gitlab, Map.put(valid_gitlab_change_request, "external_id", "gitlab-change-2")},

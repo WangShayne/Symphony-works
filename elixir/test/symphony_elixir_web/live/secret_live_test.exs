@@ -1,6 +1,7 @@
 defmodule SymphonyElixirWeb.SecretLiveTest do
   use SymphonyElixirWeb.ConnCase, async: false
 
+  import ExUnit.CaptureLog
   import Phoenix.LiveViewTest
 
   alias SymphonyElixir.Configuration
@@ -39,6 +40,24 @@ defmodule SymphonyElixirWeb.SecretLiveTest do
       |> render_submit()
 
     assert html =~ "Secret could not be stored"
+  end
+
+  test "Phoenix logs filter secret form values", %{conn: conn} do
+    canary = "live-secret-log-canary-#{System.unique_integer([:positive, :monotonic])}"
+    conn = put_req_header(conn, "authorization", "Bearer #{@bootstrap_token}")
+
+    assert {:ok, view, _html} = live(conn, "/configuration/secrets")
+
+    log =
+      capture_log([level: :debug], fn ->
+        view
+        |> form("#secret-form", secret: %{"name" => "github", "value" => canary})
+        |> render_submit()
+      end)
+
+    assert log =~ "Parameters:"
+    assert log =~ "[FILTERED]"
+    refute log =~ canary
   end
 
   test "secret form reports malformed submissions without echoing plaintext", %{conn: conn} do

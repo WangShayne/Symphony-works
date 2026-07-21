@@ -78,6 +78,13 @@ defmodule SymphonyElixir.Coordination.EventStore do
       end,
       mode: :immediate
     )
+  rescue
+    error in Exqlite.Error ->
+      if error.message == "coordination events are append-only" do
+        {:error, :event_conflict}
+      else
+        reraise error, __STACKTRACE__
+      end
   end
 
   @spec append(Ecto.UUID.t(), non_neg_integer(), [map()]) ::

@@ -52,10 +52,12 @@ defmodule SymphonyElixir.Audit do
       payload: attrs |> payload() |> Redactor.redact() |> normalize_payload()
     }
 
-    %Event{}
-    |> Event.create_changeset(event_attrs)
-    |> Repo.insert()
-    |> resolve_dedupe(event_attrs)
+    insert_result =
+      %Event{}
+      |> Event.create_changeset(event_attrs)
+      |> insert_event(event_attrs)
+
+    resolve_dedupe(insert_result, event_attrs)
   end
 
   def record(action, _attrs, actor) do
@@ -86,8 +88,32 @@ defmodule SymphonyElixir.Audit do
 
   defp resolve_dedupe({:ok, event}, _event_attrs), do: {:ok, event}
 
+  defp resolve_dedupe({:error, :event_conflict}, %{dedupe_key: dedupe_key} = event_attrs)
+       when is_binary(dedupe_key) do
+    resolve_existing_dedupe(dedupe_key, event_attrs, :dedupe_conflict)
+  end
+
   defp resolve_dedupe({:error, changeset}, %{dedupe_key: dedupe_key} = event_attrs)
        when is_binary(dedupe_key) do
+    resolve_existing_dedupe(dedupe_key, event_attrs, changeset)
+  end
+
+  defp resolve_dedupe({:error, changeset}, _event_attrs), do: {:error, changeset}
+
+  defp insert_event(changeset, %{dedupe_key: dedupe_key}) when is_binary(dedupe_key) do
+    Repo.insert(changeset)
+  rescue
+    error in Exqlite.Error ->
+      if error.message == "audit events are append-only" do
+        {:error, :event_conflict}
+      else
+        reraise error, __STACKTRACE__
+      end
+  end
+
+  defp insert_event(changeset, _event_attrs), do: Repo.insert(changeset)
+
+  defp resolve_existing_dedupe(dedupe_key, event_attrs, missing_result) do
     case Repo.get_by(Event, dedupe_key: dedupe_key) do
       %Event{} = existing ->
         if same_semantics?(existing, event_attrs),
@@ -95,11 +121,9 @@ defmodule SymphonyElixir.Audit do
           else: {:error, :dedupe_conflict}
 
       nil ->
-        {:error, changeset}
+        {:error, missing_result}
     end
   end
-
-  defp resolve_dedupe({:error, changeset}, _event_attrs), do: {:error, changeset}
 
   defp same_semantics?(event, attrs) do
     event

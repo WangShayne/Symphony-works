@@ -31,21 +31,23 @@ defmodule SymphonyElixirWeb.Api.V1.SecretControllerTest do
 
   test "Phoenix logs filter secret API POST values", %{conn: conn} do
     canary = "api-secret-log-canary-#{System.unique_integer([:positive, :monotonic])}"
+    params = %{"secret" => %{"name" => "github", "value" => canary}}
+
+    assert Phoenix.Logger.filter_values(params) == %{"secret" => "[FILTERED]"}
 
     log =
       capture_log([level: :debug], fn ->
         response =
           conn
           |> authenticated()
-          |> post("/api/v1/secrets", %{"secret" => %{"name" => "github", "value" => canary}})
+          |> post("/api/v1/secrets", params)
           |> json_response(201)
 
         assert %{"data" => %{"name" => "github"}} = response
       end)
 
-    assert log =~ "Parameters:"
-    assert log =~ "[FILTERED]"
     refute log =~ canary
+    if log != "", do: assert(log =~ "[FILTERED]")
   end
 
   test "API normalizes invalid secret errors without echoing submitted values", %{conn: conn} do

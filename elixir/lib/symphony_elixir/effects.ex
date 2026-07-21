@@ -132,7 +132,13 @@ defmodule SymphonyElixir.Effects do
       Redactor.contains_registered_secret?(normalized.target) ->
         {:error, :sensitive_target}
 
-      contains_registered_secret_identity?(normalized, [:task_id, :unit_id, :action, :provider]) ->
+      contains_registered_secret_identity?(normalized, [
+        :operation_id,
+        :task_id,
+        :unit_id,
+        :action,
+        :provider
+      ]) ->
         {:error, :sensitive_effect_identity}
 
       true ->

@@ -1240,8 +1240,11 @@ defmodule SymphonyElixir.EffectsTest do
   test "registered secret references in effect identity fields fail before persistence" do
     plaintext = "effect-identity-secret-#{System.unique_integer([:positive])}"
     {:ok, reference} = SecretStore.put("effect-identity-token", plaintext, actor: "admin-1")
+    operation_secret = OperationId.generate()
+    {:ok, _operation_reference} = SecretStore.put("effect-operation-id-token", operation_secret, actor: "admin-1")
 
     scenarios = [
+      {:operation_id, operation_secret, :sensitive_effect_identity},
       {:task_id, "task-#{reference.id}", :sensitive_effect_identity},
       {:unit_id, "unit-#{reference.id}", :sensitive_effect_identity},
       {:action, "action-#{reference.id}", :sensitive_effect_identity},
@@ -1252,21 +1255,24 @@ defmodule SymphonyElixir.EffectsTest do
     Enum.each(scenarios, fn {field, value, expected_error} ->
       operation_id = OperationId.generate()
       attrs = operation_id |> effect_attrs() |> Map.put(field, value)
+      attempted_operation_id = attrs.operation_id
 
       log =
         capture_log(fn ->
           assert {:error, ^expected_error} = Effects.execute(attrs, PersistedIntentAdapter)
         end)
 
-      assert_raise Ecto.NoResultsError, fn -> Effects.get!(operation_id) end
+      assert_raise Ecto.NoResultsError, fn -> Effects.get!(attempted_operation_id) end
       refute log =~ reference.id
       refute log =~ plaintext
+      refute log =~ operation_secret
     end)
 
     assert Effects.list(task_id: "task-1") == []
     assert {:ok, %{rows: rows}} = SQL.query(Repo, "select * from effect_records", [])
     refute inspect(rows) =~ reference.id
     refute inspect(rows) =~ plaintext
+    refute inspect(rows) =~ operation_secret
   end
 
   test "registered secret plaintext and references are rejected as mutation targets before insert" do

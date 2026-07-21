@@ -271,18 +271,20 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
 
     pin_integrations(task_id, [pinned])
 
-    change_request = %{
-      "provider" => "github",
-      "external_id" => "change-1",
-      "number" => 1,
-      "url" => "https://github.example.test/acme/unknown-create/pull/1",
-      "repository" => "acme/unknown-create",
-      "head_branch" => "task/all-actions",
-      "base_branch" => "main",
-      "title" => "All actions",
-      "draft" => true,
-      "disposition" => "created"
-    }
+    change_request =
+      %{
+        "provider" => "github",
+        "external_id" => "change-1",
+        "number" => 1,
+        "url" => "https://github.example.test/acme/unknown-create/pull/1",
+        "repository" => "acme/unknown-create",
+        "head_branch" => "task/all-actions",
+        "base_branch" => "main",
+        "title" => "All actions",
+        "draft" => true,
+        "disposition" => "created"
+      }
+      |> with_change_request_identity()
 
     old_sha = String.duplicate("1", 40)
     new_sha = String.duplicate("2", 40)
@@ -399,7 +401,37 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
         "base_branch" => "main"
       })
 
-    valid_change_request = %{
+    valid_github_change_request =
+      %{
+        "provider" => "github",
+        "external_id" => "github-change-1",
+        "number" => 1,
+        "url" => "https://example.test/acme/provider-fence/change/1",
+        "repository" => "acme/provider-fence",
+        "head_branch" => "task/provider-fence",
+        "base_branch" => "main",
+        "title" => "Provider fence",
+        "draft" => true,
+        "disposition" => "created"
+      }
+      |> with_change_request_identity()
+
+    valid_gitlab_change_request =
+      %{
+        "provider" => "gitlab",
+        "external_id" => "gitlab-change-1",
+        "number" => 1,
+        "url" => "https://example.test/acme/provider-fence/merge_requests/1",
+        "repository" => "acme/provider-fence",
+        "head_branch" => "task/provider-fence",
+        "base_branch" => "main",
+        "title" => "Provider fence",
+        "draft" => true,
+        "disposition" => "created"
+      }
+      |> with_change_request_identity()
+
+    legacy_change_request = %{
       "provider" => "github",
       "external_id" => "change-1",
       "number" => 1,
@@ -413,10 +445,15 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
     }
 
     scenarios = [
-      {"github-config-gitlab-cr", github, Map.put(valid_change_request, "provider", "gitlab")},
-      {"gitlab-config-github-cr", gitlab, valid_change_request},
-      {"repository-mismatch", github, Map.put(valid_change_request, "repository", "acme/other")},
-      {"base-branch-mismatch", github, Map.put(valid_change_request, "base_branch", "develop")}
+      {"github-config-gitlab-cr", github, Map.put(valid_github_change_request, "provider", "gitlab")},
+      {"gitlab-config-github-cr", gitlab, valid_github_change_request},
+      {"repository-mismatch", github, Map.put(valid_github_change_request, "repository", "acme/other")},
+      {"base-branch-mismatch", github, Map.put(valid_github_change_request, "base_branch", "develop")},
+      {"github-external-id-mismatch", github, Map.put(valid_github_change_request, "external_id", "github-change-2")},
+      {"github-number-mismatch", github, Map.put(valid_github_change_request, "number", 2)},
+      {"github-missing-identity", github, legacy_change_request},
+      {"gitlab-external-id-mismatch", gitlab, Map.put(valid_gitlab_change_request, "external_id", "gitlab-change-2")},
+      {"gitlab-number-mismatch", gitlab, Map.put(valid_gitlab_change_request, "number", 2)}
     ]
 
     for {suffix, config, change_request} <- scenarios,
@@ -433,15 +470,17 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
       task_id = "source-control-cr-fence-#{suffix}-#{action}"
       pin_integrations(task_id, [config])
 
-      assert {:error, :invalid_configuration} =
-               SourceControl.execute_effect(%{
-                 operation_id: OperationId.generate(),
-                 task_id: task_id,
-                 plan_revision: 1,
-                 unit_id: "integration",
-                 action: action,
-                 intent: intent
-               })
+      attrs = %{
+        operation_id: OperationId.generate(),
+        task_id: task_id,
+        plan_revision: 1,
+        unit_id: "integration",
+        action: action,
+        intent: intent
+      }
+
+      assert {:error, :invalid_configuration} = SourceControl.execute_effect(attrs)
+      assert {:error, :invalid_configuration} = SourceControl.execute_effect(attrs)
 
       refute_receive {:source_control_config, ^action, _config}, 0
       refute_receive {:source_control_invocation, _attrs}, 0
@@ -885,6 +924,25 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
     if credential_ref,
       do: Map.put(integration, "credential_ref", credential_ref),
       else: integration
+  end
+
+  defp with_change_request_identity(change_request) do
+    Map.put(change_request, "identity_sha256", change_request_identity_hash(change_request))
+  end
+
+  defp change_request_identity_hash(change_request) do
+    [
+      "v1",
+      Map.fetch!(change_request, "provider"),
+      Map.fetch!(change_request, "repository"),
+      Map.fetch!(change_request, "external_id"),
+      Map.fetch!(change_request, "number"),
+      Map.fetch!(change_request, "head_branch"),
+      Map.fetch!(change_request, "base_branch")
+    ]
+    |> :erlang.term_to_binary()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
   end
 
   defp capture_source_control do

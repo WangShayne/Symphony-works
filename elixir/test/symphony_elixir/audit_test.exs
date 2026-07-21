@@ -138,6 +138,90 @@ defmodule SymphonyElixir.AuditTest do
     refute serialized =~ "client-secret-value"
   end
 
+  test "audit metadata fields do not persist registered secrets through rows or queries" do
+    plaintext = "audit-metadata-secret-#{System.unique_integer([:positive])}"
+    private_key = "-----BEGIN PRIVATE KEY-----audit-metadata-----END PRIVATE KEY-----"
+    {:ok, reference} = SecretStore.put("audit-metadata-token", plaintext, actor: "admin-1")
+
+    log =
+      capture_log(fn ->
+        assert {:ok, event} =
+                 Audit.record(
+                   "action-#{plaintext}",
+                   %{
+                     task_id: "task-#{reference.id}",
+                     target: %{type: "task", id: "target-#{plaintext}"},
+                     configuration_revision: "revision-#{reference.id}",
+                     plan_revision: 2,
+                     outcome: "outcome-#{plaintext}",
+                     correlation_id: "correlation-#{reference.id}",
+                     dedupe_key: "dedupe-#{plaintext}",
+                     payload: %{"private_key" => private_key}
+                   },
+                   %{type: "administrator", id: "actor-#{reference.id}"}
+                 )
+
+        send(self(), {:audit_metadata_event_id, event.id})
+      end)
+
+    assert_receive {:audit_metadata_event_id, event_id}
+
+    listed = Enum.filter(Audit.list(), &(&1.id == event_id))
+
+    persisted =
+      [Audit.get!(event_id), listed]
+      |> inspect(limit: :infinity, printable_limit: :infinity)
+
+    assert length(listed) == 1
+
+    assert {:ok, %{rows: rows}} =
+             SQL.query(
+               Repo,
+               """
+               select id, actor, action, target, task_id, configuration_revision,
+                      plan_revision, outcome, correlation_id, dedupe_key, payload
+               from audit_events
+               where id = ?
+               """,
+               [event_id]
+             )
+
+    raw = inspect(rows, limit: :infinity, printable_limit: :infinity)
+
+    for sensitive <- [plaintext, reference.id, private_key] do
+      refute persisted =~ sensitive
+      refute raw =~ sensitive
+      refute log =~ sensitive
+    end
+  end
+
+  test "audit plan revision containing a registered reference fails without persistence" do
+    {:ok, reference} = SecretStore.put("audit-plan-reference", "unused-plan-secret", actor: "admin-1")
+
+    log =
+      capture_log(fn ->
+        assert {:error, %Ecto.Changeset{} = changeset} =
+                 Audit.record(
+                   :configuration_activated,
+                   %{
+                     task_id: "task-plan-reference",
+                     target: %{type: "task", id: "task-plan-reference"},
+                     plan_revision: reference.id,
+                     correlation_id: "correlation-plan-reference"
+                   },
+                   %{type: "administrator", id: "admin-1"}
+                 )
+
+        refute changeset.valid?
+        refute inspect(changeset, limit: :infinity, printable_limit: :infinity) =~ reference.id
+      end)
+
+    assert Audit.list(correlation_id: "correlation-plan-reference") == []
+    assert {:ok, %{rows: rows}} = SQL.query(Repo, "select * from audit_events", [])
+    refute inspect(rows, limit: :infinity, printable_limit: :infinity) =~ reference.id
+    refute log =~ reference.id
+  end
+
   test "database triggers reject updates and deletes of audit events" do
     {:ok, event} =
       Audit.record(

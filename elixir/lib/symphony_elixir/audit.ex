@@ -41,14 +41,14 @@ defmodule SymphonyElixir.Audit do
     event_attrs = %{
       id: OperationId.generate(),
       actor: actor |> normalize_identity("actor") |> Redactor.redact(),
-      action: normalize_name(action),
+      action: redact_name(action),
       target: attrs |> Map.get(:target, default_target(task_id)) |> normalize_identity("target") |> Redactor.redact(),
-      task_id: normalize_optional_string(task_id),
-      configuration_revision: normalize_optional_string(Map.get(attrs, :configuration_revision)),
-      plan_revision: normalize_plan_revision(Map.get(attrs, :plan_revision)),
-      outcome: attrs |> Map.get(:outcome, :succeeded) |> normalize_name(),
-      correlation_id: attrs |> Map.get(:correlation_id, task_id || OperationId.generate()) |> normalize_name(),
-      dedupe_key: normalize_optional_string(Map.get(attrs, :dedupe_key)),
+      task_id: redact_optional_string(task_id),
+      configuration_revision: attrs |> Map.get(:configuration_revision) |> redact_optional_string(),
+      plan_revision: attrs |> Map.get(:plan_revision) |> redact_plan_revision(),
+      outcome: attrs |> Map.get(:outcome, :succeeded) |> redact_name(),
+      correlation_id: attrs |> Map.get(:correlation_id, task_id || OperationId.generate()) |> redact_name(),
+      dedupe_key: attrs |> Map.get(:dedupe_key) |> redact_optional_string(),
       payload: attrs |> payload() |> Redactor.redact() |> normalize_payload()
     }
 
@@ -147,6 +147,15 @@ defmodule SymphonyElixir.Audit do
 
   defp normalize_optional_string(nil), do: nil
   defp normalize_optional_string(value), do: normalize_name(value)
+
+  defp redact_name(value), do: value |> normalize_name() |> Redactor.redact()
+
+  defp redact_optional_string(nil), do: nil
+  defp redact_optional_string(value), do: value |> normalize_optional_string() |> Redactor.redact()
+
+  defp redact_plan_revision(nil), do: nil
+  defp redact_plan_revision(value) when is_integer(value), do: value
+  defp redact_plan_revision(value), do: value |> Redactor.redact() |> normalize_plan_revision()
 
   defp normalize_plan_revision(value) when is_binary(value) do
     case Integer.parse(value) do

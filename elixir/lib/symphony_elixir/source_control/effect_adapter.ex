@@ -35,6 +35,7 @@ defmodule SymphonyElixir.SourceControl.EffectAdapter do
     "set_draft" => ~w(config change_request draft),
     "close_or_comment" => ~w(config change_request action body)
   }
+  @change_request_identity_key "identity_sha256"
   @providers ~w(fixture github gitlab)
 
   @spec prepare(map()) :: {:ok, map()} | {:error, :invalid_effect}
@@ -250,7 +251,11 @@ defmodule SymphonyElixir.SourceControl.EffectAdapter do
     %{invocation | intent: Map.put(intent, "config", updated_config), config: updated_config}
   end
 
+  defp normalize_execution_result({:ok, %ChangeRequest{} = result}),
+    do: {:ok, encode_change_request_result(result)}
+
   defp normalize_execution_result({:ok, result}), do: {:ok, json_value(result)}
+
   defp normalize_execution_result({:error, :unknown_outcome}), do: {:unknown, :unknown_outcome}
   defp normalize_execution_result({:error, reason}) when is_atom(reason), do: {:error, reason}
 
@@ -316,12 +321,15 @@ defmodule SymphonyElixir.SourceControl.EffectAdapter do
 
   defp validate_change_request_identity(action, intent, config)
        when action in ["set_draft", "close_or_comment"] do
-    with {:ok, change_request} <- change_request(value(intent, :change_request)),
+    change_request_attrs = value(intent, :change_request)
+
+    with {:ok, change_request} <- change_request(change_request_attrs),
          {:ok, provider} <- provider(config),
          {:ok, repository} <- repository(config),
          :ok <- exact_match(Atom.to_string(change_request.provider), provider),
          :ok <- exact_match(change_request.repository, repository),
-         :ok <- validate_base_branch(change_request, config) do
+         :ok <- validate_base_branch(change_request, config),
+         :ok <- validate_remote_change_request_identity(change_request_attrs, change_request) do
       :ok
     else
       _invalid -> {:error, :invalid_configuration}
@@ -344,6 +352,48 @@ defmodule SymphonyElixir.SourceControl.EffectAdapter do
 
   defp exact_match(value, expected) when is_binary(value) and value == expected, do: :ok
   defp exact_match(_value, _expected), do: {:error, :invalid_configuration}
+
+  defp validate_remote_change_request_identity(attrs, %ChangeRequest{provider: provider} = change_request)
+       when provider in [:github, :gitlab] do
+    with true <- nonempty_string?(change_request.external_id),
+         true <- positive_integer?(change_request.number),
+         identity when is_binary(identity) <- value(attrs, :identity_sha256),
+         ^identity <- change_request_identity_hash(attrs) do
+      :ok
+    else
+      _invalid -> {:error, :invalid_configuration}
+    end
+  end
+
+  defp validate_remote_change_request_identity(_attrs, %ChangeRequest{}), do: :ok
+
+  defp encode_change_request_result(%ChangeRequest{} = change_request) do
+    change_request
+    |> json_value()
+    |> put_change_request_identity()
+  end
+
+  defp put_change_request_identity(change_request) do
+    Map.put(change_request, @change_request_identity_key, change_request_identity_hash(change_request))
+  end
+
+  defp change_request_identity_hash(change_request) when is_map(change_request) do
+    [
+      "v1",
+      value(change_request, :provider),
+      value(change_request, :repository),
+      value(change_request, :external_id),
+      value(change_request, :number),
+      value(change_request, :head_branch),
+      value(change_request, :base_branch)
+    ]
+    |> :erlang.term_to_binary()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp nonempty_string?(value), do: is_binary(value) and String.trim(value) != ""
+  defp positive_integer?(value), do: is_integer(value) and value > 0
 
   defp json_value(%struct{} = value) when is_atom(struct),
     do: value |> Map.from_struct() |> json_value()

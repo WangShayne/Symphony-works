@@ -968,6 +968,13 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
                comment_opts(" ")
              )
 
+    assert {:error, :invalid_configuration} =
+             GitLab.close_or_comment(
+               config(self()),
+               change_request(),
+               operation_opts() |> Keyword.put(:action, :comment) |> Keyword.put(:body, 123)
+             )
+
     replay_response = fn _request, requests ->
       marker_body =
         requests

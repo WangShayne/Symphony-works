@@ -285,6 +285,20 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
                change_request(),
                operation(:missing_bot_actor_comment, action: :comment, body: "ship it")
              )
+
+    assert {:error, :invalid_configuration} =
+             GitHub.close_or_comment(
+               config([]),
+               change_request(),
+               operation(:non_binary_comment_body, action: :comment, body: 42)
+             )
+
+    assert {:error, :invalid_configuration} =
+             GitHub.close_or_comment(
+               config([]),
+               change_request(%{external_id: nil}),
+               operation(:missing_comment_parent_external_id, action: :comment, body: "ship it")
+             )
   end
 
   test "health rejects malformed observations and denied or unknown write permissions" do

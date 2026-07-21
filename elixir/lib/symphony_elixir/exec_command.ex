@@ -157,7 +157,7 @@ defmodule SymphonyElixir.ExecCommand do
       end)
 
       collect_control_status(
-        reader_state(self(), ref, exec_pid, exec_ref, os_pid, proofs, nil, %{
+        reader_state(self(), ref, exec_pid, exec_ref, os_pid, proofs, make_ref(), %{
           control_root: "",
           control_dir: "",
           control_path: "",
@@ -932,7 +932,7 @@ defmodule SymphonyElixir.ExecCommand do
 
       {@control_reader_message, :stop, ^ref, from, stop_ref} ->
         stop_control_reader_exec(exec_pid, exec_ref)
-        if is_reference(parent_ref), do: Process.demonitor(parent_ref, [:flush])
+        Process.demonitor(parent_ref, [:flush])
         cleanup_control_files(files.control_root, files.control_dir, files.control_path, files.secret_path)
         send(from, {@control_reader_message, :stopped, stop_ref})
     end

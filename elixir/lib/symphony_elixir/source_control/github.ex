@@ -923,8 +923,25 @@ defmodule SymphonyElixir.SourceControl.GitHub do
   end
 
   defp comment(config, repository, change_request, operation_id, dedupe_key, opts) do
-    body = Keyword.get(opts, :body)
+    case Keyword.get(opts, :body) do
+      body when is_binary(body) ->
+        comment_with_body(config, repository, change_request, operation_id, dedupe_key, body)
 
+      _invalid ->
+        {:error, :invalid_configuration}
+    end
+  end
+
+  defp comment_with_body(
+         config,
+         repository,
+         %ChangeRequest{} = change_request,
+         operation_id,
+         dedupe_key,
+         body
+       )
+       when is_binary(repository) and is_binary(operation_id) and is_binary(dedupe_key) and
+              is_binary(body) do
     with true <- nonempty_string?(body),
          {:ok, bot_actor_id} <- bot_actor_id(config),
          {:ok, marker} <- comment_marker(repository, change_request, operation_id, dedupe_key, body),
@@ -945,16 +962,29 @@ defmodule SymphonyElixir.SourceControl.GitHub do
     end
   end
 
-  defp comment_marker(repository, change_request, operation_id, dedupe_key, body) do
-    AdapterSupport.comment_marker(
+  defp comment_marker(
+         repository,
+         %ChangeRequest{external_id: parent_external_id},
+         operation_id,
+         dedupe_key,
+         body
+       )
+       when is_binary(repository) and is_binary(parent_external_id) and is_binary(operation_id) and
+              is_binary(dedupe_key) and is_binary(body) do
+    # The credential is process-scoped, which Dialyzer cannot follow through
+    # the adapter callback boundary.
+    apply(AdapterSupport, :comment_marker, [
       :github,
       repository,
-      change_request.external_id,
+      parent_external_id,
       operation_id,
       dedupe_key,
       body
-    )
+    ])
   end
+
+  defp comment_marker(_repository, _change_request, _operation_id, _dedupe_key, _body),
+    do: {:error, :invalid_configuration}
 
   defp github_comment_decision({:found, found}, _config, _repo, _cr, _body, _marker, _bot_actor_id) do
     {:ok, %{action: :already_applied, external_id: to_string(found["id"])}}

@@ -782,11 +782,20 @@ defmodule SymphonyElixir.SourceControl.GitLab do
   end
 
   defp comment(config, repository, change_request, operation_id, dedupe_key, opts) do
-    body = Keyword.get(opts, :body)
-
-    with true <- nonempty_string?(body),
+    with body when is_binary(body) <- Keyword.get(opts, :body),
+         true <- nonempty_string?(body),
+         parent_external_id when is_binary(parent_external_id) <- change_request.external_id,
+         true <- nonempty_string?(parent_external_id),
          {:ok, bot_actor_id} <- bot_actor_id(config),
-         {:ok, marker} <- comment_marker(repository, change_request, operation_id, dedupe_key, body),
+         {:ok, marker} <-
+           gitlab_comment_marker(
+             :gitlab,
+             repository,
+             parent_external_id,
+             operation_id,
+             dedupe_key,
+             body
+           ),
          {:ok, notes} <- list_notes(config, repository, change_request.number),
          {:ok, decision} <- AdapterSupport.marker_decision(notes, "body", marker, ["author", "id"], bot_actor_id) do
       gitlab_comment_decision(
@@ -801,18 +810,23 @@ defmodule SymphonyElixir.SourceControl.GitLab do
     else
       false -> {:error, :invalid_configuration}
       {:error, _reason} = error -> error
+      _invalid -> {:error, :invalid_configuration}
     end
   end
 
-  defp comment_marker(repository, change_request, operation_id, dedupe_key, body) do
-    AdapterSupport.operation_marker(
-      :gitlab,
+  @spec gitlab_comment_marker(atom(), String.t(), String.t(), String.t(), String.t(), String.t()) ::
+          {:ok, AdapterSupport.operation_marker()} | {:error, term()}
+  defp gitlab_comment_marker(provider, repository, parent_external_id, operation_id, dedupe_key, body) do
+    # The credential is process-scoped, which Dialyzer cannot follow through
+    # the adapter callback boundary.
+    apply(AdapterSupport, :comment_marker, [
+      provider,
       repository,
-      :comment,
+      parent_external_id,
       operation_id,
       dedupe_key,
-      [change_request.external_id, AdapterSupport.body_digest(body)]
-    )
+      body
+    ])
   end
 
   defp gitlab_comment_decision({:found, found}, _config, _repo, _cr, _body, _marker, _bot_actor_id) do

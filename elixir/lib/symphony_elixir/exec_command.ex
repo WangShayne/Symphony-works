@@ -50,7 +50,14 @@ defmodule SymphonyElixir.ExecCommand do
 
   defp start_guarded_command(command, start_reader) when is_list(command) and is_function(start_reader, 4) do
     case make_control_files() do
-      {:ok, %{path: control_path, secret_path: secret_path, proofs: proofs, control_dir: control_dir, control_root: control_root}} ->
+      {:ok,
+       %{
+         path: control_path,
+         secret_path: secret_path,
+         proofs: proofs,
+         control_dir: control_dir,
+         control_root: control_root
+       }} ->
         ref = make_ref()
         parent = self()
 
@@ -149,7 +156,17 @@ defmodule SymphonyElixir.ExecCommand do
         {:down, reason} -> send(self(), {:DOWN, exec_ref, :process, exec_pid, reason})
       end)
 
-      collect_control_status(self(), ref, exec_pid, exec_ref, os_pid, proofs, "", "")
+      collect_control_status(
+        reader_state(self(), ref, exec_pid, exec_ref, os_pid, proofs, nil, %{
+          control_root: "",
+          control_dir: "",
+          control_path: "",
+          secret_path: ""
+        }),
+        "",
+        ""
+      )
+
       Process.demonitor(exec_ref, [:flush])
 
       receive do
@@ -163,7 +180,9 @@ defmodule SymphonyElixir.ExecCommand do
 
     @doc false
     @spec write_control_secret_for_test(Path.t(), iodata()) :: {:ok, Path.t()} | {:error, term()}
-    def write_control_secret_for_test(control_path, secret), do: write_control_secret(control_path, secret)
+    def write_control_secret_for_test(control_path, secret) do
+      write_control_secret(control_root_from_path(control_path), control_path, secret)
+    end
 
     @doc false
     @spec protect_write_and_close_control_secret_for_test(term(), Path.t(), iodata()) :: :ok | {:error, term()}
@@ -479,12 +498,6 @@ defmodule SymphonyElixir.ExecCommand do
     end
   end
 
-  defp write_control_secret(control_path, secret) when is_binary(control_path) do
-    control_path
-    |> control_root_from_path()
-    |> write_control_secret(control_path, secret)
-  end
-
   defp write_control_secret(control_root, control_path, secret) when is_binary(control_root) and is_binary(control_path) do
     secret_path = control_path <> ".secret"
     control_dir = Path.dirname(control_path)
@@ -517,9 +530,8 @@ defmodule SymphonyElixir.ExecCommand do
       {:ok, %{type: :directory}} ->
         with :ok <- validate_owner(control_parent, :unsafe_control_parent),
              :ok <- File.chmod(control_parent, 0o700),
-             :ok <- validate_owned_path(control_parent, :directory, 0o700, :unsafe_control_parent),
-             {:ok, control_root} <- directory_realpath(control_parent) do
-          {:ok, control_root}
+             :ok <- validate_owned_path(control_parent, :directory, 0o700, :unsafe_control_parent) do
+          directory_realpath(control_parent)
         end
 
       {:ok, _stat} ->
@@ -527,9 +539,8 @@ defmodule SymphonyElixir.ExecCommand do
 
       {:error, :enoent} ->
         with :ok <- mkdir_private(control_parent),
-             :ok <- validate_owned_path(control_parent, :directory, 0o700, :unsafe_control_parent),
-             {:ok, control_root} <- directory_realpath(control_parent) do
-          {:ok, control_root}
+             :ok <- validate_owned_path(control_parent, :directory, 0o700, :unsafe_control_parent) do
+          directory_realpath(control_parent)
         end
 
       {:error, reason} ->
@@ -599,11 +610,15 @@ defmodule SymphonyElixir.ExecCommand do
   defp validate_owned_path(path, expected_type, expected_mode, error_reason) do
     with {:ok, lstat} <- File.lstat(path),
          :ok <- reject_symlink(lstat, error_reason),
-         {:ok, stat} <- File.stat(path),
-         :ok <- validate_type(stat, expected_type, error_reason),
-         :ok <- validate_owner(stat, error_reason),
-         :ok <- validate_mode(stat, expected_mode, error_reason) do
-      :ok
+         {:ok, stat} <- File.stat(path) do
+      validate_owned_stat(stat, expected_type, expected_mode, error_reason)
+    end
+  end
+
+  defp validate_owned_stat(stat, expected_type, expected_mode, error_reason) do
+    with :ok <- validate_type(stat, expected_type, error_reason),
+         :ok <- validate_owner(stat, error_reason) do
+      validate_mode(stat, expected_mode, error_reason)
     end
   end
 
@@ -659,17 +674,37 @@ defmodule SymphonyElixir.ExecCommand do
 
   defp private_control_dir?(control_root, control_dir, control_path, secret_path)
        when is_binary(control_root) and is_binary(control_dir) and is_binary(control_path) and is_binary(secret_path) do
-    Path.basename(control_root) == @control_parent_name and
-      String.starts_with?(Path.basename(control_dir), @control_private_dir_prefix) and
-      control_dir_bound_to_control_root?(control_root, control_dir) and
-      validate_owned_path(control_root, :directory, 0o700, :unsafe_control_parent) == :ok and
-      validate_owned_path(control_dir, :directory, 0o700, :unsafe_control_dir) == :ok and
-      Path.dirname(control_path) == control_dir and
-      Path.basename(control_path) == "status" and
-      secret_path == control_path <> ".secret"
+    %{
+      control_root: control_root,
+      control_dir: control_dir,
+      control_path: control_path,
+      secret_path: secret_path
+    }
+    |> private_control_dir_checks()
+    |> Enum.all?(& &1)
   end
 
   defp private_control_dir?(_control_root, _control_dir, _control_path, _secret_path), do: false
+
+  defp private_control_dir_checks(files) do
+    [
+      control_root_name?(files.control_root),
+      control_dir_name?(files.control_dir),
+      control_paths_match?(files),
+      control_dir_bound_to_control_root?(files.control_root, files.control_dir),
+      validate_owned_path(files.control_root, :directory, 0o700, :unsafe_control_parent) == :ok,
+      validate_owned_path(files.control_dir, :directory, 0o700, :unsafe_control_dir) == :ok
+    ]
+  end
+
+  defp control_root_name?(control_root), do: Path.basename(control_root) == @control_parent_name
+  defp control_dir_name?(control_dir), do: String.starts_with?(Path.basename(control_dir), @control_private_dir_prefix)
+
+  defp control_paths_match?(%{control_dir: control_dir, control_path: control_path, secret_path: secret_path}) do
+    Path.dirname(control_path) == control_dir and
+      Path.basename(control_path) == "status" and
+      secret_path == control_path <> ".secret"
+  end
 
   defp control_dir_bound_to_control_root?(control_root, control_dir) do
     with {:ok, expected_parent} <- directory_realpath(control_root),
@@ -802,19 +837,14 @@ defmodule SymphonyElixir.ExecCommand do
               send(starter, {@control_reader_message, :started, self(), os_pid})
 
               collect_control_status(
-                parent,
-                ref,
-                exec_pid,
-                exec_ref,
-                os_pid,
-                proofs,
+                reader_state(parent, ref, exec_pid, exec_ref, os_pid, proofs, parent_ref, %{
+                  control_root: control_root,
+                  control_dir: control_dir,
+                  control_path: control_path,
+                  secret_path: secret_path
+                }),
                 "",
-                "",
-                parent_ref,
-                control_root,
-                control_dir,
-                control_path,
-                secret_path
+                ""
               )
 
             {:error, reason} ->
@@ -839,24 +869,32 @@ defmodule SymphonyElixir.ExecCommand do
     end
   end
 
-  defp collect_control_status(parent, ref, exec_pid, exec_ref, os_pid, proofs, stdout, stderr) do
-    collect_control_status(parent, ref, exec_pid, exec_ref, os_pid, proofs, stdout, stderr, nil, "", "", "", "")
+  defp reader_state(parent, ref, exec_pid, exec_ref, os_pid, proofs, parent_ref, files) do
+    %{
+      parent: parent,
+      ref: ref,
+      exec_pid: exec_pid,
+      exec_ref: exec_ref,
+      os_pid: os_pid,
+      proofs: proofs,
+      parent_ref: parent_ref,
+      files: files
+    }
   end
 
   defp collect_control_status(
-         parent,
-         ref,
-         exec_pid,
-         exec_ref,
-         os_pid,
-         proofs,
+         %{
+           parent: parent,
+           ref: ref,
+           exec_pid: exec_pid,
+           exec_ref: exec_ref,
+           os_pid: os_pid,
+           proofs: proofs,
+           parent_ref: parent_ref,
+           files: files
+         } = state,
          stdout,
-         stderr,
-         parent_ref,
-         control_root,
-         control_dir,
-         control_path,
-         secret_path
+         stderr
        ) do
     receive do
       {:stdout, ^os_pid, data} ->
@@ -868,39 +906,11 @@ defmodule SymphonyElixir.ExecCommand do
             Process.demonitor(exec_ref, [:flush])
 
           [_pending] ->
-            collect_control_status(
-              parent,
-              ref,
-              exec_pid,
-              exec_ref,
-              os_pid,
-              proofs,
-              stdout,
-              stderr,
-              parent_ref,
-              control_root,
-              control_dir,
-              control_path,
-              secret_path
-            )
+            collect_control_status(state, stdout, stderr)
         end
 
       {:stderr, ^os_pid, data} ->
-        collect_control_status(
-          parent,
-          ref,
-          exec_pid,
-          exec_ref,
-          os_pid,
-          proofs,
-          stdout,
-          stderr <> IO.iodata_to_binary(data),
-          parent_ref,
-          control_root,
-          control_dir,
-          control_path,
-          secret_path
-        )
+        collect_control_status(state, stdout, stderr <> IO.iodata_to_binary(data))
 
       {:EXIT, ^exec_pid, {:exit_status, status}} ->
         Process.demonitor(exec_ref, [:flush])
@@ -920,7 +930,7 @@ defmodule SymphonyElixir.ExecCommand do
       {@control_reader_message, :stop, ^ref, from, stop_ref} ->
         stop_control_reader_exec(exec_pid, exec_ref)
         if is_reference(parent_ref), do: Process.demonitor(parent_ref, [:flush])
-        cleanup_control_files(control_root, control_dir, control_path, secret_path)
+        cleanup_control_files(files.control_root, files.control_dir, files.control_path, files.secret_path)
         send(from, {@control_reader_message, :stopped, stop_ref})
     end
   end

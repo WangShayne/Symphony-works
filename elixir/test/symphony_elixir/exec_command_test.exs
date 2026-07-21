@@ -504,8 +504,22 @@ defmodule SymphonyElixir.ExecCommandTest do
 
   defp assert_run_owner_death_cleans_control_resources do
     before_dirs = control_private_dirs()
-    test_pid = self()
+    owner = start_sleeping_exec_owner(self())
+    control_dir = new_control_dir(before_dirs)
 
+    control_path = Path.join(control_dir, "status")
+    reader_pid = eventually_value(fn -> control_reader_process_for_path(control_path, owner) end)
+    reader_os_pid = eventually_value(fn -> control_reader_os_pid_for_path(control_path) end)
+
+    try do
+      assert_reader_resources_live(reader_pid, reader_os_pid)
+      assert_owner_death_cleans_resources(owner, reader_pid, reader_os_pid, control_dir)
+    after
+      cleanup_owner_death_probe(owner, reader_pid, reader_os_pid, control_dir)
+    end
+  end
+
+  defp start_sleeping_exec_owner(test_pid) do
     owner =
       spawn(fn ->
         send(test_pid, :owner_started)
@@ -516,47 +530,46 @@ defmodule SymphonyElixir.ExecCommandTest do
       end)
 
     assert_receive :owner_started, 1_000
+    owner
+  end
 
-    control_dir =
-      eventually_value(fn ->
-        control_private_dirs()
-        |> Enum.reject(&MapSet.member?(before_dirs, &1))
-        |> Enum.find(fn dir ->
-          File.exists?(Path.join(dir, "status")) and File.exists?(Path.join(dir, "status.secret"))
-        end)
-      end)
+  defp new_control_dir(before_dirs) do
+    eventually_value(fn ->
+      control_private_dirs()
+      |> Enum.reject(&MapSet.member?(before_dirs, &1))
+      |> Enum.find(&control_dir_ready?/1)
+    end)
+  end
 
-    control_path = Path.join(control_dir, "status")
+  defp control_dir_ready?(dir) do
+    File.exists?(Path.join(dir, "status")) and File.exists?(Path.join(dir, "status.secret"))
+  end
 
-    reader_pid = eventually_value(fn -> control_reader_process_for_path(control_path, owner) end)
-    reader_os_pid = eventually_value(fn -> control_reader_os_pid_for_path(control_path) end)
-
+  defp assert_reader_resources_live(reader_pid, reader_os_pid) do
     assert is_pid(reader_pid)
     assert Process.alive?(reader_pid)
     assert is_integer(reader_os_pid)
     assert os_process_alive?(reader_os_pid)
-
-    try do
-      Process.exit(owner, :kill)
-
-      assert eventually_value(fn ->
-               if not Process.alive?(reader_pid), do: true
-             end)
-
-      assert eventually_value(fn ->
-               if not os_process_alive?(reader_os_pid), do: true
-             end)
-
-      assert eventually_value(fn ->
-               if not File.exists?(control_dir), do: true
-             end)
-    after
-      if Process.alive?(owner), do: Process.exit(owner, :kill)
-      if is_pid(reader_pid) and Process.alive?(reader_pid), do: Process.exit(reader_pid, :kill)
-      if is_integer(reader_os_pid) and os_process_alive?(reader_os_pid), do: System.cmd("kill", [Integer.to_string(reader_os_pid)])
-      File.rm_rf(control_dir)
-    end
   end
+
+  defp assert_owner_death_cleans_resources(owner, reader_pid, reader_os_pid, control_dir) do
+    Process.exit(owner, :kill)
+
+    assert eventually_value(fn -> stopped?(reader_pid) end)
+    assert eventually_value(fn -> os_process_stopped?(reader_os_pid) end)
+    assert eventually_value(fn -> removed?(control_dir) end)
+  end
+
+  defp cleanup_owner_death_probe(owner, reader_pid, reader_os_pid, control_dir) do
+    if Process.alive?(owner), do: Process.exit(owner, :kill)
+    if is_pid(reader_pid) and Process.alive?(reader_pid), do: Process.exit(reader_pid, :kill)
+    if is_integer(reader_os_pid) and os_process_alive?(reader_os_pid), do: System.cmd("kill", [Integer.to_string(reader_os_pid)])
+    File.rm_rf(control_dir)
+  end
+
+  defp stopped?(pid), do: if(not Process.alive?(pid), do: true)
+  defp os_process_stopped?(pid), do: if(not os_process_alive?(pid), do: true)
+  defp removed?(path), do: if(not File.exists?(path), do: true)
 
   test "status control rejects symlink parents and secret collisions without carrier residue" do
     test_root =
@@ -761,22 +774,27 @@ defmodule SymphonyElixir.ExecCommandTest do
       {output, 0} ->
         output
         |> String.split("\n")
-        |> Enum.find_value(fn line ->
-          if String.contains?(line, control_path) and String.contains?(line, "read -r line") do
-            line
-            |> String.trim()
-            |> String.split(~r/\s+/, parts: 2)
-            |> hd()
-            |> Integer.parse()
-            |> case do
-              {pid, ""} -> pid
-              _invalid -> nil
-            end
-          end
-        end)
+        |> Enum.filter(&control_reader_ps_line?(&1, control_path))
+        |> Enum.find_value(&parse_ps_pid/1)
 
       {_output, _status} ->
         nil
+    end
+  end
+
+  defp control_reader_ps_line?(line, control_path) do
+    String.contains?(line, control_path) and String.contains?(line, "read -r line")
+  end
+
+  defp parse_ps_pid(line) do
+    line
+    |> String.trim()
+    |> String.split(~r/\s+/, parts: 2)
+    |> hd()
+    |> Integer.parse()
+    |> case do
+      {pid, ""} -> pid
+      _invalid -> nil
     end
   end
 

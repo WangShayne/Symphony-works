@@ -40,7 +40,9 @@ defmodule SymphonyElixir.SourceControl.AdapterSupport do
     dedupe_digest = digest([provider, repository, action, dedupe_key])
     intent_digest = digest(intent_parts)
     operation_digest = digest([provider, repository, action, operation_id])
-    signature_payload = marker_signature_payload(provider, repository, action, dedupe_digest, intent_digest, operation_digest)
+
+    signature_payload =
+      marker_signature_payload(provider, repository, action, dedupe_digest, intent_digest, operation_digest)
 
     with {:ok, signature} <- Transport.sign_marker_payload(signature_payload) do
       dedupe_prefix = "<!-- symphony:dedupe-sha256=#{dedupe_digest} "
@@ -86,26 +88,9 @@ defmodule SymphonyElixir.SourceControl.AdapterSupport do
       when is_list(items) and is_binary(body_key) and is_map(marker) do
     case marker_fields(marker.exact) do
       {:ok, expected} ->
-        exact = marker_matches(items, body_key, marker, expected, :exact)
-        replay = marker_matches(items, body_key, marker, expected, :replay)
-        operation = marker_matches(items, body_key, marker, expected, :operation)
-
-        cond do
-          length(exact) > 1 or length(replay) > 1 ->
-            {:error, :ambiguous_external_state}
-
-          Enum.any?(operation, &(not marker_match?(&1, body_key, marker, expected, :exact))) ->
-            {:error, :idempotency_conflict}
-
-          length(replay) == 1 ->
-            {:ok, {:found, hd(replay)}}
-
-          marker_matches(items, body_key, marker, expected, :dedupe) != [] ->
-            {:error, :idempotency_conflict}
-
-          true ->
-            {:ok, :create}
-        end
+        items
+        |> marker_match_groups(body_key, marker, expected)
+        |> marker_decision_from_matches()
 
       :error ->
         {:ok, :create}
@@ -133,6 +118,36 @@ defmodule SymphonyElixir.SourceControl.AdapterSupport do
 
   defp marker_matches(items, body_key, marker, expected, mode) do
     Enum.filter(items, &marker_match?(&1, body_key, marker, expected, mode))
+  end
+
+  defp marker_match_groups(items, body_key, marker, expected) do
+    operation = marker_matches(items, body_key, marker, expected, :operation)
+
+    %{
+      exact: marker_matches(items, body_key, marker, expected, :exact),
+      replay: marker_matches(items, body_key, marker, expected, :replay),
+      operation_conflict?: Enum.any?(operation, &(not marker_match?(&1, body_key, marker, expected, :exact))),
+      dedupe: marker_matches(items, body_key, marker, expected, :dedupe)
+    }
+  end
+
+  defp marker_decision_from_matches(matches) do
+    cond do
+      length(matches.exact) > 1 or length(matches.replay) > 1 ->
+        {:error, :ambiguous_external_state}
+
+      matches.operation_conflict? ->
+        {:error, :idempotency_conflict}
+
+      length(matches.replay) == 1 ->
+        {:ok, {:found, hd(matches.replay)}}
+
+      matches.dedupe != [] ->
+        {:error, :idempotency_conflict}
+
+      true ->
+        {:ok, :create}
+    end
   end
 
   defp marker_body(item, body_key), do: to_string(Map.get(item, body_key) || "")

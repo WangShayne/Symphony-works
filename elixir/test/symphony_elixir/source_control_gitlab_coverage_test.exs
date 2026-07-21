@@ -554,7 +554,7 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
                operation_opts()
              )
 
-    assert Enum.count(ScriptTransport.requests(malformed_unrelated_list), &(&1.method == :post)) == 0
+    refute Enum.any?(ScriptTransport.requests(malformed_unrelated_list), &(&1.method == :post))
 
     pages =
       [canonical_project()] ++

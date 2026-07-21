@@ -15,6 +15,9 @@ defmodule SymphonyElixir.SourceControl.GitLab do
 
   alias SymphonyElixir.SourceControl.ChangeRequest.State
 
+  defguardp unknown_change_request_create_status?(status)
+            when status in [400, 409, 422] or (is_integer(status) and status >= 500 and status <= 599)
+
   @impl true
   def health_check(config) when is_map(config) do
     with {:ok, repository, base_branch} <- repository(config),
@@ -346,9 +349,27 @@ defmodule SymphonyElixir.SourceControl.GitLab do
   end
 
   defp create_change_request(config, repository, input, canonical_project_id) do
+    request = change_request_create_request(repository, input)
+
+    case Transport.request(config, :gitlab, request) do
+      {:ok, %{status: 201, body: merge_request}} ->
+        normalize_created_change_request(merge_request, repository, input, canonical_project_id)
+
+      {:ok, %{status: status}} when unknown_change_request_create_status?(status) ->
+        {:error, :unknown_outcome}
+
+      {:ok, response} ->
+        expect(response, 201)
+
+      {:error, _reason} ->
+        {:error, :unknown_outcome}
+    end
+  end
+
+  defp change_request_create_request(repository, input) do
     title = if input.draft, do: draft_title(input.title), else: input.title
 
-    request = %{
+    %{
       method: :post,
       path: "/projects/#{segment(repository)}/merge_requests",
       json: %{
@@ -359,26 +380,14 @@ defmodule SymphonyElixir.SourceControl.GitLab do
       },
       retry: :never
     }
+  end
 
-    case Transport.request(config, :gitlab, request) do
-      {:ok, %{status: 201, body: merge_request}} ->
-        if merge_request_identity?(merge_request, input, canonical_project_id) == {:ok, true} do
-          case normalize_change_request(merge_request, repository, input, :created) do
-            {:ok, _change_request} = ok -> ok
-            {:error, _reason} -> {:error, :unknown_outcome}
-          end
-        else
-          {:error, :unknown_outcome}
-        end
-
-      {:ok, %{status: status}} when status in [400, 409, 422] or (status >= 500 and status <= 599) ->
-        {:error, :unknown_outcome}
-
-      {:ok, response} ->
-        expect(response, 201)
-
-      {:error, _reason} ->
-        {:error, :unknown_outcome}
+  defp normalize_created_change_request(merge_request, repository, input, canonical_project_id) do
+    with {:ok, true} <- merge_request_identity?(merge_request, input, canonical_project_id),
+         {:ok, _change_request} = ok <- normalize_change_request(merge_request, repository, input, :created) do
+      ok
+    else
+      _invalid -> {:error, :unknown_outcome}
     end
   end
 
@@ -487,7 +496,10 @@ defmodule SymphonyElixir.SourceControl.GitLab do
 
   defp canonical_project_id(config, repository) do
     settings = value(config, :settings) || %{}
-    configured = value(settings, :project_id) || value(settings, :canonical_project_id) || value(settings, :repository_id)
+
+    configured =
+      value(settings, :project_id) || value(settings, :canonical_project_id) ||
+        value(settings, :repository_id)
 
     request = %{method: :get, path: "/projects/#{segment(repository)}", retry: :safe}
 

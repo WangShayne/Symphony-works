@@ -300,6 +300,12 @@ defmodule SymphonyElixir.ExecCommandTest do
                proofs
              )
 
+    assert {:error, {:control_read_failed, 17, "reader warning"}} =
+             ExecCommand.collect_control_status_for_test(
+               [{:stderr, "reader warning"}, {:exit, {:exit_status, 17}}],
+               proofs
+             )
+
     assert {:error, {:control_read_failed, :forced_down, ""}} =
              ExecCommand.collect_control_status_for_test([{:down, :forced_down}], proofs)
 

@@ -71,17 +71,7 @@ defmodule SymphonyElixir.ImmutableEventStoreTest do
   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   """
 
-  @migrations [
-    {20_260_720_000_100, SymphonyElixir.Repo.Migrations.CreateSystemMetadata},
-    {20_260_720_000_200, SymphonyElixir.Repo.Migrations.CreateConfigurationRevisions},
-    {20_260_720_000_210, SymphonyElixir.Repo.Migrations.CreateConfigurationTaskPins},
-    {20_260_720_000_400, SymphonyElixir.Repo.Migrations.CreateSecrets},
-    {20_260_720_000_500, SymphonyElixir.Repo.Migrations.CreateIdentityBootstrap},
-    {20_260_720_000_600, SymphonyElixir.Repo.Migrations.CreateCoordinationLedger},
-    {20_260_720_000_700, SymphonyElixir.Repo.Migrations.CreateEffectsAndAudits},
-    {20_260_720_000_710, SymphonyElixir.Repo.Migrations.ProtectCoordinationEventInserts},
-    {20_260_720_000_720, SymphonyElixir.Repo.Migrations.ProtectAuditEventInserts}
-  ]
+  @migrations_path Path.expand("../../priv/repo/migrations", __DIR__)
 
   test "coordination events reject replacement and upsert conflicts without changing history" do
     event_id = uuid_binary()
@@ -365,7 +355,7 @@ defmodule SymphonyElixir.ImmutableEventStoreTest do
     previous_dynamic_repo = Repo.put_dynamic_repo(repo_pid)
 
     try do
-      Ecto.Migrator.run(Repo, @migrations, :up,
+      Ecto.Migrator.run(Repo, @migrations_path, :up,
         to: 20_260_720_000_700,
         dynamic_repo: repo_pid
       )
@@ -422,7 +412,11 @@ defmodule SymphonyElixir.ImmutableEventStoreTest do
                  ]
                )
 
-      Ecto.Migrator.run(Repo, @migrations, :up, all: true, dynamic_repo: repo_pid)
+      Ecto.Migrator.run(Repo, @migrations_path, :up,
+        to: 20_260_720_000_720,
+        dynamic_repo: repo_pid
+      )
+
       set_recursive_triggers!(0)
 
       assert {:ok, _result} =

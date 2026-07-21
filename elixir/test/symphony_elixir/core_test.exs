@@ -1,5 +1,8 @@
 defmodule SymphonyElixir.CoreTest do
-  use SymphonyElixir.TestSupport
+  use SymphonyElixir.TestSupport, async: false
+  use SymphonyElixir.RuntimeTestHarness, async: false
+
+  alias SymphonyElixir.RuntimeTestHarness
 
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
@@ -203,30 +206,10 @@ defmodule SymphonyElixir.CoreTest do
     assert {:error, :workflow_front_matter_not_a_map} = Workflow.load(workflow_path)
   end
 
-  test "SymphonyElixir.start_link starts the agent runtime" do
+  test "SymphonyElixir.start_link starts the agent runtime", %{runtime_harness: lease} do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
-    runtime_pid = Process.whereis(SymphonyElixir.AgentRuntimeSupervisor)
-
-    on_exit(fn ->
-      if is_nil(Process.whereis(SymphonyElixir.AgentRuntimeSupervisor)) do
-        case Supervisor.restart_child(
-               SymphonyElixir.Supervisor,
-               SymphonyElixir.AgentRuntimeSupervisor
-             ) do
-          {:ok, _pid} -> :ok
-          {:error, {:already_started, _pid}} -> :ok
-        end
-      end
-    end)
-
-    if is_pid(runtime_pid) do
-      assert :ok =
-               Supervisor.terminate_child(
-                 SymphonyElixir.Supervisor,
-                 SymphonyElixir.AgentRuntimeSupervisor
-               )
-    end
+    assert :ok = RuntimeTestHarness.stop_default_runtime!(lease)
 
     assert {:ok, pid} = SymphonyElixir.start_link()
     assert Process.whereis(SymphonyElixir.AgentRuntimeSupervisor) == pid
@@ -236,7 +219,7 @@ defmodule SymphonyElixir.CoreTest do
     GenServer.stop(pid)
   end
 
-  test "orchestrator fails startup when semantic preflight fails" do
+  test "orchestrator fails startup when semantic preflight fails", %{runtime_harness: lease} do
     issue_suffix = System.unique_integer([:positive])
     orchestrator_name = Module.concat(__MODULE__, "InvalidOrchestrator#{issue_suffix}")
     workflow_path = Workflow.workflow_file_path()
@@ -251,21 +234,9 @@ defmodule SymphonyElixir.CoreTest do
       if is_nil(Process.whereis(WorkflowStore)) do
         assert {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
       end
-
-      if is_nil(Process.whereis(SymphonyElixir.AgentRuntimeSupervisor)) do
-        assert {:ok, _pid} =
-                 Supervisor.restart_child(
-                   SymphonyElixir.Supervisor,
-                   SymphonyElixir.AgentRuntimeSupervisor
-                 )
-      end
     end)
 
-    assert :ok =
-             Supervisor.terminate_child(
-               SymphonyElixir.Supervisor,
-               SymphonyElixir.AgentRuntimeSupervisor
-             )
+    assert :ok = RuntimeTestHarness.stop_default_runtime!(lease)
 
     assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
 
@@ -338,7 +309,9 @@ defmodule SymphonyElixir.CoreTest do
     assert Process.alive?(runtime_pid)
   end
 
-  test "restarting the orchestrator does not overlap redispatched work" do
+  test "restarting the orchestrator does not overlap redispatched work", %{
+    runtime_harness: lease
+  } do
     issue_suffix = System.unique_integer([:positive])
 
     test_root =
@@ -373,17 +346,10 @@ defmodule SymphonyElixir.CoreTest do
 
       terminate_hook_processes(test_root)
       restore_app_env(:memory_tracker_issues, previous_memory_issues)
-      restart_default_runtime!()
       File.rm_rf(test_root)
     end)
 
-    if Process.whereis(SymphonyElixir.AgentRuntimeSupervisor) do
-      assert :ok =
-               Supervisor.terminate_child(
-                 SymphonyElixir.Supervisor,
-                 SymphonyElixir.AgentRuntimeSupervisor
-               )
-    end
+    assert :ok = RuntimeTestHarness.stop_default_runtime!(lease)
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
@@ -1155,24 +1121,6 @@ defmodule SymphonyElixir.CoreTest do
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
   defp restore_app_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
-
-  defp restart_default_runtime! do
-    if Process.whereis(SymphonyElixir.AgentRuntimeSupervisor) do
-      :ok =
-        Supervisor.terminate_child(
-          SymphonyElixir.Supervisor,
-          SymphonyElixir.AgentRuntimeSupervisor
-        )
-    end
-
-    case Supervisor.restart_child(
-           SymphonyElixir.Supervisor,
-           SymphonyElixir.AgentRuntimeSupervisor
-         ) do
-      {:ok, pid} -> pid
-      {:error, {:already_started, pid}} -> pid
-    end
-  end
 
   defp eventually_value(fun, attempts \\ 100)
 

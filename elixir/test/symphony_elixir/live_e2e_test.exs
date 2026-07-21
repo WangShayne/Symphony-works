@@ -1,7 +1,9 @@
 defmodule SymphonyElixir.LiveE2ETest do
-  use SymphonyElixir.TestSupport
+  use SymphonyElixir.TestSupport, async: false
+  use SymphonyElixir.RuntimeTestHarness, async: false
 
   require Logger
+  alias SymphonyElixir.RuntimeTestHarness
   alias SymphonyElixir.SSH
 
   @moduletag :live_e2e
@@ -120,13 +122,13 @@ defmodule SymphonyElixir.LiveE2ETest do
   """
 
   @tag skip: @live_e2e_skip_reason
-  test "creates a real Linear project and issue with a local worker" do
-    run_live_issue_flow!(:local)
+  test "creates a real Linear project and issue with a local worker", %{runtime_harness: lease} do
+    run_live_issue_flow!(:local, lease)
   end
 
   @tag skip: @live_e2e_skip_reason
-  test "creates a real Linear project and issue with an ssh worker" do
-    run_live_issue_flow!(:ssh)
+  test "creates a real Linear project and issue with an ssh worker", %{runtime_harness: lease} do
+    run_live_issue_flow!(:ssh, lease)
   end
 
   defp fetch_team!(team_key) do
@@ -434,7 +436,7 @@ defmodule SymphonyElixir.LiveE2ETest do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
   end
 
-  defp run_live_issue_flow!(backend) when backend in [:local, :ssh] do
+  defp run_live_issue_flow!(backend, runtime_harness) when backend in [:local, :ssh] do
     run_id = "symphony-live-e2e-#{backend}-#{System.unique_integer([:positive])}"
     test_root = Path.join(System.tmp_dir!(), run_id)
     workflow_root = Path.join(test_root, "workflow")
@@ -442,18 +444,11 @@ defmodule SymphonyElixir.LiveE2ETest do
     worker_setup = live_worker_setup!(backend, run_id, test_root)
     team_key = System.get_env("SYMPHONY_LIVE_LINEAR_TEAM_KEY") || @default_team_key
     original_workflow_path = Workflow.workflow_file_path()
-    runtime_pid = Process.whereis(SymphonyElixir.AgentRuntimeSupervisor)
 
     File.mkdir_p!(workflow_root)
 
     try do
-      if is_pid(runtime_pid) do
-        assert :ok =
-                 Supervisor.terminate_child(
-                   SymphonyElixir.Supervisor,
-                   SymphonyElixir.AgentRuntimeSupervisor
-                 )
-      end
+      assert :ok = RuntimeTestHarness.stop_default_runtime!(runtime_harness)
 
       Workflow.set_workflow_file_path(workflow_file)
 
@@ -518,7 +513,7 @@ defmodule SymphonyElixir.LiveE2ETest do
         assert :ok = complete_project(project["id"], completed_project_status["id"])
       end
     after
-      restart_agent_runtime_if_needed()
+      RuntimeTestHarness.restart_default_runtime!(runtime_harness)
       cleanup_live_worker_setup(worker_setup)
       Workflow.set_workflow_file_path(original_workflow_path)
       File.rm_rf(test_root)
@@ -573,18 +568,6 @@ defmodule SymphonyElixir.LiveE2ETest do
   end
 
   defp cleanup_live_worker_setup(_worker_setup), do: :ok
-
-  defp restart_agent_runtime_if_needed do
-    if is_nil(Process.whereis(SymphonyElixir.AgentRuntimeSupervisor)) do
-      case Supervisor.restart_child(
-             SymphonyElixir.Supervisor,
-             SymphonyElixir.AgentRuntimeSupervisor
-           ) do
-        {:ok, _pid} -> :ok
-        {:error, {:already_started, _pid}} -> :ok
-      end
-    end
-  end
 
   defp live_ssh_worker_setup!(run_id) when is_binary(run_id) do
     ssh_worker_hosts = live_ssh_worker_hosts()

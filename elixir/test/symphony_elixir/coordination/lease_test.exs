@@ -30,10 +30,10 @@ defmodule SymphonyElixir.Coordination.LeaseTest do
   end
 
   test "heartbeat extends ownership past the original expiry" do
-    assert {:ok, lease} = Coordination.acquire_lease("holder-a", ttl_ms: 200)
-    Process.sleep(120)
+    assert {:ok, lease} = Coordination.acquire_lease("holder-a", ttl_ms: 2_000)
+    Process.sleep(1_000)
     assert :ok = Coordination.heartbeat(lease)
-    Process.sleep(120)
+    Process.sleep(1_050)
 
     assert {:error, {:owned_by, "holder-a"}} =
              Coordination.acquire_lease("holder-b", ttl_ms: 5_000)

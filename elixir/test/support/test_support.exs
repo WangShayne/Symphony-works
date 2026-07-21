@@ -1,9 +1,9 @@
 defmodule SymphonyElixir.TestSupport do
   @workflow_prompt "You are an agent for this repository."
 
-  defmacro __using__(_opts) do
+  defmacro __using__(opts) do
     quote do
-      use ExUnit.Case
+      use ExUnit.Case, unquote(opts)
       import ExUnit.CaptureLog
 
       alias SymphonyElixir.AgentRunner

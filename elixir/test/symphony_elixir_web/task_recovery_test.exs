@@ -1,12 +1,13 @@
 defmodule SymphonyElixirWeb.TaskRecoveryTest do
   use ExUnit.Case, async: false
+  use SymphonyElixir.RuntimeTestHarness, async: false
 
   import Phoenix.ConnTest
   import Phoenix.LiveViewTest
   import Plug.Conn
 
   alias Ecto.Adapters.SQL.Sandbox
-  alias SymphonyElixir.{Configuration, Coordination, Identity, Repo}
+  alias SymphonyElixir.{Configuration, Coordination, Identity, Repo, RuntimeTestHarness}
   alias SymphonyElixir.Configuration.{Document, Revision, TaskPin}
   alias SymphonyElixir.Coordination.{Lease, TaskProjection, UnitProjection}
   alias SymphonyElixir.Effects.Record, as: EffectRecord
@@ -14,16 +15,16 @@ defmodule SymphonyElixirWeb.TaskRecoveryTest do
 
   @endpoint SymphonyElixirWeb.Endpoint
 
-  setup do
+  setup %{runtime_harness: runtime_harness} do
     unless Process.whereis(SymphonyElixirWeb.Endpoint) do
       start_supervised!(SymphonyElixirWeb.Endpoint)
     end
 
     Sandbox.mode(Repo, :auto)
-    stop_agent_runtime!()
+    RuntimeTestHarness.stop_default_runtime!(runtime_harness)
     assert_runtime_lease_released!()
     clean_persistence!()
-    restart_agent_runtime!()
+    RuntimeTestHarness.restart_default_runtime!(runtime_harness)
 
     on_exit(fn ->
       unless Process.whereis(Repo) do
@@ -32,10 +33,10 @@ defmodule SymphonyElixirWeb.TaskRecoveryTest do
 
       if Process.whereis(Repo) do
         Sandbox.mode(Repo, :auto)
-        stop_agent_runtime!()
+        RuntimeTestHarness.stop_default_runtime!(runtime_harness)
         assert_runtime_lease_released!()
         clean_persistence!()
-        restart_agent_runtime!()
+        RuntimeTestHarness.restart_default_runtime!(runtime_harness)
         Sandbox.mode(Repo, :manual)
       end
     end)
@@ -121,26 +122,10 @@ defmodule SymphonyElixirWeb.TaskRecoveryTest do
     Repo.delete_all(PrincipalRecord)
   end
 
-  defp stop_agent_runtime! do
-    assert :ok =
-             Supervisor.terminate_child(
-               SymphonyElixir.Supervisor,
-               SymphonyElixir.AgentRuntimeSupervisor
-             )
-  end
-
   defp assert_runtime_lease_released! do
     owner_id = "task-recovery-cleanup-#{System.unique_integer([:positive])}"
     assert {:ok, lease} = Coordination.acquire_lease(owner_id, ttl_ms: 30_000)
     assert :ok = Coordination.release_lease(lease)
-  end
-
-  defp restart_agent_runtime! do
-    assert {:ok, _runtime} =
-             Supervisor.restart_child(
-               SymphonyElixir.Supervisor,
-               SymphonyElixir.AgentRuntimeSupervisor
-             )
   end
 
   defp task_payload do

@@ -1,5 +1,8 @@
 defmodule SymphonyElixir.OrchestratorStatusTest do
-  use SymphonyElixir.TestSupport
+  use SymphonyElixir.TestSupport, async: false
+  use SymphonyElixir.RuntimeTestHarness, async: false
+
+  alias SymphonyElixir.RuntimeTestHarness
 
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
@@ -1333,30 +1336,12 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert rendered |> String.split("\n") |> List.last() == "╰─"
   end
 
-  test "status dashboard coalesces rapid updates to one render per interval" do
+  test "status dashboard coalesces rapid updates to one render per interval", %{
+    runtime_harness: lease
+  } do
     dashboard_name = Module.concat(__MODULE__, :RenderDashboard)
     parent = self()
-    runtime_pid = Process.whereis(SymphonyElixir.AgentRuntimeSupervisor)
-
-    on_exit(fn ->
-      if is_nil(Process.whereis(SymphonyElixir.AgentRuntimeSupervisor)) do
-        case Supervisor.restart_child(
-               SymphonyElixir.Supervisor,
-               SymphonyElixir.AgentRuntimeSupervisor
-             ) do
-          {:ok, _pid} -> :ok
-          {:error, {:already_started, _pid}} -> :ok
-        end
-      end
-    end)
-
-    if is_pid(runtime_pid) do
-      assert :ok =
-               Supervisor.terminate_child(
-                 SymphonyElixir.Supervisor,
-                 SymphonyElixir.AgentRuntimeSupervisor
-               )
-    end
+    assert :ok = RuntimeTestHarness.stop_default_runtime!(lease)
 
     {:ok, pid} =
       StatusDashboard.start_link(

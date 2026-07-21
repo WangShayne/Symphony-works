@@ -38,7 +38,7 @@ defmodule SymphonyElixir.Coordination.Projector do
         |> Map.put(:stream_version, event.stream_version)
         |> Map.put(:status, status)
         |> Map.put(:updated_at, event.occurred_at)
-        |> maybe_put(:plan_revision, event.plan_revision)
+        |> maybe_put_plan_revision(event)
         |> merge_task_data(event)
         |> project_task_effect(event)
 
@@ -62,6 +62,31 @@ defmodule SymphonyElixir.Coordination.Projector do
   @spec replay([map()]) ::
           {:ok, {map(), %{optional(String.t()) => map()}}} | {:error, term()}
   def replay(events) do
+    with :ok <- validate_replay_events(events) do
+      replay_events(events)
+    end
+  end
+
+  defp validate_replay_events(events) do
+    Enum.reduce_while(events, 1, fn event, expected_version ->
+      cond do
+        event.event_version != 1 ->
+          {:halt, {:error, :unsupported_event_version}}
+
+        event.stream_version != expected_version ->
+          {:halt, {:error, {:non_contiguous_stream_version, expected_version, event.stream_version}}}
+
+        true ->
+          {:cont, expected_version + 1}
+      end
+    end)
+    |> case do
+      next_version when is_integer(next_version) -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp replay_events(events) do
     Enum.reduce_while(events, {:ok, {nil, %{}}}, fn event, {:ok, {task, units}} ->
       unit_id = event.data && event.data["unit_id"]
       current_unit = if is_binary(unit_id), do: Map.get(units, unit_id)
@@ -90,10 +115,8 @@ defmodule SymphonyElixir.Coordination.Projector do
             |> Map.put(:stream_version, event.stream_version)
             |> Map.put(:status, status)
             |> Map.put(:updated_at, event.occurred_at)
-            |> Map.update!(:data, &Map.merge(&1 || %{}, data))
-            |> maybe_put(:task_type, data["task_type"])
-            |> maybe_put(:execution_profile, data["execution_profile"])
-            |> maybe_put_dependencies(data)
+            |> Map.update!(:data, &Map.merge(&1 || %{}, projectable_unit_data(event.event_type, data)))
+            |> maybe_put_unit_authority(event.event_type, data)
 
           {:ok, projected}
         end
@@ -146,6 +169,42 @@ defmodule SymphonyElixir.Coordination.Projector do
   end
 
   defp maybe_put_dependencies(unit, _data), do: unit
+
+  defp maybe_put_plan_revision(task, %{event_type: "planning_started"} = event) do
+    maybe_put(task, :plan_revision, event.plan_revision)
+  end
+
+  defp maybe_put_plan_revision(task, _event), do: task
+
+  defp maybe_put_unit_authority(unit, "unit_planned", data) do
+    unit
+    |> maybe_put(:task_type, data["task_type"])
+    |> maybe_put(:execution_profile, data["execution_profile"] || data["execution_profile_id"])
+    |> maybe_put_dependencies(data)
+  end
+
+  defp maybe_put_unit_authority(unit, _event_type, _data), do: unit
+
+  defp projectable_unit_data("unit_planned", data) do
+    Map.drop(data, ["task_type", "execution_profile", "execution_profile_id", "dependencies"])
+  end
+
+  defp projectable_unit_data(_event_type, data) do
+    Map.take(data, [
+      "unit_id",
+      "percent",
+      "message",
+      "summary",
+      "worker_id",
+      "blocked_reason",
+      "approval_request_id",
+      "artifact",
+      "artifacts",
+      "error",
+      "metadata",
+      "metrics"
+    ])
+  end
 
   defp put_effect(task, event, status) do
     operation_id = event.data["operation_id"] || get_in(task, [:effect, "operation_id"])

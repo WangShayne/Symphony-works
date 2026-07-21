@@ -92,7 +92,86 @@ defmodule SymphonyElixir.Coordination.SecurityBoundaryTest do
     refute inspect(rows) =~ plaintext
   end
 
-  defp start_task(suffix, extra) do
+  test "unit progress cannot overwrite planned task or unit authority fields" do
+    {:ok, task} =
+      start_task("unit-progress-authority",
+        plan_revision: "plan-1",
+        task_type: "restricted-task",
+        execution_profile: "restricted-profile",
+        model_reference: "restricted-model"
+      )
+
+    assert {:ok, 2} =
+             Coordination.append(task.id, 1, [
+               %{
+                 type: :unit_planned,
+                 data: %{
+                   unit_id: "backend-1",
+                   task_type: "backend",
+                   execution_profile: "restricted-profile",
+                   dependencies: ["frontend-1"],
+                   model_reference_id: "model-restricted"
+                 }
+               }
+             ])
+
+    assert {:ok, 3} =
+             Coordination.append(task.id, 2, [
+               %{
+                 type: :unit_progress,
+                 plan_revision: "999",
+                 data: %{
+                   unit_id: "backend-1",
+                   percent: 50,
+                   task_type: "admin",
+                   execution_profile: "admin-profile",
+                   dependencies: [],
+                   model_reference_id: "model-admin"
+                 }
+               }
+             ])
+
+    assert {:ok, live_snapshot} = Coordination.snapshot(task.id)
+    assert_authority_unchanged(live_snapshot)
+    assert get_in(live_snapshot.units, [Access.at(0), :data, "percent"]) == 50
+    assert_progress_event_sanitized(task.id)
+
+    assert :ok = Coordination.rebuild_projection(task.id)
+    assert {:ok, rebuilt_snapshot} = Coordination.snapshot(task.id)
+    assert_authority_unchanged(rebuilt_snapshot)
+    assert get_in(rebuilt_snapshot.units, [Access.at(0), :data, "percent"]) == 50
+  end
+
+  test "non-planning unit events reject authority fields" do
+    {:ok, task} = start_task("unit-event-authority")
+
+    assert {:ok, 2} =
+             Coordination.append(task.id, 1, [
+               %{
+                 type: :unit_planned,
+                 data: %{
+                   unit_id: "backend-1",
+                   task_type: "backend",
+                   execution_profile: "restricted-profile",
+                   dependencies: []
+                 }
+               }
+             ])
+
+    for event_type <- [:unit_runnable, :unit_failed, :unit_cancelled] do
+      assert {:error, {:forbidden_event_fields, ^event_type, ["data", "task_type"]}} =
+               Coordination.append(task.id, 2, [
+                 %{
+                   type: event_type,
+                   data: %{unit_id: "backend-1", task_type: "admin"}
+                 }
+               ])
+    end
+
+    assert {:ok, %{version: 2, units: [%{task_type: "backend"}]}} = Coordination.snapshot(task.id)
+  end
+
+  defp start_task(suffix, extra \\ %{}) do
     suffix
     |> task_attrs()
     |> Map.merge(Map.new(extra))
@@ -106,5 +185,35 @@ defmodule SymphonyElixir.Coordination.SecurityBoundaryTest do
       config_revision_id: Ecto.UUID.generate(),
       baseline: "0123456789abcdef"
     }
+  end
+
+  defp assert_authority_unchanged(snapshot) do
+    assert snapshot.plan_revision == "plan-1"
+
+    assert [
+             %{
+               task_type: "backend",
+               execution_profile: "restricted-profile",
+               dependencies: ["frontend-1"],
+               data: data
+             }
+           ] = snapshot.units
+
+    assert data["model_reference_id"] == "model-restricted"
+    refute Map.has_key?(data, "task_type")
+    refute Map.has_key?(data, "execution_profile")
+    refute Map.has_key?(data, "dependencies")
+  end
+
+  defp assert_progress_event_sanitized(task_id) do
+    assert {:ok, %{rows: [[plan_revision, data]]}} =
+             SQL.query(
+               Repo,
+               "SELECT plan_revision, data FROM coordination_events WHERE task_id = ? AND stream_version = 3",
+               [task_id]
+             )
+
+    assert plan_revision == "plan-1"
+    assert Jason.decode!(data) == %{"percent" => 50, "unit_id" => "backend-1"}
   end
 end

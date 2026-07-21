@@ -33,7 +33,11 @@ defmodule SymphonyElixirWeb.TaskLive do
   end
 
   @impl true
-  def handle_info({:coordination_updated, %{id: id} = task}, %{assigns: %{task: %{id: id}}} = socket) do
+  def handle_info(
+        {:coordination_updated, %{id: id, version: version} = task},
+        %{assigns: %{task: %{id: id, version: current_version}}} = socket
+      )
+      when version > current_version do
     {:noreply, assign(socket, task: task)}
   end
 

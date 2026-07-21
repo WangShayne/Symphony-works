@@ -46,24 +46,32 @@ defmodule SymphonyElixirWeb.TaskLiveTest do
     {:ok, snapshot} = Coordination.snapshot(task_id)
     [unit] = snapshot.units
 
-    for {status, label} <- english_task_statuses() do
+    for {{status, label}, index} <- Enum.with_index(english_task_statuses()) do
       send(
         detail.pid,
-        {:coordination_updated, %{snapshot | status: status}}
+        {:coordination_updated, %{snapshot | status: status, version: snapshot.version + index + 1}}
       )
 
       assert render(detail) =~ label
     end
 
-    for {status, label} <- english_unit_statuses() do
-      send(detail.pid, {:coordination_updated, %{snapshot | units: [%{unit | status: status}]}})
+    english_unit_base = snapshot.version + length(english_task_statuses())
+
+    for {{status, label}, index} <- Enum.with_index(english_unit_statuses()) do
+      send(
+        detail.pid,
+        {:coordination_updated, %{snapshot | version: english_unit_base + index + 1, units: [%{unit | status: status}]}}
+      )
+
       assert render(detail) =~ label
     end
 
     send(detail.pid, {:coordination_updated, %{snapshot | id: Ecto.UUID.generate()}})
     assert render(detail) =~ "GH-9"
 
-    for {effect_status, label} <- english_effects() do
+    english_effect_base = english_unit_base + length(english_unit_statuses())
+
+    for {{effect_status, label}, index} <- Enum.with_index(english_effects()) do
       effect =
         if effect_status,
           do: %{operation_id: Ecto.UUID.generate(), status: effect_status},
@@ -74,7 +82,8 @@ defmodule SymphonyElixirWeb.TaskLiveTest do
         {:coordination_updated,
          %{
            snapshot
-           | effect: effect,
+           | version: english_effect_base + index + 1,
+             effect: effect,
              effect_status: effect_status,
              configuration_revision: "short-ref",
              baseline: nil
@@ -92,21 +101,29 @@ defmodule SymphonyElixirWeb.TaskLiveTest do
     assert zh_html =~ "外部操作已记录"
     assert zh_html =~ "执行单元"
 
-    for {status, label} <- chinese_task_statuses() do
+    for {{status, label}, index} <- Enum.with_index(chinese_task_statuses()) do
       send(
         zh_detail.pid,
-        {:coordination_updated, %{snapshot | status: status}}
+        {:coordination_updated, %{snapshot | status: status, version: snapshot.version + index + 1}}
       )
 
       assert render(zh_detail) =~ label
     end
 
-    for {status, label} <- chinese_unit_statuses() do
-      send(zh_detail.pid, {:coordination_updated, %{snapshot | units: [%{unit | status: status}]}})
+    chinese_unit_base = snapshot.version + length(chinese_task_statuses())
+
+    for {{status, label}, index} <- Enum.with_index(chinese_unit_statuses()) do
+      send(
+        zh_detail.pid,
+        {:coordination_updated, %{snapshot | version: chinese_unit_base + index + 1, units: [%{unit | status: status}]}}
+      )
+
       assert render(zh_detail) =~ label
     end
 
-    for {effect_status, label} <- chinese_effects() do
+    chinese_effect_base = chinese_unit_base + length(chinese_unit_statuses())
+
+    for {{effect_status, label}, index} <- Enum.with_index(chinese_effects()) do
       effect =
         if effect_status,
           do: %{operation_id: Ecto.UUID.generate(), status: effect_status},
@@ -114,7 +131,13 @@ defmodule SymphonyElixirWeb.TaskLiveTest do
 
       send(
         zh_detail.pid,
-        {:coordination_updated, %{snapshot | effect: effect, effect_status: effect_status}}
+        {:coordination_updated,
+         %{
+           snapshot
+           | version: chinese_effect_base + index + 1,
+             effect: effect,
+             effect_status: effect_status
+         }}
       )
 
       assert render(zh_detail) =~ label
@@ -130,6 +153,42 @@ defmodule SymphonyElixirWeb.TaskLiveTest do
 
     assert {:error, {:redirect, %{to: "/tasks"}}} =
              live(browser_conn(conn, operator), "/tasks/#{Ecto.UUID.generate()}")
+  end
+
+  test "task LiveView ignores stale coordination snapshots", %{
+    conn: conn,
+    operator: operator,
+    task_id: task_id
+  } do
+    assert {:ok, detail, _html} = live(browser_conn(conn, operator), "/tasks/#{task_id}")
+    {:ok, snapshot} = Coordination.snapshot(task_id)
+    [unit] = snapshot.units
+
+    newer_version = snapshot.version + 1
+
+    version_three = %{
+      snapshot
+      | version: newer_version,
+        status: :running,
+        units: [%{unit | version: newer_version, status: :running}]
+    }
+
+    stale_cross_mixed = %{
+      snapshot
+      | version: snapshot.version,
+        status: :planning,
+        units: [%{unit | version: newer_version, status: :running}]
+    }
+
+    send(detail.pid, {:coordination_updated, version_three})
+    assert render(detail) =~ "Running"
+    assert render(detail) =~ ~r/<dd class="numeric">\s*#{newer_version}\s*<\/dd>/
+
+    send(detail.pid, {:coordination_updated, stale_cross_mixed})
+    html = render(detail)
+    assert html =~ "Running"
+    assert html =~ ~r/<dd class="numeric">\s*#{newer_version}\s*<\/dd>/
+    refute html =~ "Planning"
   end
 
   test "empty task lists and role labels remain bilingual", %{conn: conn} do

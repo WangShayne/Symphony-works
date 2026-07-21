@@ -31,6 +31,40 @@ defmodule SymphonyElixir.Coordination do
     "unknown" => :unknown,
     "recovery_needed" => :recovery_needed
   }
+  @supported_event_version 1
+  @derived_event_fields MapSet.new([
+                          "id",
+                          "task_id",
+                          "stream_version",
+                          "event_type",
+                          "event_version",
+                          "actor_kind",
+                          "actor_id",
+                          "occurred_at",
+                          "inserted_at"
+                        ])
+  @unit_authority_fields MapSet.new([
+                           "task_type",
+                           "execution_profile",
+                           "execution_profile_id",
+                           "dependencies",
+                           "model_reference",
+                           "model_reference_id"
+                         ])
+  @unit_mutable_fields MapSet.new([
+                         "unit_id",
+                         "percent",
+                         "message",
+                         "summary",
+                         "worker_id",
+                         "blocked_reason",
+                         "approval_request_id",
+                         "artifact",
+                         "artifacts",
+                         "error",
+                         "metadata",
+                         "metrics"
+                       ])
   @max_list_limit 101
 
   @type snapshot :: %{
@@ -92,9 +126,9 @@ defmodule SymphonyElixir.Coordination do
     with {:ok, task_id} <- canonical_task_id(task_id),
          %TaskProjection{} = projection <- EventStore.task(task_id),
          {:ok, event_attrs} <- normalize_events(events, projection, expected_version),
-         {:ok, {new_version, stored}} <-
+         {:ok, {new_version, stored, units}} <-
            EventStore.append(task_id, expected_version, event_attrs) do
-      broadcast(task_id, public_snapshot(stored))
+      broadcast(task_id, public_snapshot(stored, units))
       {:ok, new_version}
     else
       {:error, :invalid_task_id} -> {:error, :not_found}
@@ -208,6 +242,7 @@ defmodule SymphonyElixir.Coordination do
       with {:ok, event} <- normalize_map(event),
            {:ok, type} <- required_string(event, "type"),
            data when is_map(data) <- Map.get(event, "data", %{}),
+           {:ok, data} <- validate_event_fields(type, event, data),
            :ok <- reject_sensitive_event(event),
            {:ok, event_version} <- event_version(event),
            {:ok, actor} <- event_actor(event) do
@@ -218,10 +253,8 @@ defmodule SymphonyElixir.Coordination do
           event_version: event_version,
           actor_kind: actor["kind"],
           actor_id: actor["id"],
-          plan_revision: Map.get(event, "plan_revision") || projection.plan_revision,
-          configuration_revision:
-            Map.get(event, "configuration_revision") ||
-              Map.get(event, "config_revision_id") || projection.configuration_revision,
+          plan_revision: event_plan_revision(type, event, projection),
+          configuration_revision: event_configuration_revision(type, event, projection),
           correlation_id: Map.get(event, "correlation_id") || projection.correlation_id,
           data: data,
           occurred_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
@@ -241,10 +274,72 @@ defmodule SymphonyElixir.Coordination do
 
   defp event_version(event) do
     case Map.get(event, "version", 1) do
-      version when is_integer(version) and version > 0 -> {:ok, version}
+      @supported_event_version -> {:ok, @supported_event_version}
+      version when is_integer(version) and version > 0 -> {:error, :unsupported_event_version}
       _ -> {:error, :invalid_event_version}
     end
   end
+
+  defp event_plan_revision("planning_started", event, projection) do
+    Map.get(event, "plan_revision") || projection.plan_revision
+  end
+
+  defp event_plan_revision(_type, _event, projection), do: projection.plan_revision
+
+  defp event_configuration_revision("planning_started", event, projection) do
+    Map.get(event, "configuration_revision") ||
+      Map.get(event, "config_revision_id") ||
+      projection.configuration_revision
+  end
+
+  defp event_configuration_revision(_type, _event, projection), do: projection.configuration_revision
+
+  defp validate_event_fields(type, event, data) do
+    case reject_derived_event_fields(type, event) do
+      :ok -> validate_unit_data_fields(type, data)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp reject_derived_event_fields(type, event) do
+    event
+    |> Map.keys()
+    |> Enum.find(&MapSet.member?(@derived_event_fields, &1))
+    |> case do
+      nil -> :ok
+      field -> {:error, {:forbidden_event_fields, event_identifier(type), [field]}}
+    end
+  end
+
+  defp validate_unit_data_fields("unit_planned", data) do
+    case Map.get(data, "dependencies", []) do
+      dependencies when is_list(dependencies) -> {:ok, data}
+      _invalid -> {:error, :invalid_event_data}
+    end
+  end
+
+  defp validate_unit_data_fields("unit_progress", data) do
+    {:ok, Map.take(data, MapSet.to_list(@unit_mutable_fields))}
+  end
+
+  defp validate_unit_data_fields("unit_" <> _rest = type, data) do
+    data
+    |> Map.keys()
+    |> Enum.find(&(not MapSet.member?(@unit_mutable_fields, &1)))
+    |> case do
+      nil ->
+        {:ok, data}
+
+      field ->
+        if MapSet.member?(@unit_authority_fields, field) do
+          {:error, {:forbidden_event_fields, event_identifier(type), ["data", field]}}
+        else
+          {:error, {:unexpected_event_fields, event_identifier(type), ["data", field]}}
+        end
+    end
+  end
+
+  defp validate_unit_data_fields(_type, data), do: {:ok, data}
 
   defp event_actor(event) do
     case Map.get(event, "actor", %{"kind" => "system", "id" => "coordination"}) do
@@ -320,9 +415,13 @@ defmodule SymphonyElixir.Coordination do
   end
 
   defp public_snapshot(projection) do
+    public_snapshot(projection, EventStore.units(projection.task_id))
+  end
+
+  defp public_snapshot(projection, units) do
     projection
     |> public_task()
-    |> Map.put(:units, projection.task_id |> EventStore.units() |> Enum.map(&public_unit/1))
+    |> Map.put(:units, Enum.map(units, &public_unit/1))
   end
 
   defp public_summary(projection, unit_count) do
@@ -389,6 +488,12 @@ defmodule SymphonyElixir.Coordination do
 
   defp maybe_existing_atom(nil), do: nil
   defp maybe_existing_atom(value), do: Map.fetch!(@effect_statuses, value)
+
+  defp event_identifier(value) when is_binary(value) do
+    String.to_existing_atom(value)
+  rescue
+    ArgumentError -> value
+  end
 
   defp required_string(attrs, key) do
     case Map.get(attrs, key) do

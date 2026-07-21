@@ -84,6 +84,18 @@ defmodule SymphonyElixir.Coordination.ValidationTest do
                %{type: :planning_started, version: 0, data: %{}}
              ])
 
+    assert {:error, :unsupported_event_version} =
+             Coordination.append(task.id, 1, [
+               %{type: :planning_started, version: 2, data: %{}}
+             ])
+
+    for stream_version <- [1, 2] do
+      assert {:error, {:forbidden_event_fields, :planning_started, ["stream_version"]}} =
+               Coordination.append(task.id, 1, [
+                 %{type: :planning_started, stream_version: stream_version, data: %{}}
+               ])
+    end
+
     assert {:error, :invalid_actor} =
              Coordination.append(task.id, 1, [
                %{type: :planning_started, actor: %{kind: :model}, data: %{}}

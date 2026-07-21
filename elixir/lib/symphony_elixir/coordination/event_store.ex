@@ -88,7 +88,7 @@ defmodule SymphonyElixir.Coordination.EventStore do
   end
 
   @spec append(Ecto.UUID.t(), non_neg_integer(), [map()]) ::
-          {:ok, {non_neg_integer(), TaskProjection.t()}} | {:error, term()}
+          {:ok, {non_neg_integer(), TaskProjection.t(), [map()]}} | {:error, term()}
   def append(task_id, expected_version, events) do
     Repo.transaction(
       fn ->
@@ -152,7 +152,7 @@ defmodule SymphonyElixir.Coordination.EventStore do
 
         stored = update_projection(projection, expected_version, task_state)
         persist_units(units)
-        {stored.stream_version, stored}
+        {stored.stream_version, stored, Map.values(units)}
 
       {:error, reason} ->
         Repo.rollback(reason)

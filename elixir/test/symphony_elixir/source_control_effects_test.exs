@@ -840,6 +840,7 @@ defmodule SymphonyElixir.SourceControlEffectsTest do
     invalid_with_reference =
       github_attrs
       |> Map.put(:operation_id, OperationId.generate())
+      |> Map.put(:task_id, "#{github_attrs.task_id}-invalid-configuration")
       |> put_in(
         [:intent, "attrs", "repo", "credential_ref"],
         reference_id

@@ -118,6 +118,64 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
     assert [] = ScriptTransport.requests(transport)
   end
 
+  test "public operation seams propagate missing operation identity without transport dispatch" do
+    {:ok, transport} = ScriptTransport.start_link([])
+    config = config(transport)
+
+    assert {:error, _reason} =
+             SourceControl.ensure_remote_branch(config, %{name: "topic", commit_sha: @sha}, [])
+
+    assert {:error, _reason} =
+             SourceControl.push_branch(
+               config,
+               "topic",
+               @desired_sha,
+               expected_remote_sha: @sha
+             )
+
+    assert {:error, _reason} =
+             SourceControl.ensure_change_request(change_request_attrs(config), [])
+
+    assert {:error, _reason} =
+             SourceControl.set_draft(config, change_request(), draft: false)
+
+    assert {:error, _reason} =
+             SourceControl.close_or_comment(config, change_request(), action: :close)
+
+    assert [] = ScriptTransport.requests(transport)
+
+    invalid_repository_config = put_in(config, [:settings, :repository], nil)
+
+    assert {:error, :invalid_configuration} =
+             SourceControl.ensure_remote_branch(
+               invalid_repository_config,
+               %{name: "topic", commit_sha: @sha},
+               operation_opts()
+             )
+
+    assert {:error, :invalid_configuration} =
+             SourceControl.push_branch(
+               invalid_repository_config,
+               "topic",
+               @desired_sha,
+               Keyword.put(operation_opts(), :expected_remote_sha, @sha)
+             )
+
+    assert {:error, :invalid_configuration} =
+             SourceControl.set_draft(
+               invalid_repository_config,
+               change_request(),
+               Keyword.put(operation_opts(), :draft, false)
+             )
+
+    assert {:error, :invalid_configuration} =
+             SourceControl.close_or_comment(
+               invalid_repository_config,
+               change_request(),
+               Keyword.put(operation_opts(), :action, :close)
+             )
+  end
+
   test "health and baseline reject malformed successful responses" do
     {:ok, health_transport} =
       ScriptTransport.start_link([
@@ -136,6 +194,21 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
 
     assert {:error, :invalid_configuration} =
              SourceControl.resolve_baseline(config(baseline_transport), "main")
+
+    {:ok, failed_baseline} =
+      ScriptTransport.start_link([
+        {:get, "/projects/acme%2Fwidget/repository/branches/main", {:error, :timeout}}
+      ])
+
+    assert {:error, :transport_failure} =
+             SourceControl.resolve_baseline(config(failed_baseline), "main")
+
+    {:ok, failed_health} =
+      ScriptTransport.start_link([
+        {:get, "/projects/acme%2Fwidget", {:error, :timeout}}
+      ])
+
+    assert {:error, :transport_failure} = SourceControl.health_check(config(failed_health))
   end
 
   test "health verifies GitLab credential actor against the configured bot actor" do
@@ -244,6 +317,19 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
     assert {:ok, %{disposition: :reconciled}} =
              SourceControl.ensure_remote_branch(
                config(timeout_then_found),
+               branch_input,
+               operation_opts()
+             )
+
+    {:ok, created} =
+      ScriptTransport.start_link([
+        get(path, 404, %{}),
+        post(create_path, 201, branch(@sha))
+      ])
+
+    assert {:ok, %{disposition: :created, commit_sha: @sha}} =
+             SourceControl.ensure_remote_branch(
+               config(created),
                branch_input,
                operation_opts()
              )
@@ -361,6 +447,33 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
     assert create.retry == :never
     assert create.json["description"] == "Coverage body"
     refute create.json["description"] =~ "<!-- symphony:"
+  end
+
+  test "merge request precheck ignores valid unrelated identities before creating" do
+    path = "/projects/acme%2Fwidget/merge_requests"
+
+    unrelated =
+      merge_request(%{
+        "source_branch" => "other-topic",
+        "target_branch" => "main",
+        "source_project_id" => 101,
+        "target_project_id" => 101
+      })
+
+    {:ok, transport} =
+      ScriptTransport.start_link([
+        canonical_project(),
+        get(path, 200, [unrelated]),
+        post(path, 201, merge_request())
+      ])
+
+    assert {:ok, %{disposition: :created}} =
+             SourceControl.ensure_change_request(
+               change_request_attrs(config(transport)),
+               operation_opts()
+             )
+
+    assert Enum.count(ScriptTransport.requests(transport), &(&1.method == :post)) == 1
   end
 
   test "merge request identity precheck follows all-state pagination before reporting conflict" do
@@ -499,7 +612,7 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
   test "merge request creation rejects config project mismatch before listing or posting" do
     path = "/projects/acme%2Fwidget/merge_requests"
 
-    for configured <- [0, "0", "abc", 202, "202"] do
+    for configured <- [0, "0", "abc", 202, "202", [], %{}] do
       {:ok, transport} =
         ScriptTransport.start_link([
           canonical_project()
@@ -518,6 +631,19 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
 
       refute Enum.any?(ScriptTransport.requests(transport), &(&1.path == path))
     end
+
+    {:ok, malformed_project} =
+      ScriptTransport.start_link([
+        get("/projects/acme%2Fwidget", 200, [])
+      ])
+
+    assert {:error, :provider_failure} =
+             SourceControl.ensure_change_request(
+               change_request_attrs(config(malformed_project)),
+               operation_opts()
+             )
+
+    refute Enum.any?(ScriptTransport.requests(malformed_project), &(&1.path == path))
   end
 
   test "merge request listing fails closed on malformed, rejected, and excessive pagination" do
@@ -577,6 +703,7 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
     cases = [
       {[], %{}, :pending, :pending},
       {[%{"sha" => @sha, "status" => "success"}], %{}, :passed, :passed},
+      {[%{"sha" => @sha, "status" => "running", "web_url" => "https://ci.test/pipeline"}], %{}, :pending, :pending},
       {[%{"sha" => @sha, "status" => "skipped"}], %{"allow_merge_on_skipped_pipeline" => true}, :passed, :passed},
       {[%{"sha" => @sha, "status" => "failed"}], %{}, :failed, :failed},
       {[%{"sha" => @sha, "status" => "unexpected"}], %{}, :unknown, :pending}
@@ -642,6 +769,20 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
 
     assert {:ok, %{checks_status: :passed}} =
              SourceControl.state(config(passed_transport), change_request())
+
+    {:ok, rejected_external_checks} =
+      ScriptTransport.start_link(
+        state_responses(
+          %{},
+          %{"only_allow_merge_if_all_status_checks_passed" => true},
+          [],
+          418,
+          %{}
+        )
+      )
+
+    assert {:error, :provider_failure} =
+             SourceControl.state(config(rejected_external_checks), change_request())
 
     {:ok, malformed_transport} =
       ScriptTransport.start_link(
@@ -764,6 +905,16 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
     assert {:error, :provider_failure} =
              SourceControl.close_or_comment(config(provider_rejected), change_request(), close_opts)
 
+    {:ok, closed_after_put} =
+      ScriptTransport.start_link([
+        get(path, 200, merge_request(%{"state" => "opened"})),
+        put(path, 200, merge_request(%{"state" => "closed"})),
+        get(path, 200, merge_request(%{"state" => "closed"}))
+      ])
+
+    assert {:ok, %{action: :closed, external_id: "501"}} =
+             SourceControl.close_or_comment(config(closed_after_put), change_request(), close_opts)
+
     {:ok, transport_rejected} =
       ScriptTransport.start_link([
         get(path, 200, merge_request(%{"state" => "opened"})),
@@ -788,7 +939,8 @@ defmodule SymphonyElixir.SourceControlGitLabCoverageTest do
     cases = [
       {project(%{"permissions" => %{"project_access" => %{"access_level" => 20}}}), branch(@sha)},
       {project(%{"permissions" => %{}}), branch(@sha)},
-      {project(), Map.put(branch(@sha), "can_push", false)}
+      {project(), Map.put(branch(@sha), "can_push", false)},
+      {project(), Map.put(branch(@sha), "can_push", "unknown")}
     ]
 
     for {project_body, branch_body} <- cases do

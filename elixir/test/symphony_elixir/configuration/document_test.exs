@@ -203,6 +203,114 @@ defmodule SymphonyElixir.Configuration.DocumentTest do
            } in errors
   end
 
+  test "validates canonical Source Control bot actor ids" do
+    credential_ref = "00000000-0000-0000-0000-000000000001"
+
+    source_control = %{
+      "id" => "delivery-main",
+      "kind" => "source_control",
+      "provider" => "github",
+      "credential_ref" => credential_ref,
+      "settings" => %{
+        "repository" => "WangShayne/Symphony-works",
+        "base_branch" => "main",
+        "bot_actor_id" => "31337"
+      }
+    }
+
+    document =
+      valid_project()
+      |> Map.put("source_control_integration_ref", "delivery-main")
+      |> Document.for_project()
+      |> Map.put("integrations", [source_control])
+
+    assert {:ok, ^document} = Document.validate(document)
+
+    invalid = put_in(document, ["integrations", Access.at(0), "settings", "bot_actor_id"], 31_337)
+
+    assert {:error, errors} = Document.validate(invalid)
+
+    assert %{
+             path: ["integrations", "0", "settings", "bot_actor_id"],
+             message: "must be a canonical positive decimal actor id"
+           } in errors
+  end
+
+  test "derives Automation Project integration refs from a single active integration" do
+    document =
+      valid_project()
+      |> Map.put("tracker_integration_ref", "")
+      |> Map.put("source_control_integration_ref", "")
+      |> Document.for_project()
+      |> Map.put("integrations", [
+        %{
+          "id" => "tracker-main",
+          "kind" => "tracker",
+          "provider" => "fixture",
+          "settings" => %{"scenario" => "healthy"}
+        },
+        %{
+          "id" => "tracker-disabled",
+          "kind" => "tracker",
+          "provider" => "fixture",
+          "active" => false,
+          "settings" => %{"scenario" => "disabled"}
+        },
+        %{
+          "id" => "delivery-main",
+          "kind" => "source_control",
+          "provider" => "fixture",
+          "settings" => %{"repository" => "WangShayne/Symphony-works", "base_branch" => "main"}
+        },
+        %{
+          "id" => "delivery-disabled",
+          "kind" => "source_control",
+          "provider" => "fixture",
+          "active" => false,
+          "settings" => %{"repository" => "ignored/blank", "base_branch" => "main"}
+        }
+      ])
+
+    filled = Document.ensure_project_integration_refs(document)
+    [project] = filled["automation_projects"]
+
+    assert project["tracker_integration_ref"] == "tracker-main"
+    assert project["source_control_integration_ref"] == "delivery-main"
+    assert {:ok, ^filled} = Document.validate(filled)
+
+    existing =
+      document
+      |> put_in(["automation_projects", Access.at(0), "tracker_integration_ref"], "manual-tracker")
+      |> Document.ensure_project_integration_refs()
+
+    assert get_in(existing, ["automation_projects", Access.at(0), "tracker_integration_ref"]) == "manual-tracker"
+
+    ambiguous =
+      document
+      |> Map.put("integrations", [
+        %{
+          "id" => "tracker-main",
+          "kind" => "tracker",
+          "provider" => "fixture",
+          "settings" => %{"scenario" => "healthy"}
+        },
+        %{
+          "id" => "tracker-secondary",
+          "kind" => "tracker",
+          "provider" => "fixture",
+          "settings" => %{"scenario" => "healthy"}
+        }
+      ])
+      |> Document.ensure_project_integration_refs()
+
+    [ambiguous_project] = ambiguous["automation_projects"]
+    refute Map.has_key?(ambiguous_project, "tracker_integration_ref")
+    refute Map.has_key?(ambiguous_project, "source_control_integration_ref")
+
+    unchanged = %{"automation_projects" => []}
+    assert Document.ensure_project_integration_refs(unchanged) == unchanged
+  end
+
   test "validates Automation Project integration refs against active integration ids and kinds" do
     document =
       valid_project()
@@ -559,6 +667,78 @@ defmodule SymphonyElixir.Configuration.DocumentTest do
 
     assert %{path: ["model_references", "0", "prices"], message: "is required"} in price_errors
     assert %{path: ["model_references", "0", "capabilities", "structured_output"], message: "must be a boolean"} in price_errors
+  end
+
+  test "accepts inactive execution profiles without model bindings" do
+    document =
+      runtime_model_document()
+      |> Map.put("execution_profiles", [
+        %{
+          "id" => "inactive-profile",
+          "name" => "Inactive",
+          "runtime" => "codex",
+          "instructions" => "Disabled profile.",
+          "active" => false
+        }
+      ])
+
+    assert {:ok, ^document} = Document.validate(document)
+
+    bootstrap =
+      valid_project()
+      |> Document.for_project()
+      |> Map.put("execution_profiles", [
+        %{
+          "id" => "inactive-profile",
+          "name" => "Inactive",
+          "runtime" => "codex",
+          "instructions" => "Disabled profile.",
+          "active" => false
+        }
+      ])
+
+    assert {:ok, ^bootstrap} = Document.validate(bootstrap)
+  end
+
+  test "reports malformed provider entries and incomplete provider credentials" do
+    document =
+      runtime_model_document()
+      |> Map.put("providers", [
+        "bad-provider",
+        %{
+          "id" => "incomplete-provider",
+          "name" => "",
+          "endpoint" => "http://127.0.0.1:4010"
+        },
+        %{
+          "id" => "codex-provider",
+          "name" => "Codex Provider",
+          "endpoint" => "http://127.0.0.1:4010",
+          "credential_ref" => "00000000-0000-0000-0000-000000000001"
+        }
+      ])
+
+    assert {:error, errors} = Document.validate(document)
+
+    assert %{path: ["providers", "0"], message: "must be an object"} in errors
+    assert %{path: ["providers", "1", "name"], message: "is required"} in errors
+    assert %{path: ["providers", "1", "credential_ref"], message: "is required"} in errors
+    assert %{path: ["providers", "2", "runtime_protocol"], message: "is required"} in errors
+  end
+
+  test "accepts legacy integration settings objects" do
+    document =
+      valid_project()
+      |> Document.for_project()
+      |> Map.put("integrations", [
+        %{
+          "id" => "workspace-main",
+          "kind" => "workspace",
+          "settings" => %{}
+        }
+      ])
+
+    assert {:ok, ^document} = Document.validate(document)
   end
 
   test "content hashes are deterministic and change with the document" do

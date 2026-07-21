@@ -236,8 +236,7 @@ defmodule SymphonyElixir.SourceControl.AdapterSupport do
       Integer.to_string(actor_id) == trusted_actor_id
   end
 
-  defp canonical_actor_id?(value) when is_binary(value), do: Regex.match?(~r/\A[1-9][0-9]*\z/, value)
-  defp canonical_actor_id?(_value), do: false
+  defp canonical_actor_id?(value), do: Regex.match?(~r/\A[1-9][0-9]*\z/, value)
 
   defp digest(parts) do
     parts

@@ -65,6 +65,26 @@ defmodule SymphonyElixir.ExecCommandTest do
     assert result.status == 37
   end
 
+  test "run accepts a valid working directory" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-exec-command-cwd-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    on_exit(fn -> File.rm_rf(root) end)
+    File.mkdir_p!(root)
+
+    assert {:ok, result} =
+             ExecCommand.run(["/bin/sh", "-c", "printf '%s' \"$PWD\""],
+               cd: root,
+               guarded: false
+             )
+
+    assert result.stdout =~ Path.basename(root)
+    assert result.status == 0
+  end
+
   test "run covers invalid spawn, env deletion, signal exit, timeout, and caller death" do
     assert {:error, _reason} =
              Task.async(fn -> ExecCommand.run([], guarded: false) end)
@@ -135,6 +155,33 @@ defmodule SymphonyElixir.ExecCommandTest do
 
     Process.exit(exec_pid, :kill)
     assert_receive {:exec_result, {:error, :killed}}, 5_000
+  end
+
+  test "run fails closed when the status reader exits before status proof" do
+    assert {:ok, _apps} = Application.ensure_all_started(:erlexec)
+
+    before_dirs = control_private_dirs()
+
+    runner =
+      Task.async(fn ->
+        ExecCommand.run(["/bin/sh", "-c", "while :; do sleep 1; done"],
+          timeout_ms: 60_000
+        )
+      end)
+
+    control_dir = new_control_dir(before_dirs)
+    control_path = Path.join(control_dir, "status")
+    reader_os_pid = eventually_value(fn -> control_reader_os_pid_for_path(control_path) end)
+
+    try do
+      assert is_integer(reader_os_pid)
+      assert {"", 0} = System.cmd("kill", [Integer.to_string(reader_os_pid)])
+      assert {:error, {:control_read_failed, _reason, _stderr}} = Task.await(runner, 5_000)
+      assert eventually_value(fn -> removed?(control_dir) end)
+    after
+      if is_integer(reader_os_pid) and os_process_alive?(reader_os_pid), do: System.cmd("kill", [Integer.to_string(reader_os_pid)])
+      File.rm_rf(control_dir)
+    end
   end
 
   test "status marker parser preserves non-control stderr and ignores malformed markers" do
@@ -219,6 +266,9 @@ defmodule SymphonyElixir.ExecCommandTest do
     blocking_file = Path.join(test_root, "blocking-file")
     File.write!(blocking_file, "")
     assert {:error, _reason} = ExecCommand.make_control_fifo_for_test(blocking_file)
+
+    not_directory_ancestor = Path.join([blocking_file, "child", "control-parent"])
+    assert {:error, :enotdir} = ExecCommand.make_control_fifo_for_test(not_directory_ancestor)
 
     missing_path = Path.join(test_root, "missing-control")
     empty_path = Path.join(test_root, "empty-control")
@@ -325,6 +375,10 @@ defmodule SymphonyElixir.ExecCommandTest do
     assert :ok = ExecCommand.stop_control_reader_for_test(ignores_stop, 10)
     assert Process.alive?(ignores_stop)
     Process.exit(ignores_stop, :kill)
+
+    exits_without_reply = spawn(fn -> receive do: (_message -> :ok) end)
+    assert :ok = ExecCommand.stop_control_reader_for_test(exits_without_reply, 100)
+    refute Process.alive?(exits_without_reply)
 
     fifo_root = Path.join(System.tmp_dir!(), "symphony-exec-read-success-#{System.unique_integer([:positive])}")
     assert {:ok, fifo_path} = ExecCommand.make_control_fifo_for_test(fifo_root)
@@ -458,6 +512,35 @@ defmodule SymphonyElixir.ExecCommandTest do
     assert File.read!(forged_status) == "status"
     assert File.read!(forged_secret) == "secret"
     assert File.read!(sentinel) == "keep"
+  end
+
+  test "status control private directory predicate fails closed without deleting external files" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-exec-command-private-predicate-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    control_root = Path.join(test_root, "symphony-exec-control")
+    control_dir = Path.join(control_root, "run-predicate")
+    external_dir = Path.join(test_root, "external")
+    external_status = Path.join(external_dir, "status")
+    secret_path = Path.join(control_dir, "status.secret")
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    File.mkdir_p!(control_dir)
+    File.mkdir_p!(external_dir)
+    File.chmod!(control_root, 0o700)
+    File.chmod!(control_dir, 0o700)
+    File.write!(external_status, "external-status")
+    File.write!(secret_path, "secret")
+
+    refute ExecCommand.private_control_dir_for_test(:not_binary, control_dir, external_status, secret_path)
+    refute ExecCommand.private_control_dir_for_test(control_root, control_dir, external_status, secret_path)
+
+    assert File.read!(external_status) == "external-status"
+    assert File.read!(secret_path) == "secret"
   end
 
   test "run owner death cleans reader process, reader OS process, and private control directory" do
@@ -598,6 +681,56 @@ defmodule SymphonyElixir.ExecCommandTest do
     refute File.exists?(control_dir)
   end
 
+  test "status control parent validation fails closed for unsafe owner and mkdir branches" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-exec-command-control-validation-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    previous_path = System.get_env("PATH")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    fake_bin = Path.join(test_root, "bin")
+    File.mkdir_p!(fake_bin)
+
+    parent = Path.join(test_root, "existing-parent")
+    File.mkdir_p!(parent)
+    File.chmod!(parent, 0o700)
+
+    write_fake_executable(fake_bin, "id", "printf '999999\\n'\n")
+    System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
+    assert {:error, :unsafe_control_parent} = ExecCommand.make_control_fifo_for_test(parent)
+
+    write_fake_executable(fake_bin, "id", "printf 'not-an-integer\\n'\n")
+    assert {:error, :invalid_uid} = ExecCommand.make_control_fifo_for_test(parent)
+
+    write_fake_executable(fake_bin, "id", "printf 'id failed\\n' >&2\nexit 23\n")
+    assert {:error, {:id_failed, 23, output}} = ExecCommand.make_control_fifo_for_test(parent)
+    assert output =~ "id failed"
+
+    File.rm!(Path.join(fake_bin, "id"))
+
+    missing_parent = Path.join(test_root, "missing-parent")
+    write_fake_executable(fake_bin, "mkdir", "printf 'mkdir failed\\n' >&2\nexit 17\n")
+    assert {:error, {:mkdir_failed, 17, output}} = ExecCommand.make_control_fifo_for_test(missing_parent)
+    assert output =~ "mkdir failed"
+
+    private_parent = Path.join(test_root, "private-parent")
+    File.mkdir_p!(private_parent)
+    File.chmod!(private_parent, 0o700)
+
+    write_fake_executable(fake_bin, "mkdir", "printf 'private mkdir failed\\n' >&2\nexit 19\n")
+    assert {:error, :unsafe_control_dir} = ExecCommand.make_control_fifo_for_test(private_parent)
+
+    write_fake_executable(fake_bin, "mkdir", "/bin/mkdir -p \"$1\"\nprintf 'collision\\n' >&2\nexit 1\n")
+    assert {:error, :control_dir_collision} = ExecCommand.make_control_fifo_for_test(private_parent)
+  end
+
   test "secret writer refuses carriers that were not private at creation" do
     test_root =
       Path.join(
@@ -627,6 +760,33 @@ defmodule SymphonyElixir.ExecCommandTest do
                secret_path,
                "test-token"
              )
+
+    directory_secret = Path.join(test_root, "directory.secret")
+    File.mkdir_p!(directory_secret)
+    {:ok, directory_io} = File.open(Path.join(test_root, "directory-io"), [:write, :binary])
+
+    assert {:error, :unsafe_control_secret} =
+             ExecCommand.protect_write_and_close_control_secret_for_test(
+               directory_io,
+               directory_secret,
+               "test-token"
+             )
+
+    symlink_target = Path.join(test_root, "symlink-target")
+    symlink_secret = Path.join(test_root, "symlink.secret")
+    File.write!(symlink_target, "")
+    File.ln_s!(symlink_target, symlink_secret)
+    {:ok, symlink_io} = File.open(Path.join(test_root, "symlink-io"), [:write, :binary])
+
+    assert {:error, :unsafe_control_secret} =
+             ExecCommand.protect_write_and_close_control_secret_for_test(
+               symlink_io,
+               symlink_secret,
+               "test-token"
+             )
+
+    missing_root_control = Path.join(test_root, "missing-root/run-forged/status")
+    assert {:error, _reason} = ExecCommand.write_control_secret_for_test(missing_root_control, "test-token")
   end
 
   test "child stderr cannot spoof the guarded command status marker" do
@@ -796,6 +956,12 @@ defmodule SymphonyElixir.ExecCommandTest do
       {pid, ""} -> pid
       _invalid -> nil
     end
+  end
+
+  defp write_fake_executable(directory, name, script) do
+    path = Path.join(directory, name)
+    File.write!(path, "#!/bin/sh\n" <> script)
+    File.chmod!(path, 0o755)
   end
 
   defp stat_mode(path) do

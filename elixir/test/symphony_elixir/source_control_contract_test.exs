@@ -29,6 +29,44 @@ defmodule SymphonyElixir.SourceControlContractTest do
     File.rm(Path.join(System.tmp_dir!(), "symphony-source-control-empty-fixture.json"))
   end
 
+  test "fixture transport resolves last mutation body placeholders from recorded requests" do
+    {:ok, transport} =
+      start_transport([
+        %{
+          "method" => "POST",
+          "path" => "/notes",
+          "status" => 201,
+          "headers" => %{},
+          "body" => %{"id" => 1}
+        },
+        %{
+          "method" => "GET",
+          "path" => "/notes/1",
+          "status" => 200,
+          "headers" => %{},
+          "body" => %{
+            "body" => "{{last_mutation_body}}",
+            "nested" => %{"description" => "{{last_mutation_body}}"},
+            "items" => ["{{last_mutation_body}}"]
+          }
+        }
+      ])
+
+    assert {:ok, %{status: 201}} =
+             FixtureTransport.request(
+               %{method: :post, path: "/notes", json: %{"description" => "accepted evidence"}},
+               transport
+             )
+
+    assert {:ok, response} = FixtureTransport.request(%{method: :get, path: "/notes/1"}, transport)
+
+    assert response.body == %{
+             "body" => "accepted evidence",
+             "nested" => %{"description" => "accepted evidence"},
+             "items" => ["accepted evidence"]
+           }
+  end
+
   test "fixture provider dispatches to the deterministic Source Control adapter" do
     config = %{
       provider: "fixture",

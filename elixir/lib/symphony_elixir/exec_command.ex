@@ -191,6 +191,12 @@ defmodule SymphonyElixir.ExecCommand do
     end
 
     @doc false
+    @spec private_control_dir_for_test(term(), term(), term(), term()) :: boolean()
+    def private_control_dir_for_test(control_root, control_dir, control_path, secret_path) do
+      private_control_dir?(control_root, control_dir, control_path, secret_path)
+    end
+
+    @doc false
     @spec parse_control_status_for_test(binary(), tuple()) ::
             {:ok, non_neg_integer()} | {:error, :invalid_control_status}
     def parse_control_status_for_test(line, proofs), do: parse_control_status(line, proofs)
@@ -573,9 +579,6 @@ defmodule SymphonyElixir.ExecCommand do
         else
           {:error, :unsafe_control_dir}
         end
-
-      {:error, _reason} = error ->
-        error
     end
   end
 

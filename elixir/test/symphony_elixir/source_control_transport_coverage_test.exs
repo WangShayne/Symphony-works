@@ -188,6 +188,29 @@ defmodule SymphonyElixir.SourceControlTransportCoverageTest do
              Transport.request(%{credential_ref: @credential_ref}, :github, request)
   end
 
+  test "marker signatures require binary payloads and scoped credentials" do
+    Process.delete(@credential_key)
+
+    assert {:error, :invalid_configuration} = Transport.sign_marker_payload(:not_a_payload)
+    assert {:error, :invalid_configuration} = Transport.sign_marker_payload("payload")
+    refute Transport.valid_marker_signature?(:not_a_payload, String.duplicate("0", 64))
+    refute Transport.valid_marker_signature?("payload", :not_a_signature)
+
+    signature =
+      Transport.with_credential("marker-token", fn ->
+        {:ok, signature} = Transport.sign_marker_payload("payload")
+        signature
+      end)
+
+    assert Transport.with_credential("marker-token", fn ->
+             Transport.valid_marker_signature?("payload", signature)
+           end)
+
+    refute Transport.with_credential("marker-token", fn ->
+             Transport.valid_marker_signature?("payload", String.slice(signature, 1..-1//1))
+           end)
+  end
+
   test "dispatch failures and unexpected responses collapse to transport_failure" do
     request = %{method: :get, path: "/health"}
 
@@ -207,7 +230,18 @@ defmodule SymphonyElixir.SourceControlTransportCoverageTest do
 
     {invalid_config, invalid_agent} = transport_config([{:error, :invalid_configuration}])
     assert {:error, :invalid_configuration} = authenticated_request(invalid_config, request)
+    assert_receive {:transport_request, %{path: "/health"}}
     Agent.stop(invalid_agent)
+
+    flush_transport_requests()
+
+    {invalid_dispatch_config, invalid_dispatch_agent} = transport_config([{:ok, %{status: 200, headers: %{}, body: :ok}}])
+
+    assert {:error, :transport_failure} =
+             authenticated_request(%{invalid_dispatch_config | transport: :invalid}, request)
+
+    refute_receive {:transport_request, _request}
+    Agent.stop(invalid_dispatch_agent)
   end
 
   test "unsafe requests never retry retryable provider responses" do
@@ -375,6 +409,25 @@ defmodule SymphonyElixir.SourceControlTransportCoverageTest do
                  @expected_sha
                )
              end)
+  end
+
+  test "public push without an override dispatches through hardened git transport" do
+    context = fake_git_context("remote.origin.url")
+
+    assert :ok =
+             Transport.with_credential("push-token", fn ->
+               Transport.push(
+                 %{credential_ref: @credential_ref, settings: context.config.settings},
+                 :github,
+                 "valid",
+                 @desired_sha,
+                 @expected_sha
+               )
+             end)
+
+    push_env = read_env(context.push_env_path)
+    assert push_env["SYMPHONY_GIT_CREDENTIAL"] == "push-token"
+    assert "--force-with-lease=refs/heads/valid:#{@expected_sha}" in read_lines(context.args_path)
   end
 
   test "HTTP transport sends JSON, query parameters, and headers through Req" do
@@ -1092,10 +1145,25 @@ defmodule SymphonyElixir.SourceControlTransportCoverageTest do
              Git.run_owned_for_test(fn _caller_ref -> Process.sleep(:infinity) end, 10)
   end
 
+  test "git command owner preserves fast crash reasons under repeated races" do
+    for _attempt <- 1..100 do
+      assert {:error, :forced_crash} =
+               Git.run_owned_for_test(fn _caller_ref -> exit(:forced_crash) end, 100)
+    end
+  end
+
   defp authenticated_request(config, request) do
     Transport.with_credential("scoped-token", fn ->
       Transport.request(config, :github, request)
     end)
+  end
+
+  defp flush_transport_requests do
+    receive do
+      {:transport_request, _request} -> flush_transport_requests()
+    after
+      0 -> :ok
+    end
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:symphony_elixir, key)

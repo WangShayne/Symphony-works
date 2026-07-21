@@ -241,6 +241,12 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
                dedupe_key: "invalid-repo"
              )
 
+    assert {:error, :missing_operation_identity} =
+             GitHub.ensure_remote_branch(config([]), branch(), [])
+
+    assert {:error, :missing_operation_identity} =
+             GitHub.push_branch(config([]), "topic", @desired_sha, [])
+
     assert {:error, :invalid_configuration} =
              GitHub.set_draft(config([]), change_request(),
                operation_id: "invalid-draft",
@@ -253,6 +259,9 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
                dedupe_key: "invalid-action",
                action: :merge
              )
+
+    assert {:error, :missing_operation_identity} =
+             GitHub.close_or_comment(config([]), change_request(), [])
 
     assert {:error, :invalid_configuration} =
              GitHub.close_or_comment(config([]), change_request(),
@@ -344,6 +353,28 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
              SourceControl.health_check(update_in(config([]), [:settings], &Map.delete(&1, :bot_actor_id)))
   end
 
+  test "baseline resolution returns the observed branch commit and preserves provider failures" do
+    assert {:ok, baseline} =
+             SourceControl.resolve_baseline(
+               config([ok(200, %{"commit" => %{"sha" => @sha}})]),
+               "main"
+             )
+
+    assert baseline.provider == :github
+    assert baseline.repository == "acme/widget"
+    assert baseline.branch == "main"
+    assert baseline.commit_sha == @sha
+
+    assert {:error, :transport_failure} =
+             SourceControl.resolve_baseline(config([{:error, :closed}]), "main")
+
+    assert {:error, :invalid_configuration} =
+             SourceControl.resolve_baseline(
+               put_in(config([]), [:settings, :repository], 42),
+               "main"
+             )
+  end
+
   test "branch reads preserve authentication, transport, conflict, and malformed-body failures" do
     assert {:error, :unauthorized} =
              SourceControl.ensure_remote_branch(
@@ -375,6 +406,18 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
   end
 
   test "branch creation reconciles provider races and unknown mutation outcomes" do
+    assert {:ok, created} =
+             SourceControl.ensure_remote_branch(
+               config([ok(404, %{}), ok(201, branch_body(@sha))]),
+               branch(),
+               operation(:branch_created)
+             )
+
+    assert created.disposition == :created
+    assert created.repository == "acme/widget"
+    assert created.name == "topic"
+    assert created.commit_sha == @sha
+
     assert {:ok, reconciled} =
              SourceControl.ensure_remote_branch(
                config([ok(404, %{}), ok(409, %{}), ok(200, branch_body(@sha))]),
@@ -423,6 +466,17 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
   end
 
   test "push reconciliation distinguishes transport failure, conflict, corruption, and uncertainty" do
+    assert {:ok, updated} =
+             SourceControl.push_branch(
+               config([:ok, ok(200, branch_body(@desired_sha))]),
+               "topic",
+               @desired_sha,
+               operation(:push_updated, expected_remote_sha: @sha)
+             )
+
+    assert updated.disposition == :updated
+    assert updated.commit_sha == @desired_sha
+
     assert {:error, :transport_failure} =
              SourceControl.push_branch(
                config([{:error, :push_failed}, ok(200, branch_body(@sha))]),
@@ -650,24 +704,34 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
   end
 
   test "change request precheck fails closed on malformed unrelated list item before posting" do
-    malformed =
-      pull(%{
-        "id" => "9004",
-        "number" => 93,
-        "head" => %{"repo" => %{"full_name" => "acme/widget"}, "sha" => @sha}
-      })
+    cases = [
+      {:malformed_id,
+       pull(%{
+         "id" => "9004",
+         "number" => 93,
+         "head" => %{"repo" => %{"full_name" => "acme/widget"}, "ref" => "unrelated", "sha" => @sha}
+       })},
+      {:missing_head_ref,
+       pull(%{
+         "id" => 9004,
+         "number" => 93,
+         "head" => %{"repo" => %{"full_name" => "acme/widget"}, "sha" => @sha}
+       })}
+    ]
 
-    transport = start_transport([ok(200, [malformed])])
+    for {suffix, malformed} <- cases do
+      transport = start_transport([ok(200, [malformed])])
 
-    assert {:error, :provider_failure} =
-             SourceControl.ensure_change_request(
-               change_request_attrs(config(transport)),
-               operation(:change_request_malformed_precheck_item)
-             )
+      assert {:error, :provider_failure} =
+               SourceControl.ensure_change_request(
+                 change_request_attrs(config(transport)),
+                 operation({:change_request_malformed_precheck_item, suffix})
+               )
 
-    assert Enum.map(QueueTransport.requests(transport), &{&1.method, &1.path}) == [
-             {:get, "/repos/acme/widget/pulls"}
-           ]
+      assert Enum.map(QueueTransport.requests(transport), &{&1.method, &1.path}) == [
+               {:get, "/repos/acme/widget/pulls"}
+             ]
+    end
   end
 
   test "change request listing rejects transport and malformed collection responses" do
@@ -721,6 +785,13 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
     assert reconciled.base_branch == "main"
     assert reconciled.draft?
     assert Enum.map(QueueTransport.requests(transport), & &1.method) == [:get]
+
+    assert {:error, :transport_failure} =
+             SourceControl.set_draft(config([{:error, :closed}]), change_request(),
+               operation_id: "draft-transport-error",
+               dedupe_key: "draft-transport-error",
+               draft: true
+             )
   end
 
   test "state tolerates irrelevant rules and reports closed checking changes" do
@@ -730,6 +801,19 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
     assert state.mergeability == :checking
     assert state.required_checks == []
     assert state.checks_status == :passed
+  end
+
+  test "state reports merged pulls as merged and mergeable" do
+    assert {:ok, state} =
+             SourceControl.state(
+               config(state_responses(pull(%{"merged" => true}))),
+               change_request()
+             )
+
+    assert state.status == :merged
+    assert state.mergeability == :mergeable
+    assert state.merged?
+    assert state.closed?
   end
 
   test "state preserves every non-merged GitHub mergeability observation" do
@@ -760,6 +844,8 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
             %{"context" => "missing-app", "integration_id" => 42},
             %{"context" => "no-app", "integration_id" => 100},
             %{"context" => "matched-app", "integration_id" => 7},
+            %{"context" => "failure-check"},
+            %{"context" => "pending-status"},
             %{"context" => "newest-status"}
           ]
         }
@@ -783,6 +869,11 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
           "app" => %{"id" => 7}
         },
         %{
+          "name" => "failure-check",
+          "conclusion" => "failure",
+          "details_url" => "https://checks/failure"
+        },
+        %{
           "name" => "no-app",
           "conclusion" => "success",
           "details_url" => "https://checks/no-app"
@@ -792,6 +883,7 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
 
     statuses = [
       %{"context" => "unknown-status", "state" => "mystery", "target_url" => "https://status/unknown"},
+      %{"context" => "pending-status", "state" => "pending", "target_url" => "https://status/pending"},
       %{"context" => "newest-status", "state" => "failure", "target_url" => "https://status/newest"},
       %{"context" => "newest-status", "state" => "success", "target_url" => "https://status/older"}
     ]
@@ -811,6 +903,12 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
 
     assert %{status: :passed, url: "https://checks/right-app"} =
              Enum.find(state.required_checks, &(&1.name == "matched-app"))
+
+    assert %{status: :failed, url: "https://checks/failure"} =
+             Enum.find(state.required_checks, &(&1.name == "failure-check"))
+
+    assert %{status: :pending, url: "https://status/pending"} =
+             Enum.find(state.required_checks, &(&1.name == "pending-status"))
 
     assert %{status: :failed, url: "https://status/newest"} =
              Enum.find(state.required_checks, &(&1.name == "newest-status"))
@@ -836,19 +934,27 @@ defmodule SymphonyElixir.SourceControlGitHubCoverageTest do
       ok(200, pull()),
       ok(404, %{}),
       ok(200, []),
-      ok(200, %{"checks" => [%{"context" => "classic", "app_id" => 7}], "contexts" => []}),
+      ok(200, %{
+        "checks" => [%{"context" => "classic", "app_id" => 7}],
+        "contexts" => ["classic", "legacy"]
+      }),
       ok(200, %{
         "check_runs" => [
           %{"name" => "classic", "conclusion" => "success", "app" => %{"id" => 7}}
         ]
       }),
-      ok(200, [])
+      ok(200, [%{"context" => "legacy", "state" => "success", "target_url" => "https://status/legacy"}])
     ]
 
     transport = start_transport(responses)
 
     assert {:ok, state} = SourceControl.state(config(transport), change_request())
-    assert state.required_checks == [%{name: "classic", status: :passed, url: nil}]
+
+    assert state.required_checks == [
+             %{name: "classic", status: :passed, url: nil},
+             %{name: "legacy", status: :passed, url: "https://status/legacy"}
+           ]
+
     assert state.checks_status == :passed
 
     assert Enum.map(QueueTransport.requests(transport), & &1.path) == [

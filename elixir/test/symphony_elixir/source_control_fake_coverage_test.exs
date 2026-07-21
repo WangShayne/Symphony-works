@@ -8,6 +8,12 @@ defmodule SymphonyElixir.SourceControlFakeCoverageTest do
   @sha_c String.duplicate("c", 40)
 
   test "adapter support reads atom and string configuration keys" do
+    assert AdapterSupport.operation_identity(operation_id: "operation-1", dedupe_key: "dedupe-1") ==
+             {:ok, "operation-1", "dedupe-1"}
+
+    assert AdapterSupport.operation_identity(operation_id: "operation-1", dedupe_key: "") ==
+             {:error, :missing_operation_identity}
+
     assert AdapterSupport.value(%{repository: "atom/repository"}, :repository) ==
              "atom/repository"
 
@@ -114,6 +120,42 @@ defmodule SymphonyElixir.SourceControlFakeCoverageTest do
     existing = %{"body" => AdapterSupport.append_marker("same body", other_parent_marker.exact), "id" => 1}
 
     assert {:error, :idempotency_conflict} = marker_decision([existing], parent_marker)
+  end
+
+  test "adapter support rejects malformed markers and invalid comment marker inputs" do
+    marker = marker("operation-1", "delivery-1", ["head", "main", "intent"])
+
+    assert {:error, :invalid_configuration} =
+             AdapterSupport.comment_marker(:github, "coverage/markers", "parent-1", "operation-1", "delivery-1", "")
+
+    assert {:error, :invalid_configuration} =
+             AdapterSupport.comment_marker(
+               :github,
+               "coverage/markers",
+               :not_a_parent_id,
+               "operation-1",
+               "delivery-1",
+               "body"
+             )
+
+    assert {:ok, :create} = marker_decision([%{"body" => nil, "id" => 1}], marker)
+    assert {:ok, :create} = marker_decision([%{"body" => "#{marker.exact}\nbody", "id" => 2}], marker)
+    assert {:ok, :create} = marker_decision([%{"body" => "<!-- symphony:not-a-marker -->\n\nbody", "id" => 3}], marker)
+    assert {:ok, :create} = marker_decision([], %{marker | exact: "<!-- symphony:not-a-marker -->"})
+  end
+
+  test "adapter support trusted actor filtering requires canonical positive actor ids" do
+    marker = marker("operation-1", "delivery-1", ["head", "main", "intent"])
+    body = AdapterSupport.append_marker("body", marker.exact)
+    trusted = %{"body" => body, "id" => 1, "user" => %{"id" => 42}}
+    untrusted = %{"body" => body, "id" => 2, "user" => %{"id" => 43}}
+
+    assert {:ok, {:found, ^trusted}} =
+             trusted_marker_decision([untrusted, trusted], marker, "42")
+
+    assert {:ok, :create} = trusted_marker_decision([trusted], marker, "042")
+    assert {:ok, :create} = trusted_marker_decision([trusted], marker, "0")
+    assert {:ok, :create} = trusted_marker_decision([%{trusted | "user" => %{"id" => "42"}}], marker, "42")
   end
 
   test "adapter support ignores unsigned and incorrectly signed marker lines" do
@@ -505,6 +547,12 @@ defmodule SymphonyElixir.SourceControlFakeCoverageTest do
   defp marker_decision(items, marker) do
     Transport.with_credential("marker-secret", fn ->
       AdapterSupport.marker_decision(items, "body", marker)
+    end)
+  end
+
+  defp trusted_marker_decision(items, marker, trusted_actor_id) do
+    Transport.with_credential("marker-secret", fn ->
+      AdapterSupport.marker_decision(items, "body", marker, ["user", "id"], trusted_actor_id)
     end)
   end
 

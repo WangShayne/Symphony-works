@@ -856,14 +856,12 @@ defmodule SymphonyElixir.SourceControl.Transport.Git do
     caller = self()
     result_ref = make_ref()
 
-    owner =
-      spawn(fn ->
+    {owner, owner_ref} =
+      spawn_monitor(fn ->
         Process.flag(:trap_exit, true)
         caller_ref = Process.monitor(caller)
         send(caller, {result_ref, run.(caller_ref)})
       end)
-
-    owner_ref = Process.monitor(owner)
 
     receive do
       {^result_ref, result} ->

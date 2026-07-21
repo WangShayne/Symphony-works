@@ -1,0 +1,48 @@
+[
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/pulls/14",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "id": 14014,
+      "node_id": "PR_kwDOReady14",
+      "number": 14,
+      "html_url": "https://github.test/acme/widget/pull/14",
+      "title": "ABC-14",
+      "draft": true,
+      "head": {"ref": "symphony/ABC-14"},
+      "base": {"ref": "main"}
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/graphql",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "data": {
+        "markPullRequestReadyForReview": {
+          "clientMutationId": "task-14:ready",
+          "pullRequest": {"id": "PR_kwDOReady14", "number": 14, "isDraft": false}
+        }
+      }
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/pulls/14",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "id": 14014,
+      "node_id": "PR_kwDOReady14",
+      "number": 14,
+      "html_url": "https://github.test/acme/widget/pull/14",
+      "title": "ABC-14",
+      "draft": false,
+      "head": {"ref": "symphony/ABC-14"},
+      "base": {"ref": "main"}
+    }
+  }
+]

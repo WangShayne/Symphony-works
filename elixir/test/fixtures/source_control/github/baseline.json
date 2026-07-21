@@ -1,0 +1,12 @@
+[
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/branches/release%2Fv1",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "name": "release/v1",
+      "commit": {"sha": "2222222222222222222222222222222222222222"}
+    }
+  }
+]

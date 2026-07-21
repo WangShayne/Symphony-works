@@ -16,8 +16,10 @@ defmodule SymphonyElixir.Codex.AppServer do
   @health_provider_key "symphony_health_probe"
   @sensitive_values_key {__MODULE__, :sensitive_values}
 
+  @type port_handle :: port() | SSH.Stream.t()
+
   @type session :: %{
-          port: port(),
+          port: port_handle(),
           metadata: map(),
           approval_policy: String.t() | map(),
           auto_approve_requests: boolean(),
@@ -160,7 +162,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @spec stop_session(session()) :: :ok
-  def stop_session(%{port: port}) when is_port(port) do
+  def stop_session(%{port: port}) do
     stop_port(port)
   end
 
@@ -395,6 +397,15 @@ defmodule SymphonyElixir.Codex.AppServer do
         _ ->
           %{}
       end
+
+    case worker_host do
+      host when is_binary(host) -> Map.put(base_metadata, :worker_host, host)
+      _ -> base_metadata
+    end
+  end
+
+  defp port_metadata(%SSH.Stream{} = stream, worker_host) do
+    base_metadata = %{codex_app_server_pid: to_string(SSH.os_pid(stream))}
 
     case worker_host do
       host when is_binary(host) -> Map.put(base_metadata, :worker_host, host)
@@ -1282,6 +1293,10 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  defp stop_port(%SSH.Stream{} = stream) do
+    SSH.close_stream(stream)
+  end
+
   defp emit_message(on_message, event, details, metadata) when is_function(on_message, 1) do
     message =
       metadata
@@ -1382,9 +1397,14 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp tool_call_arguments(_params), do: %{}
 
-  defp send_message(port, message) do
+  defp send_message(port, message) when is_port(port) do
     line = Jason.encode!(message) <> "\n"
     Port.command(port, line)
+  end
+
+  defp send_message(%SSH.Stream{} = stream, message) do
+    line = Jason.encode!(message) <> "\n"
+    SSH.send_data(stream, line)
   end
 
   defp needs_input?("mcpServer/elicitation/request", payload) when is_map(payload), do: true

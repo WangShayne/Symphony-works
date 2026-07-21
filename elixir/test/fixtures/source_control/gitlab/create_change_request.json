@@ -1,0 +1,26 @@
+[
+  {
+    "method": "GET",
+    "path": "/projects/acme%2Fwidget/merge_requests",
+    "status": 200,
+    "headers": {},
+    "body": []
+  },
+  {
+    "method": "POST",
+    "path": "/projects/acme%2Fwidget/merge_requests",
+    "status": 201,
+    "headers": {},
+    "body": {
+      "id": 1010,
+      "iid": 10,
+      "web_url": "https://gitlab.test/acme/widget/-/merge_requests/10",
+      "title": "Draft: ABC-10",
+      "description": "Accepted implementation",
+      "draft": true,
+      "source_branch": "symphony/ABC-10",
+      "target_branch": "main",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  }
+]

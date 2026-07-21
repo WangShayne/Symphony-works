@@ -1,0 +1,60 @@
+{
+  "status": 200,
+  "headers": {},
+  "body": {
+    "data": {
+      "viewer": {
+        "id": "linear-bot"
+      },
+      "projects": {
+        "nodes": [
+          {
+            "id": "project-1",
+            "slugId": "ENG"
+          }
+        ]
+      },
+      "issues": {
+        "nodes": [
+          {
+            "id": "health-issue",
+            "state": {
+              "id": "state-started",
+              "name": "Custom building name",
+              "type": "started"
+            },
+            "comments": {
+              "nodes": []
+            }
+          }
+        ]
+      },
+      "workflowStates": {
+        "nodes": [
+          {
+            "id": "state-started",
+            "name": "Custom building name",
+            "type": "started"
+          },
+          {
+            "id": "state-completed",
+            "name": "Released to customers",
+            "type": "completed"
+          },
+          {
+            "id": "state-cancelled",
+            "name": "Will not pursue",
+            "type": "canceled"
+          }
+        ]
+      },
+      "commentCreateCapability": {
+        "fields": [
+          {
+            "name": "commentCreate"
+          }
+        ]
+      }
+    }
+  }
+}

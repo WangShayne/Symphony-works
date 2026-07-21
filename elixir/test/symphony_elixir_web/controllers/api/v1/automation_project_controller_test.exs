@@ -1,6 +1,7 @@
 defmodule SymphonyElixirWeb.Api.V1.AutomationProjectControllerTest do
   use SymphonyElixirWeb.ConnCase, async: false
 
+  alias SymphonyElixir.Configuration.Revision
   alias SymphonyElixir.Security.SecretStore
 
   @bootstrap_token "test-bootstrap-token-with-32-bytes"
@@ -27,6 +28,12 @@ defmodule SymphonyElixirWeb.Api.V1.AutomationProjectControllerTest do
     end
 
     def stop_session(%{thread_id: "probe-thread"}), do: :ok
+  end
+
+  defmodule LeakyIntegrationHealth do
+    def health_check(%{"credential" => credential}) do
+      {:error, %{"code" => "denied", "message" => credential}}
+    end
   end
 
   setup do
@@ -294,6 +301,173 @@ defmodule SymphonyElixirWeb.Api.V1.AutomationProjectControllerTest do
              |> json_response(200)
   end
 
+  test "Administrator configures and validates independent integrations through REST" do
+    created =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/automation-projects", %{"project" => valid_project()})
+      |> json_response(201)
+
+    revision_id = created["data"]["id"]
+
+    document =
+      Map.put(created["data"]["document"], "integrations", [
+        %{
+          "id" => "tracker-fixture",
+          "kind" => "tracker",
+          "provider" => "fixture",
+          "settings" => %{
+            "scenario" => "healthy",
+            "state_ids" => %{
+              "started" => "state-started",
+              "completed" => "state-completed",
+              "cancelled" => "state-cancelled"
+            }
+          }
+        },
+        %{
+          "id" => "delivery-fixture",
+          "kind" => "source_control",
+          "provider" => "fixture",
+          "settings" => %{
+            "repository" => "WangShayne/Symphony-works",
+            "base_branch" => "main",
+            "scenario" => "healthy"
+          }
+        }
+      ])
+
+    assert %{"data" => %{"document" => %{"automation_projects" => [project], "integrations" => integrations}}} =
+             build_conn()
+             |> authenticated()
+             |> patch("/api/v1/configuration-revisions/#{revision_id}", %{"document" => document})
+             |> json_response(200)
+
+    assert Enum.map(integrations, & &1["id"]) == ["tracker-fixture", "delivery-fixture"]
+    assert project["tracker_integration_ref"] == "tracker-fixture"
+    assert project["source_control_integration_ref"] == "delivery-fixture"
+
+    assert get_in(integrations, [Access.at(0), "settings", "state_ids", "completed"]) ==
+             "state-completed"
+
+    assert %{
+             "data" => %{
+               "validation_evidence" => %{
+                 "probes" => [%{"probe" => "integrations", "integrations" => health}]
+               }
+             }
+           } =
+             build_conn()
+             |> authenticated()
+             |> post("/api/v1/configuration-revisions/#{revision_id}/validate")
+             |> json_response(200)
+
+    assert Enum.map(health, & &1["status"]) == ["passed", "passed"]
+
+    encoded = Jason.encode!(health)
+    refute encoded =~ "credential_ref"
+    refute encoded =~ "authorization"
+  end
+
+  test "REST draft update rejects runtime-only integration transport before persistence" do
+    created =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/automation-projects", %{"project" => valid_project()})
+      |> json_response(201)
+
+    revision_id = created["data"]["id"]
+
+    unsafe_document =
+      Map.put(created["data"]["document"], "integrations", [
+        %{
+          "id" => "delivery-fixture",
+          "kind" => "source_control",
+          "provider" => "fixture",
+          "settings" => %{
+            "repository" => "WangShayne/Symphony-works",
+            "base_branch" => "main",
+            "transport" => "runtime-only"
+          }
+        }
+      ])
+
+    assert %{"error" => %{"code" => "invalid_configuration"}} =
+             build_conn()
+             |> authenticated()
+             |> patch("/api/v1/configuration-revisions/#{revision_id}", %{"document" => unsafe_document})
+             |> json_response(422)
+
+    refute inspect(SymphonyElixir.Repo.get!(Revision, revision_id).document) =~ "runtime-only"
+  end
+
+  test "REST exposes useful redacted integration health failures" do
+    previous = Application.get_env(:symphony_elixir, :integration_health_adapters)
+
+    Application.put_env(:symphony_elixir, :integration_health_adapters, %{
+      "tracker" => LeakyIntegrationHealth
+    })
+
+    on_exit(fn -> Application.put_env(:symphony_elixir, :integration_health_adapters, previous) end)
+
+    {:ok, api_reference} =
+      SecretStore.put("rest-tracker-api", "rest-api-secret", actor: "admin")
+
+    {:ok, webhook_reference} =
+      SecretStore.put("rest-tracker-webhook", "rest-webhook-secret", actor: "admin")
+
+    created =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/automation-projects", %{"project" => valid_project()})
+      |> json_response(201)
+
+    revision_id = created["data"]["id"]
+
+    document =
+      Map.put(created["data"]["document"], "integrations", [
+        %{
+          "id" => "tracker-main",
+          "kind" => "tracker",
+          "provider" => "github",
+          "credential_ref" => api_reference.id,
+          "settings" => %{
+            "owner" => "WangShayne",
+            "repository" => "Symphony-works",
+            "bot_actor_id" => "symphony-bot",
+            "webhook_secret_ref" => webhook_reference.id
+          }
+        }
+      ])
+
+    build_conn()
+    |> authenticated()
+    |> patch("/api/v1/configuration-revisions/#{revision_id}", %{"document" => document})
+    |> json_response(200)
+
+    response =
+      build_conn()
+      |> authenticated()
+      |> post("/api/v1/configuration-revisions/#{revision_id}/validate")
+      |> json_response(422)
+
+    assert response["error"]["code"] == "invalid_configuration"
+
+    assert response["error"]["details"] == %{
+             "id" => "tracker-main",
+             "kind" => "tracker",
+             "provider" => "github",
+             "reason" => "denied",
+             "status" => "failed"
+           }
+
+    encoded = Jason.encode!(response)
+    refute encoded =~ "rest-api-secret"
+    refute encoded =~ "rest-webhook-secret"
+    refute encoded =~ api_reference.id
+    refute encoded =~ webhook_reference.id
+  end
+
   test "REST updates, probes, and activates runtime model profile bindings", %{conn: conn} do
     create =
       conn
@@ -458,7 +632,20 @@ defmodule SymphonyElixirWeb.Api.V1.AutomationProjectControllerTest do
              json_response(import_conn, 201)
 
     updated_document =
-      put_in(imported_document, ["automation_projects", Access.at(0), "name"], "Edited draft")
+      imported_document
+      |> put_in(["automation_projects", Access.at(0), "name"], "Edited draft")
+      |> Map.update!("integrations", fn integrations ->
+        integrations
+        |> Enum.reject(&(&1["id"] == "tracker"))
+        |> Kernel.++([
+          %{
+            "id" => "tracker",
+            "kind" => "tracker",
+            "provider" => "fixture",
+            "settings" => %{"scenario" => "healthy"}
+          }
+        ])
+      end)
 
     assert %{"data" => %{"id" => ^imported_id, "document" => %{"automation_projects" => [updated]}}} =
              build_conn()
@@ -524,7 +711,7 @@ defmodule SymphonyElixirWeb.Api.V1.AutomationProjectControllerTest do
 
     encoded = Jason.encode!(exported)
     refute encoded =~ "ghp_api_key"
-    assert encoded =~ "[REDACTED]"
+    refute encoded =~ "api_key"
   end
 
   test "bootstrap Administrator binds a secret reference to a draft provider without returning plaintext",

@@ -1,0 +1,43 @@
+[
+  {
+    "method": "GET",
+    "path": "/projects/acme%2Fwidget/merge_requests",
+    "status": 200,
+    "headers": {},
+    "body": []
+  },
+  {
+    "method": "POST",
+    "path": "/projects/acme%2Fwidget/merge_requests",
+    "status": 201,
+    "headers": {},
+    "body": {
+      "id": 23023,
+      "iid": 23,
+      "web_url": "https://gitlab.test/acme/widget/-/merge_requests/23",
+      "title": "Draft: ABC-23",
+      "description": "Original intent",
+      "draft": true,
+      "source_branch": "symphony/ABC-23",
+      "target_branch": "main"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/projects/acme%2Fwidget/merge_requests",
+    "status": 200,
+    "headers": {},
+    "body": [
+      {
+        "id": 23023,
+        "iid": 23,
+        "web_url": "https://gitlab.test/acme/widget/-/merge_requests/23",
+        "title": "Draft: ABC-23",
+        "description": "{{last_mutation_body}}",
+        "draft": true,
+        "source_branch": "symphony/ABC-23",
+        "target_branch": "main"
+      }
+    ]
+  }
+]

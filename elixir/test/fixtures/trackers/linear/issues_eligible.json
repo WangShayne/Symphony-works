@@ -1,0 +1,49 @@
+{
+  "status": 200,
+  "headers": {},
+  "body": {
+    "data": {
+      "issues": {
+        "nodes": [
+          {
+            "id": "issue-eligible",
+            "identifier": "ENG-10",
+            "title": "Eligible Linear issue",
+            "description": "Issue body",
+            "priority": 2,
+            "state": {
+              "id": "state-started",
+              "name": "Custom building name",
+              "type": "started"
+            },
+            "branchName": "feature/ENG-10",
+            "url": "https://linear.test/issue/ENG-10",
+            "assignee": {
+              "id": "worker-1"
+            },
+            "labels": {
+              "nodes": [
+                {
+                  "name": "ready-for-agent"
+                }
+              ]
+            },
+            "inverseRelations": {
+              "nodes": [],
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              }
+            },
+            "createdAt": "2026-07-20T00:00:00Z",
+            "updatedAt": "2026-07-20T00:01:00Z"
+          }
+        ],
+        "pageInfo": {
+          "hasNextPage": false,
+          "endCursor": null
+        }
+      }
+    }
+  }
+}

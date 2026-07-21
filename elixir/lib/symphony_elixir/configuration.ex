@@ -15,11 +15,51 @@ defmodule SymphonyElixir.Configuration do
   alias SymphonyElixir.Repo
   alias SymphonyElixir.Security.SecretStore
 
+  @plaintext_credential_fields [
+    "api_key",
+    "api_token",
+    "access_token",
+    "auth_token",
+    "private_token",
+    "token",
+    "secret",
+    "client_secret",
+    "webhook_secret",
+    "webhook_token",
+    "credential",
+    "credentials",
+    "private_key",
+    "password",
+    "authorization",
+    "transport"
+  ]
+
+  @plaintext_credential_aliases [
+    "apikey",
+    "apitoken",
+    "accesstoken",
+    "authtoken",
+    "privatetoken",
+    "token",
+    "secret",
+    "clientsecret",
+    "webhooksecret",
+    "webhooktoken",
+    "credential",
+    "credentialref",
+    "credentials",
+    "privatekey",
+    "password",
+    "authorization",
+    "transport"
+  ]
+
   @spec create_draft(map(), keyword()) :: {:ok, Revision.t()} | {:error, tuple() | Ecto.Changeset.t()}
   def create_draft(document, opts) when is_map(document) do
     actor = Keyword.fetch!(opts, :actor)
+    document = Document.ensure_project_integration_refs(document)
 
-    with :ok <- validate_runtime_credential_references(document) do
+    with :ok <- validate_credential_references(document) do
       %Revision{}
       |> Revision.draft_changeset(%{
         document: document,
@@ -35,10 +75,11 @@ defmodule SymphonyElixir.Configuration do
           {:ok, Revision.t()} | {:error, :not_found | tuple() | Ecto.Changeset.t()}
   def update_draft(id, document, opts) when is_map(document) do
     _actor = Keyword.fetch!(opts, :actor)
+    document = Document.ensure_project_integration_refs(document)
 
     with %Revision{} = revision <- Repo.get(Revision, id),
          :ok <- validate_transition(revision.status, :draft_update),
-         :ok <- validate_runtime_credential_references(document) do
+         :ok <- validate_credential_references(document) do
       revision
       |> Revision.update_draft_changeset(%{
         document: document,
@@ -52,28 +93,70 @@ defmodule SymphonyElixir.Configuration do
     end
   end
 
-  defp validate_runtime_credential_references(document) do
-    invalid_reference? =
-      ["providers", "model_references"]
-      |> Enum.flat_map(fn key ->
-        document
-        |> Map.get(key, [])
-        |> List.wrap()
-      end)
+  defp validate_credential_references(document) do
+    cond do
+      plaintext_credential_field?(document) ->
+        invalid_credential_error("plaintext_field")
+
+      Enum.any?(credential_references(document), &(not SecretStore.valid_reference_id?(&1))) ->
+        invalid_credential_error("invalid_reference")
+
+      true ->
+        :ok
+    end
+  end
+
+  defp invalid_credential_error(reason) do
+    {:error,
+     {:invalid_credential_ref,
+      %{
+        "credential_ref" => "[REDACTED]",
+        "reason" => reason
+      }}}
+  end
+
+  defp credential_references(document) do
+    direct_references =
+      ["providers", "model_references", "integrations"]
+      |> Enum.flat_map(fn key -> document |> Map.get(key, []) |> List.wrap() end)
       |> Enum.filter(&(is_map(&1) and Map.has_key?(&1, "credential_ref")))
       |> Enum.map(&Map.get(&1, "credential_ref"))
-      |> Enum.any?(&(not SecretStore.valid_reference_id?(&1)))
 
-    if invalid_reference? do
-      {:error,
-       {:invalid_credential_ref,
-        %{
-          "credential_ref" => "[REDACTED]",
-          "reason" => "invalid_reference"
-        }}}
-    else
-      :ok
-    end
+    webhook_references =
+      document
+      |> Map.get("integrations", [])
+      |> List.wrap()
+      |> Enum.filter(&is_map/1)
+      |> Enum.map(&get_in(&1, ["settings", "webhook_secret_ref"]))
+      |> Enum.reject(&is_nil/1)
+
+    direct_references ++ webhook_references
+  end
+
+  defp plaintext_credential_field?(value) when is_map(value) do
+    Enum.any?(value, fn {key, nested} ->
+      plaintext_credential_key?(key) or plaintext_credential_field?(nested)
+    end)
+  end
+
+  defp plaintext_credential_field?(value) when is_list(value),
+    do: Enum.any?(value, &plaintext_credential_field?/1)
+
+  defp plaintext_credential_field?(_value), do: false
+
+  defp plaintext_credential_key?(key) when key in ["credential_ref", "webhook_secret_ref"], do: false
+
+  defp plaintext_credential_key?(key) do
+    normalized =
+      key
+      |> to_string()
+      |> String.downcase()
+      |> String.replace(~r/[^a-z0-9]+/, "_")
+      |> String.trim("_")
+
+    compacted = String.replace(normalized, "_", "")
+
+    normalized in @plaintext_credential_fields or compacted in @plaintext_credential_aliases
   end
 
   @spec validate(Ecto.UUID.t(), keyword()) ::

@@ -1,0 +1,18 @@
+{
+  "status": 200,
+  "headers": {},
+  "body": {
+    "data": {
+      "issueUpdate": {
+        "success": true,
+        "issue": {
+          "id": "issue-1",
+          "state": {
+            "name": "Released to customers",
+            "type": "completed"
+          }
+        }
+      }
+    }
+  }
+}

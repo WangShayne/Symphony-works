@@ -1,0 +1,20 @@
+[
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/issues/16/comments",
+    "status": 200,
+    "headers": {},
+    "body": []
+  },
+  {
+    "method": "POST",
+    "path": "/repos/acme/widget/issues/16/comments",
+    "status": 201,
+    "headers": {},
+    "body": {
+      "id": 1616,
+      "html_url": "https://github.test/acme/widget/pull/16#issuecomment-1616",
+      "body": "Acceptance evidence attached"
+    }
+  }
+]

@@ -371,6 +371,7 @@ defmodule SymphonyElixir.CoreTest do
         GenServer.stop(pid)
       end
 
+      terminate_hook_processes(test_root)
       restore_app_env(:memory_tracker_issues, previous_memory_issues)
       restart_default_runtime!()
       File.rm_rf(test_root)
@@ -459,6 +460,17 @@ defmodule SymphonyElixir.CoreTest do
 
     assert is_pid(second_worker_pid)
     assert Process.alive?(second_worker_pid)
+
+    runtime_supervisor_name
+    |> Process.whereis()
+    |> GenServer.stop()
+
+    assert eventually_value(fn ->
+             case hook_process_ids(test_root) do
+               [] -> true
+               _pids -> nil
+             end
+           end)
   end
 
   test "linear issue state reconciliation fetch with no running issues is a no-op" do
@@ -1120,6 +1132,20 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
+  end
+
+  test "agent runner rejects unsafe preferred ssh hosts before remote startup" do
+    issue = %Issue{
+      id: "issue-unsafe-worker-host",
+      identifier: "MT-UNSAFE-WORKER",
+      title: "Reject unsafe worker host",
+      description: "Do not pass option-shaped destinations to ssh",
+      state: "In Progress"
+    }
+
+    assert_raise RuntimeError, ~r/invalid_ssh_destination/, fn ->
+      AgentRunner.run(issue, nil, worker_host: "-oProxyCommand=bad")
+    end
   end
 
   defp assert_due_after_delay(due_at_ms, requested_at_ms, observed_at_ms, delay_ms) do
@@ -2220,6 +2246,59 @@ defmodule SymphonyElixir.CoreTest do
              end)
     after
       File.rm_rf(test_root)
+    end
+  end
+
+  defp terminate_hook_processes(test_root) do
+    cleaned_up? = eventually_value(fn -> terminate_hook_processes_once(test_root) end)
+
+    unless cleaned_up?, do: flunk_uncleaned_hook_processes(test_root)
+  end
+
+  defp terminate_hook_processes_once(test_root) do
+    case hook_process_ids(test_root) do
+      [] ->
+        true
+
+      pids ->
+        Enum.each(pids, fn pid ->
+          System.cmd("kill", ["-TERM", Integer.to_string(pid)], stderr_to_stdout: true)
+        end)
+
+        nil
+    end
+  end
+
+  defp flunk_uncleaned_hook_processes(test_root) do
+    case hook_process_ids(test_root) do
+      [] -> :ok
+      pids -> flunk("hook process cleanup timed out: #{inspect(pids)}")
+    end
+  end
+
+  defp hook_process_ids(test_root) do
+    case System.cmd("ps", ["-axo", "pid=,command="], stderr_to_stdout: true) do
+      {output, 0} ->
+        output
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.contains?(&1, test_root))
+        |> Enum.flat_map(&process_id_from_ps_line/1)
+
+      {_output, _status} ->
+        []
+    end
+  end
+
+  defp process_id_from_ps_line(line) do
+    case line |> String.trim() |> String.split(~r/\s+/, parts: 2) do
+      [pid, _command] ->
+        case Integer.parse(pid) do
+          {pid, ""} -> [pid]
+          _invalid -> []
+        end
+
+      _invalid ->
+        []
     end
   end
 end

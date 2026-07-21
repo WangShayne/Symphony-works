@@ -1,0 +1,57 @@
+{
+  "status": 200,
+  "headers": {},
+  "body": {
+    "data": {
+      "issues": {
+        "nodes": [
+          {
+            "id": "issue-truncated",
+            "identifier": "ENG-3",
+            "title": "Issue with more blocker pages",
+            "description": "Issue body",
+            "priority": 2,
+            "state": {
+              "id": "state-started",
+              "name": "Building",
+              "type": "started"
+            },
+            "branchName": "feature/ENG-3",
+            "url": "https://linear.test/issue/ENG-3",
+            "assignee": {
+              "id": "worker-1"
+            },
+            "labels": {
+              "nodes": [
+                {
+                  "name": "ready-for-agent"
+                }
+              ]
+            },
+            "inverseRelations": {
+              "nodes": [
+                {
+                  "type": "blocks",
+                  "issue": {
+                    "id": "visible-blocker",
+                    "identifier": "ENG-92",
+                    "state": {
+                      "name": "Released",
+                      "type": "completed"
+                    }
+                  }
+                }
+              ],
+              "pageInfo": {
+                "hasNextPage": true,
+                "endCursor": "more-blockers"
+              }
+            },
+            "createdAt": "2026-07-20T00:00:00Z",
+            "updatedAt": "2026-07-20T00:01:00Z"
+          }
+        ]
+      }
+    }
+  }
+}

@@ -9,11 +9,12 @@ defmodule SymphonyElixirWeb.Auth.Controller do
   @spec login(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def login(conn, params) do
     css_url = SymphonyElixirWeb.StaticAssets.dashboard_css_url()
+    html_lang = SymphonyElixirWeb.Layouts.html_lang(%{conn: conn, params: params})
     error = if Map.has_key?(params, "error"), do: ~s(<p class="auth-error" role="alert">Sign in failed</p>), else: ""
 
     html(conn, """
     <!DOCTYPE html>
-    <html lang="en">
+    <html lang="#{html_lang}">
       <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">

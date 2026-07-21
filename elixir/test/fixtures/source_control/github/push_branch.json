@@ -1,0 +1,19 @@
+[
+  {
+    "method": "GIT_PUSH",
+    "path": "refs/heads/symphony/ABC-7",
+    "status": 0,
+    "headers": {},
+    "body": {}
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/git/ref/heads/symphony%2FABC-7",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "ref": "refs/heads/symphony/ABC-7",
+      "object": {"sha": "8888888888888888888888888888888888888888"}
+    }
+  }
+]

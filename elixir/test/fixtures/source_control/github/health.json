@@ -1,0 +1,32 @@
+[
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget",
+    "status": 200,
+    "headers": {"x-oauth-scopes": "repo"},
+    "body": {
+      "full_name": "acme/widget",
+      "permissions": {"pull": true, "push": true, "admin": false}
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/branches/main",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "name": "main",
+      "protected": true,
+      "commit": {"sha": "1111111111111111111111111111111111111111"}
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/repos/acme/widget/rules/branches/main",
+    "status": 200,
+    "headers": {},
+    "body": [
+      {"type": "pull_request", "ruleset_source_type": "Repository"}
+    ]
+  }
+]

@@ -19,10 +19,35 @@ defmodule SymphonyElixir.Configuration.Document do
   @empty_map_sections ["budgets", "acceptance", "network", "retention"]
   @top_level_fields ["schema_version", "automation_projects", "routing"] ++
                       @list_sections ++ @empty_map_sections
-  @project_fields ["id", "name", "tracker", "repository"]
+  @project_fields [
+    "id",
+    "name",
+    "tracker",
+    "repository",
+    "tracker_integration_ref",
+    "source_control_integration_ref"
+  ]
   @tracker_fields ["kind", "scope"]
   @repository_fields ["url", "target_branch"]
   @provider_fields ["id", "name", "runtime_protocol", "endpoint", "credential_ref"]
+  @integration_kinds ["tracker", "source_control"]
+  @integration_fields ["id", "kind", "provider", "credential_ref", "settings", "active"]
+  @legacy_integration_fields ["id", "kind", "settings"]
+  @integration_setting_fields [
+    "endpoint",
+    "api_base_url",
+    "project_slug",
+    "assignee",
+    "owner",
+    "repository",
+    "project_id",
+    "base_branch",
+    "scenario",
+    "fixture",
+    "webhook_secret_ref",
+    "bot_actor_id",
+    "state_ids"
+  ]
   @model_reference_fields [
     "id",
     "provider_id",
@@ -75,6 +100,7 @@ defmodule SymphonyElixir.Configuration.Document do
     project =
       project
       |> Map.take(@project_fields)
+      |> drop_blank_integration_refs()
       |> sanitize_nested_fields("tracker", @tracker_fields)
       |> sanitize_nested_fields("repository", @repository_fields)
 
@@ -95,6 +121,19 @@ defmodule SymphonyElixir.Configuration.Document do
     }
   end
 
+  @spec ensure_project_integration_refs(map()) :: map()
+  def ensure_project_integration_refs(%{"automation_projects" => [project], "integrations" => integrations} = document)
+      when is_map(project) and is_list(integrations) do
+    project =
+      project
+      |> put_default_integration_ref("tracker_integration_ref", integrations, "tracker")
+      |> put_default_integration_ref("source_control_integration_ref", integrations, "source_control")
+
+    Map.put(document, "automation_projects", [project])
+  end
+
+  def ensure_project_integration_refs(document), do: document
+
   @spec validate(term()) :: {:ok, map()} | {:error, [validation_error()]}
   def validate(document) when is_map(document) do
     errors =
@@ -104,6 +143,7 @@ defmodule SymphonyElixir.Configuration.Document do
       |> require_list_sections(document, @list_sections)
       |> require_providers(document)
       |> require_model_references(document)
+      |> validate_integrations(document)
       |> require_empty_sections(document, @empty_map_sections, %{})
       |> validate_routing(document)
       |> validate_task_types(document)
@@ -134,8 +174,8 @@ defmodule SymphonyElixir.Configuration.Document do
     [%{path: ["schema_version"], message: "must equal 1"} | errors]
   end
 
-  defp require_automation_projects(errors, %{"automation_projects" => [project]}) do
-    validate_project(errors, project, 0)
+  defp require_automation_projects(errors, %{"automation_projects" => [project]} = document) do
+    validate_project(errors, project, 0, integration_context(document))
   end
 
   defp require_automation_projects(errors, _document) do
@@ -150,17 +190,18 @@ defmodule SymphonyElixir.Configuration.Document do
 
   defp require_providers(errors, _document), do: errors
 
-  defp validate_project(errors, project, index) when is_map(project) do
+  defp validate_project(errors, project, index, context) when is_map(project) do
     prefix = ["automation_projects", Integer.to_string(index)]
 
     errors
     |> require_project_paths(project, prefix)
+    |> validate_project_integration_refs(project, prefix, context)
     |> reject_unknown_fields(project, @project_fields, prefix)
     |> reject_nested_unknown_fields(project, "tracker", @tracker_fields, prefix)
     |> reject_nested_unknown_fields(project, "repository", @repository_fields, prefix)
   end
 
-  defp validate_project(errors, _project, index) do
+  defp validate_project(errors, _project, index, _context) do
     [
       %{
         path: ["automation_projects", Integer.to_string(index)],
@@ -325,6 +366,285 @@ defmodule SymphonyElixir.Configuration.Document do
         [%{path: [section, Integer.to_string(index)], message: "must be an object"} | acc]
     end)
   end
+
+  defp validate_integrations(errors, %{"integrations" => integrations}) when is_list(integrations) do
+    integrations
+    |> Enum.with_index()
+    |> Enum.reduce(errors, fn
+      {%{"kind" => kind} = integration, index}, acc when kind in @integration_kinds ->
+        validate_integration(acc, integration, index)
+
+      {%{"kind" => kind} = integration, index}, acc when kind in ["workspace", "codex"] ->
+        prefix = ["integrations", Integer.to_string(index)]
+
+        acc
+        |> require_paths(integration, prefix, [["id"], ["kind"]])
+        |> require_settings_object(Map.get(integration, "settings"), prefix)
+        |> reject_unknown_fields(integration, @legacy_integration_fields, prefix)
+
+      {integration, index}, acc when is_map(integration) ->
+        prefix = ["integrations", Integer.to_string(index)]
+
+        acc
+        |> require_paths(integration, prefix, [["id"], ["kind"]])
+        |> validate_integration_kind(Map.get(integration, "kind"), prefix)
+
+      {_integration, _index}, acc ->
+        acc
+    end)
+  end
+
+  defp validate_integrations(errors, _document), do: errors
+
+  defp validate_integration(errors, integration, index) do
+    prefix = ["integrations", Integer.to_string(index)]
+    kind = Map.get(integration, "kind")
+    provider = Map.get(integration, "provider")
+    settings = Map.get(integration, "settings")
+
+    errors
+    |> require_paths(integration, prefix, [["id"], ["kind"], ["provider"]])
+    |> require_integration_settings(settings, prefix)
+    |> validate_integration_kind(kind, prefix)
+    |> validate_integration_provider(kind, provider, prefix)
+    |> validate_integration_active(integration, prefix)
+    |> validate_integration_credential(integration, provider, prefix)
+    |> validate_integration_provider_settings(kind, provider, settings, prefix)
+    |> reject_unknown_fields(integration, @integration_fields, prefix)
+  end
+
+  defp validate_integration_active(errors, %{"active" => value}, _prefix) when is_boolean(value) do
+    errors
+  end
+
+  defp validate_integration_active(errors, %{"active" => _value}, prefix) do
+    [%{path: prefix ++ ["active"], message: "must be a boolean"} | errors]
+  end
+
+  defp validate_integration_active(errors, _integration, _prefix), do: errors
+
+  defp require_integration_settings(errors, settings, prefix) when is_map(settings) do
+    reject_unknown_fields(errors, settings, @integration_setting_fields, prefix ++ ["settings"])
+  end
+
+  defp require_integration_settings(errors, _settings, prefix) do
+    [%{path: prefix ++ ["settings"], message: "must be an object"} | errors]
+  end
+
+  defp require_settings_object(errors, settings, _prefix) when is_map(settings), do: errors
+
+  defp require_settings_object(errors, _settings, prefix) do
+    [%{path: prefix ++ ["settings"], message: "must be an object"} | errors]
+  end
+
+  defp validate_integration_kind(errors, kind, _prefix) when kind in ["tracker", "source_control"],
+    do: errors
+
+  defp validate_integration_kind(errors, kind, prefix) when is_binary(kind) and kind != "" do
+    [%{path: prefix ++ ["kind"], message: "is not supported"} | errors]
+  end
+
+  defp validate_integration_kind(errors, _kind, _prefix), do: errors
+
+  defp validate_integration_provider(errors, "tracker", provider, _prefix)
+       when provider in ["fixture", "linear", "github", "gitlab"],
+       do: errors
+
+  defp validate_integration_provider(errors, "source_control", provider, _prefix)
+       when provider in ["fixture", "github", "gitlab"],
+       do: errors
+
+  defp validate_integration_provider(errors, kind, provider, prefix)
+       when kind in ["tracker", "source_control"] and is_binary(provider) and provider != "" do
+    [%{path: prefix ++ ["provider"], message: "is not supported for #{kind}"} | errors]
+  end
+
+  defp validate_integration_provider(errors, _kind, _provider, _prefix), do: errors
+
+  defp validate_integration_credential(errors, _integration, "fixture", _prefix), do: errors
+
+  defp validate_integration_credential(errors, integration, _provider, prefix) do
+    case Map.get(integration, "credential_ref") do
+      reference when is_binary(reference) ->
+        if SecretStore.valid_reference_id?(reference) do
+          errors
+        else
+          [%{path: prefix ++ ["credential_ref"], message: "must be an opaque secret reference"} | errors]
+        end
+
+      _reference ->
+        [%{path: prefix ++ ["credential_ref"], message: "is required"} | errors]
+    end
+  end
+
+  defp validate_integration_provider_settings(errors, "tracker", "linear", settings, prefix) do
+    errors
+    |> require_setting_paths(settings, prefix, [
+      ["project_slug"],
+      ["webhook_secret_ref"],
+      ["bot_actor_id"]
+    ])
+    |> validate_webhook_secret_reference(settings, prefix)
+    |> validate_linear_state_ids(settings, prefix)
+  end
+
+  defp validate_integration_provider_settings(errors, "tracker", "github", settings, prefix) do
+    errors
+    |> require_setting_paths(settings, prefix, [
+      ["owner"],
+      ["repository"],
+      ["webhook_secret_ref"],
+      ["bot_actor_id"]
+    ])
+    |> validate_webhook_secret_reference(settings, prefix)
+  end
+
+  defp validate_integration_provider_settings(errors, "tracker", "gitlab", settings, prefix) do
+    errors
+    |> require_setting_paths(settings, prefix, [
+      ["project_id"],
+      ["webhook_secret_ref"],
+      ["bot_actor_id"]
+    ])
+    |> validate_webhook_secret_reference(settings, prefix)
+  end
+
+  defp validate_integration_provider_settings(errors, "source_control", provider, settings, prefix)
+       when provider in ["fixture", "github", "gitlab"] do
+    require_setting_paths(errors, settings, prefix, [["repository"], ["base_branch"]])
+  end
+
+  defp validate_integration_provider_settings(errors, _kind, _provider, _settings, _prefix), do: errors
+
+  defp require_setting_paths(errors, settings, prefix, paths) when is_map(settings) do
+    require_paths(errors, settings, prefix ++ ["settings"], paths)
+  end
+
+  defp require_setting_paths(errors, _settings, _prefix, _paths), do: errors
+
+  defp validate_webhook_secret_reference(errors, settings, prefix) when is_map(settings) do
+    case Map.get(settings, "webhook_secret_ref") do
+      reference when is_binary(reference) ->
+        if SecretStore.valid_reference_id?(reference) do
+          errors
+        else
+          [
+            %{
+              path: prefix ++ ["settings", "webhook_secret_ref"],
+              message: "must be an opaque secret reference"
+            }
+            | errors
+          ]
+        end
+
+      _reference ->
+        errors
+    end
+  end
+
+  defp validate_webhook_secret_reference(errors, _settings, _prefix), do: errors
+
+  defp validate_linear_state_ids(errors, settings, prefix) when is_map(settings) do
+    case Map.get(settings, "state_ids") do
+      state_ids when is_map(state_ids) and map_size(state_ids) > 0 ->
+        Enum.reduce(state_ids, errors, &validate_linear_state_id(&1, &2, prefix))
+
+      state_ids when is_map(state_ids) ->
+        [%{path: prefix ++ ["settings", "state_ids"], message: "must contain at least one state"} | errors]
+
+      nil ->
+        [%{path: prefix ++ ["settings", "state_ids"], message: "is required"} | errors]
+
+      _state_ids ->
+        [%{path: prefix ++ ["settings", "state_ids"], message: "must be an object"} | errors]
+    end
+  end
+
+  defp validate_linear_state_ids(errors, _settings, _prefix), do: errors
+
+  defp validate_linear_state_id({state, state_id}, errors, prefix) do
+    if nonempty_string?(state) and nonempty_string?(state_id) do
+      errors
+    else
+      [
+        %{
+          path: prefix ++ ["settings", "state_ids", to_string(state)],
+          message: "must map a non-empty state name to a non-empty ID"
+        }
+        | errors
+      ]
+    end
+  end
+
+  defp validate_project_integration_refs(errors, project, prefix, context) do
+    errors
+    |> validate_project_integration_ref(project, prefix, context, %{
+      field: "tracker_integration_ref",
+      kind: "tracker",
+      label: "Tracker"
+    })
+    |> validate_project_integration_ref(project, prefix, context, %{
+      field: "source_control_integration_ref",
+      kind: "source_control",
+      label: "Source Control"
+    })
+  end
+
+  defp validate_project_integration_ref(errors, project, prefix, context, opts) do
+    field = opts.field
+    kind = opts.kind
+    label = opts.label
+    integrations_for_kind = Map.get(context.by_kind, kind, [])
+
+    case Map.fetch(project, field) do
+      {:ok, ref} when is_binary(ref) and ref != "" ->
+        validate_bound_integration_ref(errors, ref, prefix ++ [field], context.by_id, kind, label)
+
+      {:ok, _ref} ->
+        [%{path: prefix ++ [field], message: "is required"} | errors]
+
+      :error when integrations_for_kind == [] ->
+        errors
+
+      :error ->
+        [%{path: prefix ++ [field], message: "is required"} | errors]
+    end
+  end
+
+  defp validate_bound_integration_ref(errors, ref, path, integrations_by_id, kind, label) do
+    case Map.fetch(integrations_by_id, ref) do
+      {:ok, integration} ->
+        cond do
+          Map.get(integration, "kind") != kind ->
+            [%{path: path, message: "must reference a #{label} integration"} | errors]
+
+          integration_active?(integration) ->
+            errors
+
+          true ->
+            [%{path: path, message: "must reference an active #{label} integration"} | errors]
+        end
+
+      :error ->
+        [%{path: path, message: "must reference an existing #{label} integration"} | errors]
+    end
+  end
+
+  defp integration_context(%{"integrations" => integrations}) when is_list(integrations) do
+    integration_maps = Enum.filter(integrations, &is_map/1)
+
+    %{
+      by_id: Map.new(integration_maps, &{Map.get(&1, "id"), &1}),
+      by_kind: Enum.group_by(integration_maps, &Map.get(&1, "kind"))
+    }
+  end
+
+  defp integration_context(_document), do: %{by_id: %{}, by_kind: %{}}
+
+  defp integration_active?(%{"active" => false}), do: false
+  defp integration_active?(_integration), do: true
+
+  defp nonempty_string?(value), do: is_binary(value) and String.trim(value) != ""
 
   defp validate_task_types(errors, %{"task_types" => task_types}) when is_list(task_types) do
     Enum.reduce(Enum.with_index(task_types), errors, fn
@@ -716,6 +1036,39 @@ defmodule SymphonyElixir.Configuration.Document do
       {:ok, value} when is_map(value) -> Map.put(project, section, Map.take(value, allowed_fields))
       _other -> project
     end
+  end
+
+  defp drop_blank_integration_refs(project) do
+    project
+    |> drop_blank_field("tracker_integration_ref")
+    |> drop_blank_field("source_control_integration_ref")
+  end
+
+  defp drop_blank_field(project, field) do
+    case Map.get(project, field) do
+      value when value in [nil, ""] -> Map.delete(project, field)
+      _value -> project
+    end
+  end
+
+  defp put_default_integration_ref(project, field, integrations, kind) do
+    case Map.get(project, field) do
+      value when is_binary(value) and value != "" ->
+        project
+
+      _value ->
+        case active_integration_ids(integrations, kind) do
+          [id] -> Map.put(project, field, id)
+          _ids -> Map.delete(project, field)
+        end
+    end
+  end
+
+  defp active_integration_ids(integrations, kind) do
+    integrations
+    |> Enum.filter(&(is_map(&1) and Map.get(&1, "kind") == kind and integration_active?(&1)))
+    |> Enum.map(&Map.get(&1, "id"))
+    |> Enum.filter(&nonempty_string?/1)
   end
 
   defp path_key(field) when is_binary(field), do: field

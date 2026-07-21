@@ -127,7 +127,13 @@ defmodule SymphonyElixir.Security.SecretStore do
   end
 
   @spec valid_reference_id?(term()) :: boolean()
-  def valid_reference_id?(id) when is_binary(id), do: match?({:ok, _uuid}, Ecto.UUID.cast(id))
+  def valid_reference_id?(id) when is_binary(id) and byte_size(id) == 36 do
+    case Ecto.UUID.cast(id) do
+      {:ok, uuid} -> uuid == String.downcase(id)
+      :error -> false
+    end
+  end
+
   def valid_reference_id?(_id), do: false
 
   @spec list_references() :: [Reference.t()]

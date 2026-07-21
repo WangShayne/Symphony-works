@@ -182,6 +182,24 @@ defmodule SymphonyElixirWeb.Api.V1.AutomationProjectController do
     }
   end
 
+  defp validation_error(
+         conn,
+         {:probe_failed, :integration, %{"integration" => integration}}
+       )
+       when is_map(integration) do
+    details = Map.take(integration, ["id", "kind", "provider", "reason", "status"])
+
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        code: "invalid_configuration",
+        message: "Integration health check failed",
+        details: details
+      }
+    })
+  end
+
   defp validation_error(conn, {:invalid_configuration, errors}) when is_list(errors) do
     conn
     |> put_status(:unprocessable_entity)

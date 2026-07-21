@@ -1,0 +1,8 @@
+{
+  "object_kind": "issue",
+  "object_attributes": {
+    "iid": 3,
+    "action": "close",
+    "state": "closed"
+  }
+}

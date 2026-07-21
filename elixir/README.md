@@ -13,7 +13,7 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 ## How it works
 
-1. Polls the configured tracker for candidate work (the included production adapter is Linear)
+1. Polls the configured Linear, GitHub, or GitLab Tracker adapter for candidate work
 2. Creates a workspace per issue
 3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
    workspace
@@ -119,8 +119,54 @@ POST /api/v1/configuration-revisions/<revision uuid>/providers/linear/credential
 }
 ```
 
-Only `providers[*].credential_ref` is stored. Do not put provider tokens or plaintext credential
-fields in `WORKFLOW.md` or configuration revisions.
+Tracker and Source Control are independent entries in `integrations`. Configure them through the
+Administrator Dashboard at `/configuration`, or update the complete draft document through
+`PATCH /api/v1/configuration-revisions/<revision uuid>`:
+
+```json
+{
+  "integrations": [
+    {
+      "id": "tracker-main",
+      "kind": "tracker",
+      "provider": "github",
+      "credential_ref": "<api-token secret uuid>",
+      "settings": {
+        "owner": "your-org",
+        "repository": "your-repo",
+        "bot_actor_id": "symphony-bot",
+        "webhook_secret_ref": "<webhook-secret uuid>"
+      }
+    },
+    {
+      "id": "delivery-main",
+      "kind": "source_control",
+      "provider": "gitlab",
+      "credential_ref": "<api-token secret uuid>",
+      "settings": {"repository": "group/project", "base_branch": "main"}
+    }
+  ]
+}
+```
+
+Production Tracker adapters require separate API-token and webhook-signing references. The
+deterministic `fixture` provider requires neither and is intended for validation and tests. Only
+bare, canonical UUID references are accepted; raw 16-byte values, `secret:<uuid>` strings, and
+plaintext credentials are rejected before persistence. Health validation resolves each reference
+through the Credential Broker, exposes plaintext only for the duration of the adapter call, and
+stores only redacted evidence. Set `bot_actor_id` to the
+provider identity used by Symphony; progress upserts update only marker comments owned by that
+identity and never overwrite a user-authored lookalike.
+
+Linear Tracker entries also require `settings.state_ids`, mapping Symphony workflow states such as
+`started`, `completed`, and `cancelled` to Linear workflow-state IDs. The Dashboard exposes these
+state mappings alongside the other adapter settings, and REST updates preserve additional mapping
+keys supplied in the complete draft document.
+
+Do not put provider tokens or plaintext credential fields in `WORKFLOW.md` or configuration
+revisions. A one-time `WORKFLOW.md` import copies non-secret Tracker settings into an inactive draft
+but deliberately ignores the legacy `api_key` value; an Administrator must bind Secret References
+before activating a production adapter.
 
 Rotate encrypted rows by supplying the current and replacement master keys from the environment;
 the task does not accept keys as command arguments:

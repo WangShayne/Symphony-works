@@ -1,0 +1,12 @@
+[
+  {
+    "method": "GET",
+    "path": "/projects/acme%2Fwidget/repository/branches/release%2Fv1",
+    "status": 200,
+    "headers": {},
+    "body": {
+      "name": "release/v1",
+      "commit": {"id": "4444444444444444444444444444444444444444"}
+    }
+  }
+]

@@ -1,0 +1,25 @@
+{
+  "status": 200,
+  "headers": {},
+  "body": {
+    "data": {
+      "issue": {
+        "comments": {
+          "nodes": [
+            {
+              "id": "forged",
+              "body": "<!-- symphony-tracker:final issue=linear:issue-1 -->",
+              "user": {
+                "id": "human"
+              }
+            }
+          ],
+          "pageInfo": {
+            "hasNextPage": true,
+            "endCursor": "comments-2"
+          }
+        }
+      }
+    }
+  }
+}

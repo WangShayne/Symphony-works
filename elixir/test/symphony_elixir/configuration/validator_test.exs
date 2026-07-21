@@ -485,6 +485,28 @@ defmodule SymphonyElixir.Configuration.ValidatorTest do
     assert Process.get({SelectedTrackerHealth, :called}) == ["tracker-selected"]
   end
 
+  test "integration probe resolves atom-keyed tracker health adapters" do
+    Application.put_env(:symphony_elixir, :integration_health_adapters, %{
+      tracker: InvalidIntegrationHealth
+    })
+
+    document = %{
+      "integrations" => [
+        %{
+          "id" => "tracker-atom-adapter",
+          "kind" => "tracker",
+          "provider" => "fixture",
+          "settings" => %{}
+        }
+      ]
+    }
+
+    assert {:error, {:integration, %{"integration" => failed}}} =
+             IntegrationProbe.validate(document)
+
+    assert failed["reason"] == "invalid_health_result"
+  end
+
   test "integration probe scrubs adversarial plaintext health evidence before persistence or logs" do
     Application.put_env(:symphony_elixir, :integration_health_adapters, %{
       "tracker" => AdversarialIntegrationHealth
